@@ -4,7 +4,7 @@
 
 纯 C# 的 [Hy-MT2](https://huggingface.co/tencent/Hy-MT2-1.8B)（`hunyuan-dense`）**非官方** CPU 推理实现。不依赖 llama.cpp 或 ONNX Runtime，自带 AVX2 内核，面向进程内调用。
 
-当前验证过的 GGUF 量化：**Q4_K_M**、**Q2_0C**、**1.25-bit STQ1_0**。其它格式与模型规模尚未测试。
+当前验证过的 GGUF 量化：**Q8_0**、**Q6_K**、**Q4_K_M**、**Q2_0C**、**1.25-bit STQ1_0**。其它格式与模型规模尚未测试。
 
 ## 模型
 
@@ -14,6 +14,8 @@
 | --- | --- |
 | 1.25-bit STQ1_0 | [Hy-MT2-1.8B-1.25Bit-GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-1.25Bit-GGUF) |
 | Q2_0C | [Hy-MT2-1.8B-2Bit-GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-2Bit-GGUF) |
+| Q8_0 | [Hy-MT2-1.8B-GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF) |
+| Q6_K | [Hy-MT2-1.8B-GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF) |
 | Q4_K_M | [Hy-MT2-1.8B-GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF) |
 
 ## 快速开始
@@ -125,6 +127,8 @@ static int ArgMax(float[] logits)
 
 Q1.25 与 Q2 的 decode 基本持平；相比 Q4，Q1.25 prefill 快约 33%、decode 快约 74%。5800X 连续满载时频率与温度波动较大，上述数字不代表硬件上限。llama.cpp 一行为历史记录，未随本轮复测。
 
+另一台**开发机B**（hybrid CPU，8 P-core，DDR4-3200，Release）上复测了 Q4 / Q6 / Q8，并与纯 CPU llama.cpp 同窗口对照：**prefill 约 4–6 倍于 llama.cpp**（Q6 463.7 vs 119.1、Q8 548.8 vs 93.0 tok/s）；decode 贴着内存带宽墙，与 llama.cpp 同量级、慢约 3–11%。完整数据、带宽微基准与噪声说明见 [docs/perf-B.md](docs/perf-B.md)。
+
 复现：
 
 ```powershell
@@ -137,7 +141,10 @@ Q2 panel 默认 64 KiB tile，可用 `--q2-col-tile-kb 64` 显式指定。`--pro
 
 ## 实现要点
 
-- **Q4_K_M**：`q4_Kx8 × q8_Kx4` AVX2 panel GEMM；decode 走 Q8 行量化 + GEMV。
+- **Q8_0**：34 B / 32 权重。层权重（含 token_embd，兼任 lm_head）重排成 8 列 panel；prefill 一次吃 8 个 token，decode 在 panel 上做 GEMV，权重按单条顺序流读取。有 AVX-VNNI 时内积用 `vpdpbusd`，否则用 `vpmaddubsw`。激活量化夹在 −127..127。QKV 与 gate/up 的 GEMV 各融合成一次并行调度；输出行按动态 chunk（`Interlocked.Add`，与 ggml mul_mat 相同思路）在 worker 间分配。
+- **Q6_K**：沿用 `q6_Kx8 × q8_Kx4` panel。整模的 Q、K、V 和 gate/up 共用一次激活量化、一次并行调度，行分配同样是动态 chunk。内积固定 AVX2 `vpmaddubsw` + `vpmaddwd`（实测 VNNI 版在 Raptor Lake 上更慢，VNNI 函数保留供其它 CPU 与测试）。
+- **decode attention**：scores → softmax → combine 按 head 融合在一次并行调度里，score 行保持在热缓存。
+- **Q4_K_M**：`q4_Kx8 × q8_Kx4` AVX2 panel GEMM；decode 走 Q8 行量化 + GEMV。Q4 内核不走 VNNI。
 - **Q2_0C**：8 列压缩 panel，保留 2-bit 权重，不展开为逐字节副本。
 - **STQ1_0**：42 B / 256 权重的 stride-16 block，加载时重排为 8 行 panel，prefill / decode 均走 AVX2 GEMV / GEMM。
 - **Q2 prefill**：QKV、gate/up、SiLU→down 复用 Q8 激活量化；2-bit 点积用 int32 归约避免 int16 溢出。

@@ -112,16 +112,16 @@ public static unsafe class GemmQ6K
                         // Two 8-value steps share one 16-value scale.
                         Vector256<byte> wa = Avx.LoadVector256(q);
                         Vector256<byte> wb = Avx.LoadVector256(q + 32);
-                        j0 = Avx2.Add(j0, Avx2.MultiplyAddAdjacent(Dot8(wa, wb, a), scv));
-                        j1 = Avx2.Add(j1, Avx2.MultiplyAddAdjacent(Dot8(wa, wb, a + 2), scv));
-                        j2 = Avx2.Add(j2, Avx2.MultiplyAddAdjacent(Dot8(wa, wb, a + 4), scv));
-                        j3 = Avx2.Add(j3, Avx2.MultiplyAddAdjacent(Dot8(wa, wb, a + 6), scv));
+                        j0 = Avx2.Add(j0, Accumulate8(wa, wb, a, scv));
+                        j1 = Avx2.Add(j1, Accumulate8(wa, wb, a + 2, scv));
+                        j2 = Avx2.Add(j2, Accumulate8(wa, wb, a + 4, scv));
+                        j3 = Avx2.Add(j3, Accumulate8(wa, wb, a + 6, scv));
                         wa = Avx.LoadVector256(q + 64);
                         wb = Avx.LoadVector256(q + 96);
-                        j0 = Avx2.Add(j0, Avx2.MultiplyAddAdjacent(Dot8(wa, wb, a + 8), scv));
-                        j1 = Avx2.Add(j1, Avx2.MultiplyAddAdjacent(Dot8(wa, wb, a + 10), scv));
-                        j2 = Avx2.Add(j2, Avx2.MultiplyAddAdjacent(Dot8(wa, wb, a + 12), scv));
-                        j3 = Avx2.Add(j3, Avx2.MultiplyAddAdjacent(Dot8(wa, wb, a + 14), scv));
+                        j0 = Avx2.Add(j0, Accumulate8(wa, wb, a + 8, scv));
+                        j1 = Avx2.Add(j1, Accumulate8(wa, wb, a + 10, scv));
+                        j2 = Avx2.Add(j2, Accumulate8(wa, wb, a + 12, scv));
+                        j3 = Avx2.Add(j3, Accumulate8(wa, wb, a + 14, scv));
                         q += 128;
                         a += 16;
                         sc += 16;
@@ -170,6 +170,26 @@ public static unsafe class GemmQ6K
     }
 
     /// <summary>
+    /// 8 K values × 8 columns. Scales are duplicated shorts [s0 s0 s1 s1 …].
+    /// vpmaddubsw beats vpdpbusd here: the VNNI variant pays an extra
+    /// vpmulld+shuffle to scale lanes separately (slower on Raptor Lake).
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<int> Accumulate8(Vector256<byte> wa, Vector256<byte> wb, int* a, Vector256<short> scv) =>
+        Dot8ScaledAvx2(wa, wb, a, scv);
+
+    /// <summary>AVX2 reference: shorts [c0 c0 c1 c1 …], each ≤ 4·63·127.</summary>
+    public static Vector256<int> Dot8ScaledAvx2(Vector256<byte> wa, Vector256<byte> wb, int* a, Vector256<short> scv) =>
+        Avx2.MultiplyAddAdjacent(Dot8(wa, wb, a), scv);
+
+    public static Vector256<int> Dot8ScaledVnni(Vector256<byte> wa, Vector256<byte> wb, int* a, Vector256<short> scv)
+    {
+        Vector256<int> dots = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, wa, Avx2.BroadcastScalarToVector256(a).AsSByte());
+        dots = AvxVnni.MultiplyWideningAndAdd(dots, wb, Avx2.BroadcastScalarToVector256(a + 1).AsSByte());
+        return Avx2.MultiplyLow(dots, EvenScales(scv));
+    }
+
+    /// <summary>
     /// 8 K values × 8 columns for one activation row: shorts [c0 c0 c1 c1 … c7 c7],
     /// each ≤ 4·63·127 so the pair sum fits int16.
     /// </summary>
@@ -178,4 +198,17 @@ public static unsafe class GemmQ6K
         Avx2.Add(
             Avx2.MultiplyAddAdjacent(wa, Avx2.BroadcastScalarToVector256(a).AsSByte()),
             Avx2.MultiplyAddAdjacent(wb, Avx2.BroadcastScalarToVector256(a + 1).AsSByte()));
+
+    /// <summary>Duplicated shorts [s0 s0 s1 s1 … s7 s7] to int32 [s0 s1 … s7].</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<int> EvenScales(Vector256<short> scv)
+    {
+        Vector256<byte> shuf = Vector256.Create(
+            (byte)0, 1, 4, 5, 8, 9, 12, 13, 0, 0, 0, 0, 0, 0, 0, 0,
+            (byte)0, 1, 4, 5, 8, 9, 12, 13, 0, 0, 0, 0, 0, 0, 0, 0);
+        Vector256<short> packed = Avx2.Shuffle(scv.AsByte(), shuf).AsInt16();
+        return Vector256.Create(
+            Sse41.ConvertToVector128Int32(packed.GetLower()),
+            Sse41.ConvertToVector128Int32(packed.GetUpper()));
+    }
 }

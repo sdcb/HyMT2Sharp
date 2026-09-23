@@ -12,6 +12,7 @@ public sealed class CpuThreadPool : IDisposable
 {
     private readonly Thread[] _threads;
     private readonly AutoResetEvent[] _starts;
+    private readonly int[] _parked;
     private Action<int, int>? _work;
     private int _workers;
     private int _remaining;
@@ -29,6 +30,7 @@ public sealed class CpuThreadPool : IDisposable
         ThreadCount = Math.Max(1, threadCount);
         _threads = new Thread[ThreadCount];
         _starts = new AutoResetEvent[ThreadCount];
+        _parked = new int[ThreadCount];
         for (int i = 0; i < ThreadCount; i++)
         {
             int index = i;
@@ -57,7 +59,8 @@ public sealed class CpuThreadPool : IDisposable
         Volatile.Write(ref _remaining, workers);
         Interlocked.Increment(ref _jobId);
         for (int i = 0; i < workers; i++)
-            _starts[i].Set();
+            if (Volatile.Read(ref _parked[i]) != 0)
+                _starts[i].Set();
 
         int spins = 0;
         while (Volatile.Read(ref _remaining) > 0)
@@ -126,7 +129,10 @@ public sealed class CpuThreadPool : IDisposable
 
             if (Volatile.Read(ref _jobId) != seen || _stop)
                 continue;
-            _starts[index].WaitOne();
+            Interlocked.Exchange(ref _parked[index], 1);
+            if (Volatile.Read(ref _jobId) == seen && !_stop)
+                _starts[index].WaitOne();
+            Volatile.Write(ref _parked[index], 0);
         }
     }
 

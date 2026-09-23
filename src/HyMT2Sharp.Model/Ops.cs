@@ -356,6 +356,78 @@ public static unsafe class Ops
             pool.For(heads, Body);
     }
 
+    /// <summary>
+    /// Single-token attention: scores → softmax → combine per head inside one
+    /// parallel region, so decode pays one dispatch per layer and the score row
+    /// stays cache-hot between phases.
+    /// </summary>
+    public static void AttentionDecode(
+        float* q,
+        float* cacheK,
+        float* cacheV,
+        float* scores,
+        float* output,
+        int heads,
+        int kvHeads,
+        int headDim,
+        int kvLen,
+        int kvStride,
+        float scale,
+        int startPos,
+        CpuThreadPool? pool = null)
+    {
+        int group = heads / kvHeads;
+        void Body(int worker, int workers)
+        {
+            int begin = heads * worker / workers;
+            int end = heads * (worker + 1) / workers;
+            for (int h = begin; h < end; h++)
+            {
+                int kvh = h / group;
+                float* qh = q + h * headDim;
+                float* kBase = cacheK + kvh * headDim;
+                float* vBase = cacheV + kvh * headDim;
+                float* row = scores + h * kvLen;
+                int allowed = Math.Min(kvLen, startPos + 1);
+                int kt = 0;
+                for (; kt + 3 < allowed; kt += 4)
+                {
+                    float* k0 = kBase + (kt + 0) * kvStride;
+                    float* k1 = kBase + (kt + 1) * kvStride;
+                    float* k2 = kBase + (kt + 2) * kvStride;
+                    float* k3 = kBase + (kt + 3) * kvStride;
+                    DotF32x4(qh, k0, k1, k2, k3, headDim, row + kt, scale);
+                }
+
+                for (; kt < allowed; kt++)
+                    row[kt] = DotF32(qh, kBase + kt * kvStride, headDim) * scale;
+
+                SoftmaxRow(row, allowed);
+
+                float* outH = output + h * headDim;
+                int d = 0;
+                if (Avx.IsSupported && Fma.IsSupported)
+                {
+                    for (; d + 63 < headDim; d += 64)
+                        Axpy64(row, vBase + d, kvStride, allowed, outH + d);
+                }
+
+                if (d < headDim)
+                {
+                    for (int i = d; i < headDim; i++)
+                        outH[i] = 0;
+                    for (int k = 0; k < allowed; k++)
+                        AxpyF32(outH + d, vBase + k * kvStride + d, row[k], headDim - d);
+                }
+            }
+        }
+
+        if (pool == null || heads <= 1)
+            Body(0, 1);
+        else
+            pool.For(heads, Body);
+    }
+
     /// <summary>output[qt,h] = Σ_{kt &lt; startPos+qt+1} scores[h,qt,kt] · v[kt,kvh].</summary>
     public static void AttentionCombine(
         float* cacheV,

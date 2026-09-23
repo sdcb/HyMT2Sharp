@@ -113,6 +113,36 @@ public sealed unsafe partial class HunyuanDenseModel
             if (ProfileEnabled) TicksQ2 += Stopwatch.GetTimestamp() - t2;
             return;
         }
+        if (Avx2.IsSupported && (seq & 3) == 0 &&
+            wq.Type == GgmlTensorType.Q8_0 && wk.Type == GgmlTensorType.Q8_0 && wv.Type == GgmlTensorType.Q8_0 &&
+            wq.Packed8 != null && wk.Packed8 != null && wv.Packed8 != null &&
+            (qDim & 7) == 0 && (kDim & 7) == 0)
+        {
+            long t8 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
+            BlockQ8_0x4* q8 = Q8PrefillBuffer(hidden, seq);
+            MulMatQ8_0.QuantizeAndGemm(input, q8, hidden, seq, _pool,
+                new Q8Panel(wq.Packed8, q, qDim),
+                new Q8Panel(wk.Packed8, k, kDim),
+                new Q8Panel(wv.Packed8, v, kDim));
+            if (ProfileEnabled) TicksQ8 += Stopwatch.GetTimestamp() - t8;
+            return;
+        }
+        if ((seq & 3) == 0 && wq.Packed6 != null && wk.Packed6 != null && wv.Packed6 != null &&
+            (qDim & 7) == 0 && (kDim & 7) == 0)
+        {
+            int nb6 = hidden / Qk.SuperBlock;
+            nuint actBytes6 = (nuint)((seq / 4) * nb6 * Qk.Q8Kx4Size);
+            BlockQ8Kx4* q8 = (BlockQ8Kx4*)_gemmScratch.E(actBytes6);
+            long t6 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
+            MulMatPanel.QuantizeAndGemm(
+                input, q8, hidden, seq, _pool,
+                PanelWeight.ForQ6(wq.Packed6, q, qDim),
+                PanelWeight.ForQ6(wk.Packed6, k, kDim),
+                PanelWeight.ForQ6(wv.Packed6, v, kDim));
+            if (ProfileEnabled)
+                TicksQ6 += Stopwatch.GetTimestamp() - t6;
+            return;
+        }
         if ((seq & 3) == 0 && wq.Packed != null && wk.Packed != null && (wv.Packed != null || wv.Packed6 != null))
         {
             int nb = hidden / Qk.SuperBlock;
@@ -153,6 +183,32 @@ public sealed unsafe partial class HunyuanDenseModel
                 new STQPanelWeight(wg.PackedSTQ, gate, ffn),
                 new STQPanelWeight(wu.PackedSTQ, up, ffn));
             if (ProfileEnabled) TicksSTQ += Stopwatch.GetTimestamp() - t2;
+            return;
+        }
+        if ((seq & 3) == 0 && wg.Packed6 != null && wu.Packed6 != null && (ffn & 7) == 0)
+        {
+            int nb6 = hidden / Qk.SuperBlock;
+            nuint actBytes6 = (nuint)((seq / 4) * nb6 * Qk.Q8Kx4Size);
+            BlockQ8Kx4* q8 = (BlockQ8Kx4*)_gemmScratch.E(actBytes6);
+            long t6 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
+            MulMatPanel.QuantizeAndGemm(
+                input, q8, hidden, seq, _pool,
+                PanelWeight.ForQ6(wg.Packed6, gate, ffn),
+                PanelWeight.ForQ6(wu.Packed6, up, ffn));
+            if (ProfileEnabled)
+                TicksQ6 += Stopwatch.GetTimestamp() - t6;
+            return;
+        }
+        if (Avx2.IsSupported && (seq & 3) == 0 &&
+            wg.Type == GgmlTensorType.Q8_0 && wu.Type == GgmlTensorType.Q8_0 &&
+            wg.Packed8 != null && wu.Packed8 != null && (ffn & 7) == 0)
+        {
+            long t8 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
+            BlockQ8_0x4* q8 = Q8PrefillBuffer(hidden, seq);
+            MulMatQ8_0.QuantizeAndGemm(input, q8, hidden, seq, _pool,
+                new Q8Panel(wg.Packed8, gate, ffn),
+                new Q8Panel(wu.Packed8, up, ffn));
+            if (ProfileEnabled) TicksQ8 += Stopwatch.GetTimestamp() - t8;
             return;
         }
         if ((seq & 3) == 0 && wg.Packed != null && wu.Packed != null)
@@ -202,6 +258,16 @@ public sealed unsafe partial class HunyuanDenseModel
             if (ProfileEnabled) TicksSTQ += Stopwatch.GetTimestamp() - t2;
             return;
         }
+        if (Avx2.IsSupported && (seq & 3) == 0 && wd.Type == GgmlTensorType.Q8_0 &&
+            wd.Packed8 != null && (hidden & 7) == 0)
+        {
+            long t8 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
+            BlockQ8_0x4* q8 = Q8PrefillBuffer(ffn, seq);
+            MulMatQ8_0.SiluQuantizeAndGemm(gate, up, q8, ffn, seq, _pool,
+                new Q8Panel(wd.Packed8, down, hidden));
+            if (ProfileEnabled) TicksQ8 += Stopwatch.GetTimestamp() - t8;
+            return;
+        }
         if ((seq & 3) == 0 && (wd.Packed != null || wd.Packed6 != null))
         {
             int nb = ffn / Qk.SuperBlock;
@@ -248,5 +314,11 @@ public sealed unsafe partial class HunyuanDenseModel
     {
         int q8Blocks = nIn / STQ1_0.BlockLength;
         return (BlockQ8Kx4*)_gemmScratch.E((nuint)((long)(tokens / 4) * q8Blocks * Qk.Q8Kx4Size));
+    }
+
+    private BlockQ8_0x4* Q8PrefillBuffer(int nIn, int tokens)
+    {
+        int blocks = nIn / Qk.Q8_0Block;
+        return (BlockQ8_0x4*)_gemmScratch.E((nuint)((long)(tokens / 4) * blocks * Qk.Q8_0x4Size));
     }
 }

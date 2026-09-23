@@ -23,6 +23,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     private readonly List<int> _cacheTokens = [];
     private int _cacheLen;
     private int _cacheCap;
+    private float[]? _logits;
 
     public ModelConfig Config { get; private set; }
     public BpeTokenizer Tokenizer { get; }
@@ -33,6 +34,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     public static long TicksQ2;
     public static long TicksSTQ;
     public static long TicksQ6;
+    public static long TicksQ8;
     public static long TicksAttnScore;
     public static long TicksSoftmax;
     public static long TicksAttnCombine;
@@ -48,6 +50,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         TicksQ2 = 0;
         TicksSTQ = 0;
         TicksQ6 = 0;
+        TicksQ8 = 0;
         TicksAttnScore = 0;
         TicksSoftmax = 0;
         TicksAttnCombine = 0;
@@ -143,7 +146,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         float* last = normed + (seq - 1) * hidden;
 
         int vocab = Config.VocabSize > 0 ? Config.VocabSize : Tokenizer.VocabSize;
-        float[] logits = new float[vocab];
+        float[] logits = _logits ??= new float[vocab];
         fixed (float* lp = logits)
             Linear(last, "output.weight", lp, hidden, vocab, 1, fallback: "token_embd.weight");
 
@@ -191,9 +194,17 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
             case GgmlTensorType.Q6_K:
             {
                 long t0 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
-                Q6K.Gemm(w.Q6, input, output, nIn, nOut, tokens, _pool, _gemmScratch);
+                MulMatQ6K.Gemm(w.Packed6, w.Q6, input, output, nIn, nOut, tokens, _pool, _gemmScratch);
                 if (ProfileEnabled)
                     TicksQ6 += Stopwatch.GetTimestamp() - t0;
+                break;
+            }
+            case GgmlTensorType.Q8_0:
+            {
+                long t0 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
+                MulMatQ8_0.Gemm(w.Packed8, w.Q8, input, output, nIn, nOut, tokens, _pool, _gemmScratch);
+                if (ProfileEnabled)
+                    TicksQ8 += Stopwatch.GetTimestamp() - t0;
                 break;
             }
             default:
@@ -205,7 +216,12 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     {
         Weight w = _weights["token_embd.weight"];
         int hidden = Config.HiddenSize;
-        if (hidden % Qk.SuperBlock != 0)
+        if (w.Type == GgmlTensorType.Q8_0)
+        {
+            if (hidden % Qk.Q8_0Block != 0)
+                throw new NotSupportedException("token embedding inner dim must be a multiple of 32.");
+        }
+        else if (hidden % Qk.SuperBlock != 0)
             throw new NotSupportedException("token embedding inner dim must be a multiple of 256.");
         int nb = hidden / Qk.SuperBlock;
         int n = tokens.Length;
@@ -223,6 +239,9 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
                     break;
                 case GgmlTensorType.Q6_K:
                     Q6K.DequantizeRow(w.Q6 + tokens[t] * nb, row, hidden);
+                    break;
+                case GgmlTensorType.Q8_0:
+                    Q8_0.DequantizeRow(w.Q8 + tokens[t] * (hidden / Qk.Q8_0Block), row, hidden);
                     break;
                 case GgmlTensorType.Q2_0C:
                     Q2_0C.DequantizeRow(w.Q2 + tokens[t] * nb, row, hidden);
@@ -284,12 +303,14 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
 
             int nIn = (int)info.Shape[0];
             int nOut = info.Shape.Length > 1 ? (int)info.Shape[1] : 1;
-            if (nIn % Qk.SuperBlock != 0)
-                throw new NotSupportedException($"{name}: nIn={nIn} is not a multiple of 256");
+            int align = info.Type == GgmlTensorType.Q8_0 ? Qk.Q8_0Block : Qk.SuperBlock;
+            if (nIn % align != 0)
+                throw new NotSupportedException($"{name}: nIn={nIn} is not a multiple of {align}");
             int nb = info.Type switch
             {
                 GgmlTensorType.Q2_0C => nIn / Q2_0C.BlockLength,
                 GgmlTensorType.STQ1_0 => nIn / STQ1_0.BlockLength,
+                GgmlTensorType.Q8_0 => nIn / Qk.Q8_0Block,
                 _ => nIn / Qk.SuperBlock,
             };
             int blockBytes = info.Type switch
@@ -297,6 +318,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
                 GgmlTensorType.Q4_K => Qk.Q4KSize,
                 GgmlTensorType.Q5_K => Qk.Q5KSize,
                 GgmlTensorType.Q6_K => Qk.Q6KSize,
+                GgmlTensorType.Q8_0 => Qk.Q8_0Size,
                 GgmlTensorType.Q2_0C => Qk.Q2_0CSize,
                 GgmlTensorType.STQ1_0 => Qk.STQ1_0Size,
                 _ => throw new NotSupportedException($"Unsupported quantized tensor type {info.Type} for {name}"),
@@ -351,15 +373,31 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
                         w.PackedSTQ = (BlockSTQ1_0x8*)packed.Pointer;
                     }
                 }
-                else
-                    w.Q6 = (BlockQ6K*)quant.Pointer;
-                // Only per-layer Q6 weights take the prefill panel; the tied lm_head stays a GEMV.
-                if (info.Type == GgmlTensorType.Q6_K && name.StartsWith("blk.", StringComparison.Ordinal) && nOut >= 8)
+                else if (info.Type == GgmlTensorType.Q6_K)
                 {
-                    NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q6Kx8Size));
-                    RepackQ6K.Rows(w.Q6, (BlockQ6Kx8*)packed.Pointer, nIn, nOut & ~7);
-                    w.Packed6 = (BlockQ6Kx8*)packed.Pointer;
+                    w.Q6 = (BlockQ6K*)quant.Pointer;
+                    // Only per-layer Q6 weights take the prefill panel; the tied lm_head stays a GEMV.
+                    if (name.StartsWith("blk.", StringComparison.Ordinal) && nOut >= 8)
+                    {
+                        NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q6Kx8Size));
+                        RepackQ6K.Rows(w.Q6, (BlockQ6Kx8*)packed.Pointer, nIn, nOut & ~7);
+                        w.Packed6 = (BlockQ6Kx8*)packed.Pointer;
+                    }
                 }
+                else if (info.Type == GgmlTensorType.Q8_0)
+                {
+                    w.Q8 = (BlockQ8_0*)quant.Pointer;
+                    // token_embd is also packed: lm_head runs one panel GEMV per
+                    // token, which reads weights as a single sequential stream.
+                    if (nOut >= 8)
+                    {
+                        NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q8_0x8Size));
+                        RepackQ8_0.Rows(w.Q8, (BlockQ8_0x8*)packed.Pointer, nIn, nOut & ~7);
+                        w.Packed8 = (BlockQ8_0x8*)packed.Pointer;
+                    }
+                }
+                else
+                    throw new NotSupportedException($"Unsupported quantized tensor type {info.Type} for {name}");
             }
 
             _weights[name] = w;
@@ -477,6 +515,8 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         public BlockSTQ1_0* STQ;
         public BlockSTQ1_0x8* PackedSTQ;
         public BlockQ6Kx8* Packed6;
+        public BlockQ8_0* Q8;
+        public BlockQ8_0x8* Packed8;
         public float* F32;
         public int NIn;
         public int NOut;

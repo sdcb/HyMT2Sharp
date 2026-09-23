@@ -58,26 +58,12 @@ public sealed unsafe partial class HunyuanDenseModel
 
         int kvLen = start + seq;
         float scale = 1f / MathF.Sqrt(dim);
-        float* sc = (float*)Bump((nuint)((long)heads * seq * kvLen * sizeof(float)));
-        long t0 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
-        Ops.AttentionScores(q, _cacheK[layer], sc, heads, kvHeads, dim, seq, kvLen, qDim, kDim, scale, start, _pool);
-        if (ProfileEnabled)
-        {
-            TicksAttnScore += Stopwatch.GetTimestamp() - t0;
-            t0 = Stopwatch.GetTimestamp();
-        }
-
-        Ops.SoftmaxCausal(sc, heads, seq, kvLen, start, _pool);
-        if (ProfileEnabled)
-        {
-            TicksSoftmax += Stopwatch.GetTimestamp() - t0;
-            t0 = Stopwatch.GetTimestamp();
-        }
-
+        float* sc = (float*)Bump((nuint)((long)heads * kvLen * sizeof(float)));
         float* ao = (float*)Bump((nuint)((long)seq * qDim * sizeof(float)));
-        Ops.AttentionCombine(_cacheV[layer], sc, ao, heads, kvHeads, dim, seq, kvLen, qDim, kDim, start, _pool);
+        long t0 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
+        Ops.AttentionDecode(q, _cacheK[layer], _cacheV[layer], sc, ao, heads, kvHeads, dim, kvLen, kDim, scale, start, _pool);
         if (ProfileEnabled)
-            TicksAttnCombine += Stopwatch.GetTimestamp() - t0;
+            TicksAttnScore += Stopwatch.GetTimestamp() - t0;
 
         DecodeLinear(ao, $"blk.{layer}.attn_output.weight", output, qDim, Config.HiddenSize);
     }
@@ -90,35 +76,32 @@ public sealed unsafe partial class HunyuanDenseModel
         int hidden = Config.HiddenSize;
         int qDim = Config.NumHeads * Config.HeadDim;
         int kDim = Config.NumKvHeads * Config.HeadDim;
+        if (wq.Type == GgmlTensorType.Q8_0 && wk.Type == GgmlTensorType.Q8_0 && wv.Type == GgmlTensorType.Q8_0)
+        {
+            long t8 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
+            DecodeQ8Triple(input, wq, wk, wv, q, k, v, hidden, qDim, kDim, kDim);
+            if (ProfileEnabled)
+                TicksQ8 += Stopwatch.GetTimestamp() - t8;
+            return;
+        }
+
         nuint q8Bytes = (nuint)Q8K.RowBytes(hidden);
         BlockQ8K* y = (BlockQ8K*)_gemmScratch.D(q8Bytes);
         Q8K.QuantizeRow(input, y, hidden);
         long t0 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
-        GemvPrequant(wq, y, q, hidden, qDim);
-        GemvPrequant(wk, y, k, hidden, kDim);
-        if (ProfileEnabled)
+        if (wq.Type == GgmlTensorType.Q6_K && wk.Type == GgmlTensorType.Q6_K && wv.Type == GgmlTensorType.Q6_K)
         {
-            if (wq.Type == GgmlTensorType.Q2_0C) TicksQ2 += Stopwatch.GetTimestamp() - t0;
-            else if (wq.Type == GgmlTensorType.STQ1_0) TicksSTQ += Stopwatch.GetTimestamp() - t0;
-            else TicksQ4 += Stopwatch.GetTimestamp() - t0;
-        }
-        t0 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
-        if (wv.Type == GgmlTensorType.Q6_K)
-        {
-            Q6K.GemvPrequant(wv.Q6, y, v, hidden, kDim, _pool);
-            if (ProfileEnabled)
-                TicksQ6 += Stopwatch.GetTimestamp() - t0;
+            Q6K.GemvPrequantMulti(y, hidden, _pool, wq.Q6, q, qDim, wk.Q6, k, kDim, wv.Q6, v, kDim);
         }
         else
         {
+            GemvPrequant(wq, y, q, hidden, qDim);
+            GemvPrequant(wk, y, k, hidden, kDim);
             GemvPrequant(wv, y, v, hidden, kDim);
-                if (ProfileEnabled)
-                {
-                    if (wv.Type == GgmlTensorType.Q2_0C) TicksQ2 += Stopwatch.GetTimestamp() - t0;
-                    else if (wv.Type == GgmlTensorType.STQ1_0) TicksSTQ += Stopwatch.GetTimestamp() - t0;
-                    else TicksQ4 += Stopwatch.GetTimestamp() - t0;
-                }
         }
+
+        if (ProfileEnabled)
+            AddMatmulTicks(wq.Type, Stopwatch.GetTimestamp() - t0);
     }
 
     private void DecodeGateUp(float* input, float* gate, float* up, int layer)
@@ -127,18 +110,36 @@ public sealed unsafe partial class HunyuanDenseModel
         Weight wu = _weights[$"blk.{layer}.ffn_up.weight"];
         int hidden = Config.HiddenSize;
         int ffn = Config.FfnSize;
+        if (wg.Type == GgmlTensorType.Q8_0 && wu.Type == GgmlTensorType.Q8_0)
+        {
+            long t8 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
+            int blocks = hidden / Qk.Q8_0Block;
+            BlockQ8_0Act* act = (BlockQ8_0Act*)_gemmScratch.D((nuint)blocks * (nuint)Qk.Q8_0ActSize);
+            Q8_0.QuantizeActs(input, act, hidden);
+            Q8_0.GemvPackedMulti(act, hidden, _pool,
+                new Q8GemvTarget(wg.Packed8, wg.Q8, gate, ffn),
+                new Q8GemvTarget(wu.Packed8, wu.Q8, up, ffn));
+            if (ProfileEnabled)
+                TicksQ8 += Stopwatch.GetTimestamp() - t8;
+            return;
+        }
+
         nuint q8Bytes = (nuint)Q8K.RowBytes(hidden);
         BlockQ8K* y = (BlockQ8K*)_gemmScratch.D(q8Bytes);
         Q8K.QuantizeRow(input, y, hidden);
         long t0 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
-        GemvPrequant(wg, y, gate, hidden, ffn);
-        GemvPrequant(wu, y, up, hidden, ffn);
-        if (ProfileEnabled)
+        if (wg.Type == GgmlTensorType.Q6_K && wu.Type == GgmlTensorType.Q6_K)
         {
-            if (wg.Type == GgmlTensorType.Q2_0C) TicksQ2 += Stopwatch.GetTimestamp() - t0;
-            else if (wg.Type == GgmlTensorType.STQ1_0) TicksSTQ += Stopwatch.GetTimestamp() - t0;
-            else TicksQ4 += Stopwatch.GetTimestamp() - t0;
+            Q6K.GemvPrequantMulti(y, hidden, _pool, wg.Q6, gate, ffn, wu.Q6, up, ffn);
         }
+        else
+        {
+            GemvPrequant(wg, y, gate, hidden, ffn);
+            GemvPrequant(wu, y, up, hidden, ffn);
+        }
+
+        if (ProfileEnabled)
+            AddMatmulTicks(wg.Type, Stopwatch.GetTimestamp() - t0);
     }
 
     private void DecodeLinear(float* input, string name, float* output, int nIn, int nOut)
@@ -167,6 +168,11 @@ public sealed unsafe partial class HunyuanDenseModel
                 if (ProfileEnabled)
                     TicksQ6 += Stopwatch.GetTimestamp() - t0;
                 break;
+            case GgmlTensorType.Q8_0:
+                MulMatQ8_0.Gemv(w.Packed8, w.Q8, input, output, nIn, nOut, _pool, _gemmScratch);
+                if (ProfileEnabled)
+                    TicksQ8 += Stopwatch.GetTimestamp() - t0;
+                break;
             default:
                 throw new NotSupportedException($"{name} type {w.Type} is not a decode GEMV weight.");
         }
@@ -178,8 +184,30 @@ public sealed unsafe partial class HunyuanDenseModel
             MulMatQ2.GemvPrequant(w.Packed2, w.Q2, x, y, nIn, nOut, _pool);
         else if (w.Type == GgmlTensorType.STQ1_0)
             MulMatSTQ.GemvPrequant(w.PackedSTQ, w.STQ, x, y, nIn, nOut, _pool);
+        else if (w.Type == GgmlTensorType.Q6_K)
+            Q6K.GemvPrequant(w.Q6, x, y, nIn, nOut, _pool);
         else
             MulMatQ4K.GemvPrequant(w.Q4, x, y, nIn, nOut, _pool);
+    }
+
+    private void DecodeQ8Triple(float* input, Weight a, Weight b, Weight c, float* ya, float* yb, float* yc, int nIn, int na, int nb, int nc)
+    {
+        int blocks = nIn / Qk.Q8_0Block;
+        BlockQ8_0Act* act = (BlockQ8_0Act*)_gemmScratch.D((nuint)blocks * (nuint)Qk.Q8_0ActSize);
+        Q8_0.QuantizeActs(input, act, nIn);
+        Q8_0.GemvPackedMulti(act, nIn, _pool,
+            new Q8GemvTarget(a.Packed8, a.Q8, ya, na),
+            new Q8GemvTarget(b.Packed8, b.Q8, yb, nb),
+            new Q8GemvTarget(c.Packed8, c.Q8, yc, nc));
+    }
+
+    private static void AddMatmulTicks(GgmlTensorType type, long dt)
+    {
+        if (type == GgmlTensorType.Q2_0C) TicksQ2 += dt;
+        else if (type == GgmlTensorType.STQ1_0) TicksSTQ += dt;
+        else if (type == GgmlTensorType.Q6_K) TicksQ6 += dt;
+        else if (type == GgmlTensorType.Q8_0) TicksQ8 += dt;
+        else TicksQ4 += dt;
     }
 
     private void RmsSerial(string name, float* x, float* y, int rows, int dim)

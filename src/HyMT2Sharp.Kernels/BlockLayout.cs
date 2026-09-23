@@ -17,6 +17,13 @@ public static class Qk
     public const int Q5KSize = 176;
     public const int Q6KSize = 210;
     public const int Q6Kx8Size = 2848;
+    public const int Q8_0Block = 32;
+    public const int Q8_0Size = 34;
+    // Eight Q8_0 columns, one 32-value block. Qs holds signed bytes grouped as
+    // column c's K values 4j..4j+3 so one activation dword broadcast feeds all 8 columns.
+    public const int Q8_0x8Size = 8 * sizeof(float) + Q8_0Block * 8;
+    public const int Q8_0x4Size = 4 * sizeof(float) + 4 * sizeof(int) + Q8_0Block * 4;
+    public const int Q8_0ActSize = 8 + Q8_0Block;
     public const int Q2_0CSize = 130;
     public const int Q2x8Size = 1056;
     public const int STQ1_0BlockLength = 256;
@@ -141,6 +148,46 @@ public unsafe struct BlockQ8Kx4
 /// <see cref="Scales"/>[i] is [sc_i(c0) sc_i(c0) … sc_i(c7) sc_i(c7)] for 16-value sub-block i;
 /// <see cref="ScalePairs"/>[p] is [sc_2p(c0) sc_2p+1(c0) …] for the −32 bsum correction.
 /// </summary>
+/// <summary>GGUF Q8_0 block: fp16 scale plus 32 signed int8 values. 34 bytes, tightly packed.</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockQ8_0
+{
+    public ushort D;
+    public fixed sbyte Qs[Qk.Q8_0Block];
+}
+
+/// <summary>One activation row of Q8_0 for GEMV. <see cref="Sum"/> is the sum of the 32 signed quants.</summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockQ8_0Act
+{
+    public float D;
+    public int Sum;
+    public fixed sbyte Qs[Qk.Q8_0Block];
+}
+
+/// <summary>
+/// Four activation rows, 32 K values. <c>Qs[r * 32 + k]</c> is row r.
+/// <c>Bias[r]</c> is 128 times the sum of row r's 32 signed quants, for the VNNI +128 weight bias.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockQ8_0x4
+{
+    public fixed float D[4];
+    public fixed int Bias[4];
+    public fixed sbyte Qs[Qk.Q8_0Block * 4];
+}
+
+/// <summary>
+/// Eight Q8_0 columns. <see cref="Qs"/> chunk j (32 bytes) is columns 0..7 × K values
+/// 4j..4j+3, stored as signed int8 bit patterns.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockQ8_0x8
+{
+    public fixed float D[8];
+    public fixed byte Qs[Qk.Q8_0Block * 8];
+}
+
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public unsafe struct BlockQ6Kx8
 {

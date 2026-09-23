@@ -137,21 +137,16 @@ public static unsafe class Q6K
                 Vector256<sbyte> q83 = Avx.LoadVector256(q8);
                 q8 += 32;
 
-                Vector256<short> p160 = Avx2.MultiplyAddAdjacent(q40, q80);
-                Vector256<short> p161 = Avx2.MultiplyAddAdjacent(q41, q81);
-                Vector256<short> p162 = Avx2.MultiplyAddAdjacent(q42, q82);
-                Vector256<short> p163 = Avx2.MultiplyAddAdjacent(q43, q83);
-
-                Vector128<sbyte> scale0 = Ssse3.Shuffle(scales, ScaleShuffle(iscale + 0));
-                Vector128<sbyte> scale1 = Ssse3.Shuffle(scales, ScaleShuffle(iscale + 1));
-                Vector128<sbyte> scale2 = Ssse3.Shuffle(scales, ScaleShuffle(iscale + 2));
-                Vector128<sbyte> scale3 = Ssse3.Shuffle(scales, ScaleShuffle(iscale + 3));
+                Vector256<short> sc0 = Avx2.ConvertToVector256Int16(Ssse3.Shuffle(scales, ScaleShuffle(iscale + 0)));
+                Vector256<short> sc1 = Avx2.ConvertToVector256Int16(Ssse3.Shuffle(scales, ScaleShuffle(iscale + 1)));
+                Vector256<short> sc2 = Avx2.ConvertToVector256Int16(Ssse3.Shuffle(scales, ScaleShuffle(iscale + 2)));
+                Vector256<short> sc3 = Avx2.ConvertToVector256Int16(Ssse3.Shuffle(scales, ScaleShuffle(iscale + 3)));
                 iscale += 4;
 
-                Vector256<int> i0 = Avx2.MultiplyAddAdjacent(Avx2.ConvertToVector256Int16(scale0), p160);
-                Vector256<int> i1 = Avx2.MultiplyAddAdjacent(Avx2.ConvertToVector256Int16(scale1), p161);
-                Vector256<int> i2 = Avx2.MultiplyAddAdjacent(Avx2.ConvertToVector256Int16(scale2), p162);
-                Vector256<int> i3 = Avx2.MultiplyAddAdjacent(Avx2.ConvertToVector256Int16(scale3), p163);
+                Vector256<int> i0 = ScaleQ6(q40, q80, sc0);
+                Vector256<int> i1 = ScaleQ6(q41, q81, sc1);
+                Vector256<int> i2 = ScaleQ6(q42, q82, sc2);
+                Vector256<int> i3 = ScaleQ6(q43, q83, sc3);
                 sumi = Avx2.Add(sumi, Avx2.Add(i0, i1));
                 sumi = Avx2.Add(sumi, Avx2.Add(i2, i3));
             }
@@ -260,15 +255,32 @@ public static unsafe class Q6K
         Vector256<short> sc2,
         Vector256<short> sc3)
     {
-        Vector256<short> p0 = Avx2.MultiplyAddAdjacent(q40, Avx.LoadVector256(q8));
-        Vector256<short> p1 = Avx2.MultiplyAddAdjacent(q41, Avx.LoadVector256(q8 + 32));
-        Vector256<short> p2 = Avx2.MultiplyAddAdjacent(q42, Avx.LoadVector256(q8 + 64));
-        Vector256<short> p3 = Avx2.MultiplyAddAdjacent(q43, Avx.LoadVector256(q8 + 96));
-        Vector256<int> i0 = Avx2.MultiplyAddAdjacent(sc0, p0);
-        Vector256<int> i1 = Avx2.MultiplyAddAdjacent(sc1, p1);
-        Vector256<int> i2 = Avx2.MultiplyAddAdjacent(sc2, p2);
-        Vector256<int> i3 = Avx2.MultiplyAddAdjacent(sc3, p3);
+        Vector256<int> i0 = ScaleQ6(q40, Avx.LoadVector256(q8), sc0);
+        Vector256<int> i1 = ScaleQ6(q41, Avx.LoadVector256(q8 + 32), sc1);
+        Vector256<int> i2 = ScaleQ6(q42, Avx.LoadVector256(q8 + 64), sc2);
+        Vector256<int> i3 = ScaleQ6(q43, Avx.LoadVector256(q8 + 96), sc3);
         sum = Avx2.Add(sum, Avx2.Add(Avx2.Add(i0, i1), Avx2.Add(i2, i3)));
+    }
+
+    /// <summary>
+    /// 32 unsigned 6-bit values × signed activations, then the shuffled Q6 scales.
+    /// <paramref name="sc"/> is 8 copies of s0 followed by 8 copies of s1.
+    /// vpmaddubsw pairs beat vpdpbusd+vpmulld here: the VNNI variant scales each
+    /// dot lane separately, which is slower on Raptor Lake measured 2026-04.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<int> ScaleQ6(Vector256<byte> q, Vector256<sbyte> a, Vector256<short> sc) =>
+        ScaleQ6Avx2(q, a, sc);
+
+    public static Vector256<int> ScaleQ6Avx2(Vector256<byte> q, Vector256<sbyte> a, Vector256<short> sc) =>
+        Avx2.MultiplyAddAdjacent(sc, Avx2.MultiplyAddAdjacent(q, a));
+
+    public static Vector256<int> ScaleQ6Vnni(Vector256<byte> q, Vector256<sbyte> a, Vector256<short> sc)
+    {
+        Vector256<int> dots = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, q, a);
+        int s0 = sc.GetElement(0);
+        int s1 = sc.GetElement(8);
+        return Avx2.MultiplyLow(dots, Vector256.Create(s0, s0, s0, s0, s1, s1, s1, s1));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -415,17 +427,62 @@ public static unsafe class Q6K
     public static void GemvPrequant(BlockQ6K* weights, BlockQ8K* y, float* output, int nIn, int nOut, CpuThreadPool? pool)
     {
         int nb = nIn / Qk.SuperBlock;
+        int next = 0;
         void Body(int worker, int workers)
         {
-            int begin = nOut * worker / workers;
-            int end = nOut * (worker + 1) / workers;
-            for (int row = begin; row < end; row++)
-                output[row] = Dot(weights + row * nb, y, nIn);
+            // Dynamic chunks: a worker on a slow memory patch takes fewer rows
+            // instead of gating the whole GEMV (same trick as ggml mul_mat).
+            // ~16 claims per worker keeps each claim a long contiguous stream.
+            int chunk = Math.Max(8, nOut / (workers * 16));
+            int begin;
+            while ((begin = Interlocked.Add(ref next, chunk) - chunk) < nOut)
+            {
+                int end = Math.Min(begin + chunk, nOut);
+                for (int row = begin; row < end; row++)
+                    output[row] = Dot(weights + row * nb, y, nIn);
+            }
         }
 
         if (pool == null)
             Body(0, 1);
         else
             pool.For(nOut, Body);
+    }
+
+    /// <summary>
+    /// One parallel region over several weights sharing the same Q8_K activation:
+    /// decode pays one dispatch for Q,K,V or gate,up instead of one per weight.
+    /// </summary>
+    public static void GemvPrequantMulti(BlockQ8K* y, int nIn, CpuThreadPool? pool, BlockQ6K* w0, float* d0, int n0, BlockQ6K* w1, float* d1, int n1, BlockQ6K* w2 = null, float* d2 = null, int n2 = 0)
+    {
+        int nb = nIn / Qk.SuperBlock;
+        int total = n0 + n1 + n2;
+        int next = 0;
+        void Body(int worker, int workers)
+        {
+            int chunk = Math.Max(8, total / (workers * 16));
+            int begin;
+            while ((begin = Interlocked.Add(ref next, chunk) - chunk) < total)
+            {
+                int end = Math.Min(begin + chunk, total);
+                int r0 = Math.Clamp(begin, 0, n0);
+                int r1 = Math.Clamp(end, 0, n0);
+                for (int row = r0; row < r1; row++)
+                    d0[row] = Dot(w0 + row * nb, y, nIn);
+                r0 = Math.Clamp(begin - n0, 0, n1);
+                r1 = Math.Clamp(end - n0, 0, n1);
+                for (int row = r0; row < r1; row++)
+                    d1[row] = Dot(w1 + row * nb, y, nIn);
+                r0 = Math.Clamp(begin - n0 - n1, 0, n2);
+                r1 = Math.Clamp(end - n0 - n1, 0, n2);
+                for (int row = r0; row < r1; row++)
+                    d2[row] = Dot(w2 + row * nb, y, nIn);
+            }
+        }
+
+        if (pool == null || total == 0)
+            Body(0, 1);
+        else
+            pool.For(total, Body);
     }
 }

@@ -4,7 +4,7 @@
 
 Unofficial pure C# CPU inference for [Hy-MT2](https://huggingface.co/tencent/Hy-MT2-1.8B) (`hunyuan-dense`). No llama.cpp or ONNX Runtime; AVX2 kernels are built in. Intended for in-process use.
 
-Validated GGUF quantizations: **Q4_K_M**, **Q2_0C**, and **1.25-bit STQ1_0**. Other formats and model sizes have not been tested.
+Validated GGUF quantizations: **Q8_0**, **Q6_K**, **Q4_K_M**, **Q2_0C**, and **1.25-bit STQ1_0**. Other formats and model sizes have not been tested.
 
 ## Models
 
@@ -14,6 +14,8 @@ Weights are not shipped in the NuGet packages. Download a GGUF yourself:
 | --- | --- |
 | 1.25-bit STQ1_0 | [Hy-MT2-1.8B-1.25Bit-GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-1.25Bit-GGUF) |
 | Q2_0C | [Hy-MT2-1.8B-2Bit-GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-2Bit-GGUF) |
+| Q8_0 | [Hy-MT2-1.8B-GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF) |
+| Q6_K | [Hy-MT2-1.8B-GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF) |
 | Q4_K_M | [Hy-MT2-1.8B-GGUF](https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF) |
 
 ## Quick start
@@ -125,6 +127,8 @@ Environment: Ryzen 7 5800X (Zen 3), Windows, Release, 8 threads, `avx2=True`, `v
 
 Q1.25 and Q2 decode at about the same rate. Versus Q4, Q1.25 prefill is ~33% faster and decode ~74% faster. A 5800X under sustained load will wander with clocks and temperature; these numbers are not a hardware ceiling. The llama.cpp row is a previous measurement and was not re-run with this pass.
 
+A second box (**dev machine B**: hybrid CPU, 8 P-cores, DDR4-3200, Release) re-measured Q4 / Q6 / Q8 against CPU-only llama.cpp in the same window: **prefill is ~4–6× llama.cpp** (Q6 463.7 vs 119.1, Q8 548.8 vs 93.0 tok/s); decode sits at the memory-bandwidth wall, in the same ballpark as llama.cpp but ~3–11% slower. Full data, bandwidth microbenchmarks, and noise caveats: [docs/perf-B.md](docs/perf-B.md) (Chinese).
+
 Reproduce:
 
 ```powershell
@@ -137,6 +141,9 @@ Q2 panels default to a 64 KiB tile (`--q2-col-tile-kb 64`). `--profile` prints S
 
 ## Implementation notes
 
+- **Q8_0**: 34 B / 32 weights. Layer weights (including `token_embd`, which doubles as `lm_head`) are repacked into 8-column panels; prefill consumes 8 tokens per pass and decode runs GEMV directly on the panel so weights stream as one sequential read. Inner products use `vpdpbusd` with AVX-VNNI, else `vpmaddubsw`. Activations quantize to ±127. The QKV and gate/up GEMVs each fuse into a single parallel dispatch; output rows are claimed by workers in dynamic chunks (`Interlocked.Add`, same idea as ggml `mul_mat`).
+- **Q6_K**: keeps the `q6_Kx8 × q8_Kx4` panel. Q, K, V and gate/up share one activation quantization and one parallel dispatch, with the same dynamic chunking. The inner product is fixed to AVX2 `vpmaddubsw` + `vpmaddwd` (the VNNI variant measured slower on Raptor Lake; VNNI code remains for other CPUs and tests).
+- **Decode attention**: scores → softmax → combine are fused per head inside a single parallel dispatch so the score row stays cache-hot.
 - **Q4_K_M**: `q4_Kx8 × q8_Kx4` AVX2 panel GEMM; decode uses Q8 row quant + GEMV.
 - **Q2_0C**: compressed 8-column panels; 2-bit weights stay packed (no per-weight byte expansion).
 - **STQ1_0**: 42 B / 256-weight stride-16 blocks, repacked to 8-row panels; prefill and decode both use AVX2 GEMV / GEMM.

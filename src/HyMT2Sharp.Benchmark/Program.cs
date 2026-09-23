@@ -1,4 +1,7 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using Sdcb.HyMT2Sharp.Gguf;
 using Sdcb.HyMT2Sharp.Kernels;
 using Sdcb.HyMT2Sharp.Model;
@@ -24,6 +27,15 @@ if (args.Contains("--dump-q4-gemm"))
 if (args.Contains("--micro-q4"))
 {
     MicroQ4(Args.GetInt(args, "--micro-in", 2048), Args.GetInt(args, "--micro-out", 64), Args.GetInt(args, "--micro-tokens", 32), Args.GetInt(args, "--micro-reps", 500));
+    return;
+}
+
+if (args.Contains("--micro-q8"))
+{
+    if (args.Contains("--micro-model"))
+        MicroQ8Model(Args.GetInt(args, "--micro-reps", 8), threads, args.Contains("--micro-arena"));
+    else
+        MicroQ8(Args.GetInt(args, "--micro-in", 2048), Args.GetInt(args, "--micro-out", 6144), Args.GetInt(args, "--micro-reps", 200), threads);
     return;
 }
 
@@ -168,6 +180,7 @@ static void PrintProfile(string phase)
     double q2 = HunyuanDenseModel.TicksQ2 / freq * 1000.0;
     double stq = HunyuanDenseModel.TicksSTQ / freq * 1000.0;
     double q6 = HunyuanDenseModel.TicksQ6 / freq * 1000.0;
+    double q8 = HunyuanDenseModel.TicksQ8 / freq * 1000.0;
     double score = HunyuanDenseModel.TicksAttnScore / freq * 1000.0;
     double soft = HunyuanDenseModel.TicksSoftmax / freq * 1000.0;
     double comb = HunyuanDenseModel.TicksAttnCombine / freq * 1000.0;
@@ -176,8 +189,8 @@ static void PrintProfile(string phase)
     double silu = HunyuanDenseModel.TicksSilu / freq * 1000.0;
     double quant = HunyuanDenseModel.TicksQuant / freq * 1000.0;
     double embed = HunyuanDenseModel.TicksEmbed / freq * 1000.0;
-    double accounted = q4 + q2 + stq + q6 + score + soft + comb + rms + rope + silu + quant + embed;
-    Console.WriteLine($"profile {phase}: q4={q4:F0}ms q2={q2:F0}ms stq={stq:F0}ms q6={q6:F0}ms attnQK={score:F0}ms softmax={soft:F0}ms attnAV={comb:F0}ms rms={rms:F0}ms rope={rope:F0}ms silu={silu:F0}ms embed={embed:F0}ms accounted={accounted:F0}ms");
+    double accounted = q4 + q2 + stq + q6 + q8 + score + soft + comb + rms + rope + silu + quant + embed;
+    Console.WriteLine($"profile {phase}: q4={q4:F0}ms q2={q2:F0}ms stq={stq:F0}ms q6={q6:F0}ms q8={q8:F0}ms attnQK={score:F0}ms softmax={soft:F0}ms attnAV={comb:F0}ms rms={rms:F0}ms rope={rope:F0}ms silu={silu:F0}ms embed={embed:F0}ms accounted={accounted:F0}ms");
 }
 
 static unsafe void MicroQ4(int nIn, int nOut, int tokens, int reps)
@@ -208,6 +221,180 @@ static unsafe void MicroQ4(int nIn, int nOut, int tokens, int reps)
     double macs = (double)nIn * nOut * tokens * reps;
     double maddubs = macs / 32;
     Console.WriteLine($"micro-q4 in={nIn} out={nOut} tokens={tokens} weights={(nOut / 8) * nb * Qk.Q4Kx8Size / 1024}KB act={(tokens / 4) * nb * Qk.Q8Kx4Size / 1024}KB  {sw.Elapsed.TotalMilliseconds:F1} ms  {macs / sw.Elapsed.TotalSeconds / 1e9:F1} GMAC/s  {maddubs / sw.Elapsed.TotalSeconds / 1e9:F2} G-maddubs/s (peak ~9 at 4.5GHz)");
+}
+
+static unsafe void MicroQ8(int nIn, int nOut, int reps, int threads)
+{
+    int nb = nIn / Qk.Q8_0Block;
+    using NativeBuffer q8 = new((nuint)((long)nOut * nb * Qk.Q8_0Size));
+    using NativeBuffer q8x8 = new((nuint)((long)(nOut / 8) * nb * Qk.Q8_0x8Size));
+    using NativeBuffer act = new((nuint)(nb * Qk.Q8_0ActSize));
+    using NativeBuffer dst = new((nuint)(nOut * sizeof(float)));
+    using NativeBuffer src = new((nuint)(nIn * sizeof(float)));
+    float* input = (float*)src.Pointer;
+    for (int i = 0; i < nIn; i++)
+        input[i] = MathF.Sin(i * 0.37f);
+    BlockQ8_0* rows = (BlockQ8_0*)q8.Pointer;
+    for (int r = 0; r < nOut * nb; r++)
+    {
+        rows[r].D = Sdcb.HyMT2Sharp.Kernels.HalfBits.FromSingle(0.5f);
+        for (int k = 0; k < Qk.Q8_0Block; k++)
+            rows[r].Qs[k] = (sbyte)((r * 31 + k * 7) & 0x7F);
+    }
+
+    RepackQ8_0.Rows(rows, (BlockQ8_0x8*)q8x8.Pointer, nIn, nOut);
+    Q8_0.QuantizeActs(input, (BlockQ8_0Act*)act.Pointer, nIn);
+    using CpuThreadPool pool = new(threads);
+    for (int i = 0; i < 20; i++)
+        Q8_0.GemvPrequant(rows, (BlockQ8_0Act*)act.Pointer, (float*)dst.Pointer, nIn, nOut, pool);
+    Stopwatch sw = Stopwatch.StartNew();
+    for (int i = 0; i < reps; i++)
+        Q8_0.GemvPrequant(rows, (BlockQ8_0Act*)act.Pointer, (float*)dst.Pointer, nIn, nOut, pool);
+    sw.Stop();
+    double bytes = (double)nOut * nb * Qk.Q8_0Size * reps;
+    Console.WriteLine($"micro-q8 gemv-rows in={nIn} out={nOut} {sw.Elapsed.TotalMilliseconds:F1} ms  {bytes / sw.Elapsed.TotalSeconds / 1e9:F1} GB/s");
+
+    for (int i = 0; i < 20; i++)
+        Q8_0.GemvPacked((BlockQ8_0x8*)q8x8.Pointer, rows, (BlockQ8_0Act*)act.Pointer, (float*)dst.Pointer, nIn, nOut, pool);
+    sw.Restart();
+    for (int i = 0; i < reps; i++)
+        Q8_0.GemvPacked((BlockQ8_0x8*)q8x8.Pointer, rows, (BlockQ8_0Act*)act.Pointer, (float*)dst.Pointer, nIn, nOut, pool);
+    sw.Stop();
+    bytes = (double)(nOut / 8) * nb * Qk.Q8_0x8Size * reps;
+    Console.WriteLine($"micro-q8 gemv-packed in={nIn} out={nOut} {sw.Elapsed.TotalMilliseconds:F1} ms  {bytes / sw.Elapsed.TotalSeconds / 1e9:F1} GB/s");
+}
+
+/// <summary>Replay one decode token's worth of Q8_0 GEMVs at model shapes.</summary>
+static unsafe void MicroQ8Model(int reps, int threads, bool useArena)
+{
+    const int hidden = 2048;
+    const int ffn = 6144;
+    const int qDim = 2048;
+    const int kDim = 512;
+    const int layers = 32;
+    const int vocab = 120816;
+    (int nIn, int nOut)[] shapes =
+    [
+        (hidden, qDim), (hidden, kDim), (hidden, kDim), (qDim, hidden),
+        (hidden, ffn), (hidden, ffn), (ffn, hidden),
+    ];
+    nuint[] wsBytes = new nuint[shapes.Length];
+    for (int i = 0; i < shapes.Length; i++)
+        wsBytes[i] = (nuint)((long)(shapes[i].nOut / 8) * (shapes[i].nIn / Qk.Q8_0Block) * Qk.Q8_0x8Size);
+    using NativeBuffer lm = new((nuint)((long)(vocab / 8) * (hidden / Qk.Q8_0Block) * Qk.Q8_0x8Size));
+    NativeBuffer[] ws = new NativeBuffer[shapes.Length * layers];
+    NativeBuffer[] dsts = new NativeBuffer[shapes.Length];
+    nuint[] wptr = new nuint[shapes.Length * layers];
+    NativeBuffer? arena = null;
+    try
+    {
+        if (useArena)
+        {
+            nuint total = 0;
+            for (int i = 0; i < shapes.Length; i++)
+                total += wsBytes[i] * (nuint)layers;
+            arena = new NativeBuffer(total + (nuint)(shapes.Length * layers) * 4096);
+            nuint at = 0;
+            for (int i = 0; i < shapes.Length; i++)
+            {
+                for (int l = 0; l < layers; l++)
+                {
+                    wptr[i * layers + l] = (nuint)arena.Pointer + at;
+                    at += wsBytes[i];
+                    at = (at + 4095) & ~(nuint)4095;
+                }
+
+                dsts[i] = new NativeBuffer((nuint)(shapes[i].nOut * sizeof(float)));
+            }
+        }
+        else
+        {
+            for (int i = 0; i < shapes.Length; i++)
+            {
+                for (int l = 0; l < layers; l++)
+                {
+                    NativeBuffer b = ws[i * layers + l] = new(wsBytes[i]);
+                    NativeMemory.Clear(b.Pointer, Math.Min(b.Bytes, (nuint)4096));
+                    wptr[i * layers + l] = (nuint)b.Pointer;
+                }
+
+                dsts[i] = new NativeBuffer((nuint)(shapes[i].nOut * sizeof(float)));
+            }
+        }
+
+        using NativeBuffer actB = new((nuint)((ffn / Qk.Q8_0Block) * Qk.Q8_0ActSize));
+        using NativeBuffer lmDst = new((nuint)(vocab * sizeof(float)));
+        using CpuThreadPool pool = new(threads);
+        void LayerToken(int l)
+        {
+            BlockQ8_0x8* wq = (BlockQ8_0x8*)wptr[0 * layers + l];
+            BlockQ8_0x8* wk = (BlockQ8_0x8*)wptr[1 * layers + l];
+            BlockQ8_0x8* wv = (BlockQ8_0x8*)wptr[2 * layers + l];
+            BlockQ8_0Act* act = (BlockQ8_0Act*)actB.Pointer;
+            Q8_0.GemvPackedMulti(act, hidden, pool,
+                new Q8GemvTarget(wq, null, (float*)dsts[0].Pointer, qDim),
+                new Q8GemvTarget(wk, null, (float*)dsts[1].Pointer, kDim),
+                new Q8GemvTarget(wv, null, (float*)dsts[2].Pointer, kDim));
+            Q8_0.GemvPacked((BlockQ8_0x8*)wptr[3 * layers + l], null, act, (float*)dsts[3].Pointer, qDim, hidden, pool);
+            Q8_0.GemvPackedMulti(act, hidden, pool,
+                new Q8GemvTarget((BlockQ8_0x8*)wptr[4 * layers + l], null, (float*)dsts[4].Pointer, ffn),
+                new Q8GemvTarget((BlockQ8_0x8*)wptr[5 * layers + l], null, (float*)dsts[5].Pointer, ffn));
+            Q8_0.GemvPacked((BlockQ8_0x8*)wptr[6 * layers + l], null, act, (float*)dsts[6].Pointer, ffn, hidden, pool);
+        }
+
+        for (int i = 0; i < 2; i++)
+        {
+            for (int l = 0; l < layers; l++)
+                LayerToken(l);
+            Q8_0.GemvPacked((BlockQ8_0x8*)lm.Pointer, null, (BlockQ8_0Act*)actB.Pointer, (float*)lmDst.Pointer, hidden, vocab, pool);
+        }
+
+        Stopwatch sw = Stopwatch.StartNew();
+        for (int r = 0; r < reps; r++)
+        {
+            for (int l = 0; l < layers; l++)
+                LayerToken(l);
+            Q8_0.GemvPacked((BlockQ8_0x8*)lm.Pointer, null, (BlockQ8_0Act*)actB.Pointer, (float*)lmDst.Pointer, hidden, vocab, pool);
+        }
+
+        sw.Stop();
+        long perToken = 0;
+        foreach (nuint b in wsBytes)
+            perToken += (long)b;
+        perToken *= layers;
+        perToken += (long)lm.Bytes;
+        double gemvMs = sw.Elapsed.TotalMilliseconds;
+        Console.WriteLine($"micro-q8 model-seq {gemvMs:F1} ms  {perToken * (double)reps / gemvMs / 1e6:F1} GB/s  {reps / (gemvMs / 1000.0):F2} tok/s-equiv");
+
+        // Pure sequential read ceiling: same buffers, load-only kernel.
+        for (int i = 0; i < 2; i++)
+        {
+            for (int l = 0; l < layers; l++)
+                for (int s = 0; s < shapes.Length; s++)
+                    ReadOnly.Run((void*)wptr[s * layers + l], wsBytes[s], pool);
+            ReadOnly.Run(lm.Pointer, lm.Bytes, pool);
+        }
+
+        sw.Restart();
+        for (int r = 0; r < reps; r++)
+        {
+            for (int l = 0; l < layers; l++)
+                for (int s = 0; s < shapes.Length; s++)
+                    ReadOnly.Run((void*)wptr[s * layers + l], wsBytes[s], pool);
+            ReadOnly.Run(lm.Pointer, lm.Bytes, pool);
+        }
+
+        sw.Stop();
+        Console.WriteLine($"micro-q8 read-only  {sw.Elapsed.TotalMilliseconds:F1} ms  {perToken * (double)reps / sw.Elapsed.TotalSeconds / 1e9:F1} GB/s");
+    }
+    finally
+    {
+        foreach (NativeBuffer b in ws)
+            b?.Dispose();
+        foreach (NativeBuffer d in dsts)
+            d?.Dispose();
+        arena?.Dispose();
+    }
 }
 
 static unsafe void DumpQ4Gemm()
@@ -252,20 +439,88 @@ static unsafe void DumpSilu()
     Console.WriteLine($"dump-silu g0={g[0]}");
 }
 
-static int ArgMax(float[] logits)
+static unsafe int ArgMax(float[] logits)
 {
+    int n = logits.Length;
     int best = 0;
-    float max = logits[0];
-    for (int i = 1; i < logits.Length; i++)
+    float max;
+    fixed (float* p = logits)
     {
-        if (logits[i] > max)
+        if (Avx.IsSupported)
         {
-            max = logits[i];
-            best = i;
+            var vmax = Avx.LoadVector256(p);
+            var vidx = Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7);
+            var vbest = vidx;
+            var step = Vector256.Create(8);
+            int i = 8;
+            for (; i + 8 <= n; i += 8)
+            {
+                var v = Avx.LoadVector256(p + i);
+                vidx = Avx2.Add(vidx, step);
+                var gt = Avx.Compare(v, vmax, FloatComparisonMode.OrderedGreaterThanNonSignaling);
+                vmax = Avx.BlendVariable(vmax, v, gt);
+                vbest = Avx2.BlendVariable(vbest, vidx, gt.AsInt32());
+            }
+
+            best = 0;
+            max = vmax.GetElement(0);
+            for (int l = 1; l < 8; l++)
+            {
+                if (vmax.GetElement(l) > max)
+                {
+                    max = vmax.GetElement(l);
+                    best = vbest.GetElement(l);
+                }
+            }
+
+            for (; i < n; i++)
+            {
+                if (p[i] > max)
+                {
+                    max = p[i];
+                    best = i;
+                }
+            }
+
+            return best;
+        }
+
+        max = p[0];
+        for (int i = 1; i < n; i++)
+        {
+            if (p[i] > max)
+            {
+                max = p[i];
+                best = i;
+            }
         }
     }
 
     return best;
+}
+
+static unsafe class ReadOnly
+{
+    private static Vector256<byte> _sink;
+
+    public static void Run(void* ptr, nuint bytes, CpuThreadPool pool)
+    {
+        long n = (long)bytes / 32;
+        pool.For(1024, (int worker, int workers) =>
+        {
+            long begin = n * worker / workers;
+            long end = n * (worker + 1) / workers;
+            byte* p = (byte*)ptr + begin * 32;
+            Vector256<byte> acc = Vector256<byte>.Zero;
+            for (long i = begin; i < end; i++)
+            {
+                acc = Avx2.Xor(acc, Avx.LoadVector256(p));
+                p += 32;
+            }
+
+            _sink = acc;
+        });
+    }
 }
 
 static class Args

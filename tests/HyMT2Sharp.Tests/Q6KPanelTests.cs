@@ -1,4 +1,6 @@
 using System.Runtime.InteropServices;
+using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.X86;
 using Sdcb.HyMT2Sharp.Kernels;
 
 namespace Sdcb.HyMT2Sharp.Tests;
@@ -77,6 +79,28 @@ public sealed class Q6KPanelTests
                     Assert.True(a0[i].Bsums[j] == a1[i].Bsums[j], $"bsums[{i},{j}] {a0[i].Bsums[j]} vs {a1[i].Bsums[j]}");
             }
         }
+    }
+
+    [Fact]
+    public unsafe void ScaleProducts_Avx2MatchesVnni()
+    {
+        if (!Avx2.IsSupported || !AvxVnni.IsSupported)
+            return;
+
+        byte* q = stackalloc byte[32];
+        sbyte* a = stackalloc sbyte[32];
+        Random rng = new(6);
+        for (int i = 0; i < 32; i++)
+        {
+            q[i] = (byte)rng.Next(64);
+            a[i] = (sbyte)rng.Next(-127, 128);
+        }
+
+        Vector256<short> sc = Vector256.Create((short)3, 3, 3, 3, 3, 3, 3, 3, -5, -5, -5, -5, -5, -5, -5, -5);
+        Vector256<int> avx = Q6K.ScaleQ6Avx2(Avx.LoadVector256(q), Avx.LoadVector256(a), sc);
+        Vector256<int> vnni = Q6K.ScaleQ6Vnni(Avx.LoadVector256(q), Avx.LoadVector256(a), sc);
+        for (int i = 0; i < 8; i++)
+            Assert.Equal(avx.GetElement(i), vnni.GetElement(i));
     }
 
     private static float[] RandomRow(int n, int seed)
