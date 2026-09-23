@@ -116,18 +116,20 @@ static int ArgMax(float[] logits)
 
 ## Performance
 
-Environment: Ryzen 7 5800X (Zen 3), Windows, Release, 8 threads, `avx2=True`, `vnni=False`. Model load and warmup are excluded. Prefill is the mean of three 512-token runs. Decode is 128 tokens after a 512-token context. Same-day TensorSharp / llama.cpp numbers (Q1.25 / Q2 / Q4, version pins): [docs/engine-benchmark.md](docs/engine-benchmark.md) (Chinese).
+Environment: Ryzen 7 5800X (Zen 3), Windows, Release, 8 threads, `avx2=True`, `vnni=False`. Model load and warmup are excluded. Prefill is the mean of three 512-token runs. Decode is 128 tokens after a 512-token context. Full data (all five quantizations, same-window llama.cpp comparison, cross-machine numbers and bandwidth analysis): [docs/perf.md](docs/perf.md) (Chinese).
 
 | Model | prefill 512 | decode 128 | prefill reps |
 | --- | ---: | ---: | --- |
-| HyMT2Sharp Q1.25 / STQ1_0 | **553.63 tok/s** | 43.10 tok/s | 570.5 / 531.1 / 560.8 |
-| HyMT2Sharp Q2_0C | 541.00 tok/s | **43.79 tok/s** | 560.4 / 506.6 / 559.7 |
-| HyMT2Sharp Q4_K_M | 416.33 tok/s | 24.79 tok/s | 417.0 / 412.7 / 419.4 |
-| llama.cpp Q4_K_M (earlier) | 254.93 ± 3.10 tok/s | 27.39 ± 0.37 tok/s | `llama-bench -p 512 -n 128 -t 8 -ngl 0` |
+| HyMT2Sharp Q1.25 / STQ1_0 | **564.66 tok/s** | **47.75 tok/s** | 573.5 / 558.6 / 562.1 |
+| HyMT2Sharp Q2_0C | 488.95 tok/s | 47.53 tok/s | 494.6 / 492.0 / 480.5 |
+| HyMT2Sharp Q4_K_M | 423.99 tok/s | 26.55 tok/s | 426.8 / 419.8 / 425.5 |
+| HyMT2Sharp Q6_K | 403.25 tok/s | 22.96 tok/s | 410.0 / 391.5 / 408.9 |
+| HyMT2Sharp Q8_0 | 319.81 tok/s | 16.60 tok/s | 318.5 / 319.9 / 321.0 |
+| llama.cpp Q4_K_M | 246.24 ± 0.82 tok/s | 31.57 ± 0.17 tok/s | `llama-bench -p 512 -n 128 -t 8 -ngl 0 -dev none` |
 
-Q1.25 and Q2 decode at about the same rate. Versus Q4, Q1.25 prefill is ~33% faster and decode ~74% faster. A 5800X under sustained load will wander with clocks and temperature; these numbers are not a hardware ceiling. The llama.cpp row is a previous measurement and was not re-run with this pass.
+Q1.25 and Q2 decode at about the same rate. Versus Q4, Q1.25 prefill is ~33% faster and decode ~80% faster. Decode sits at the memory-bandwidth wall, so throughput falls off almost exactly in inverse proportion to weight size. A 5800X under sustained load will wander with clocks and temperature; these numbers are not a hardware ceiling. llama.cpp cannot load Q2_0C / STQ1_0, so only the K-quants can be compared.
 
-A second box (**dev machine B**: hybrid CPU, 8 P-cores, DDR4-3200, Release) re-measured Q4 / Q6 / Q8 against CPU-only llama.cpp in the same window: **prefill is ~4–6× llama.cpp** (Q6 463.7 vs 119.1, Q8 548.8 vs 93.0 tok/s); decode sits at the memory-bandwidth wall, in the same ballpark as llama.cpp but ~3–11% slower. Full data, bandwidth microbenchmarks, and noise caveats: [docs/perf-B.md](docs/perf-B.md) (Chinese).
+A second box (**dev machine B**: hybrid CPU, 8 P-cores + 16 E-cores, DDR4-3200, AVX-VNNI) re-measured Q4 / Q6 / Q8 against CPU-only llama.cpp in the same window: **prefill is ~4–6× llama.cpp** (Q6 463.7 vs 119.1, Q8 548.8 vs 93.0 tok/s); decode sits at the same bandwidth wall. Full data, bandwidth microbenchmarks, and noise caveats: [docs/perf-B.md](docs/perf-B.md) (Chinese).
 
 Reproduce:
 

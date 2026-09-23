@@ -116,18 +116,20 @@ static int ArgMax(float[] logits)
 
 ## 性能
 
-测试环境：Ryzen 7 5800X（Zen 3）、Windows、Release、8 线程，`avx2=True`、`vnni=False`。不计模型加载与 warmup；prefill 为 512 token 三次平均，decode 为 512 token 上下文后连续生成 128 token。与 TensorSharp、llama.cpp 的同日现场对照（含 Q1.25 / Q2 / Q4 与版本号）见 [docs/engine-benchmark.md](docs/engine-benchmark.md)。
+测试环境：Ryzen 7 5800X（Zen 3）、Windows、Release、8 线程，`avx2=True`、`vnni=False`。不计模型加载与 warmup；prefill 为 512 token 三次平均，decode 为 512 token 上下文后连续生成 128 token。完整数据（五种量化、同窗口 llama.cpp 对照、跨机器对比与带宽分析）见 [docs/perf.md](docs/perf.md)。
 
 | 模型 | prefill 512 | decode 128 | prefill 三次 |
 | --- | ---: | ---: | --- |
-| HyMT2Sharp Q1.25 / STQ1_0 | **553.63 tok/s** | 43.10 tok/s | 570.5 / 531.1 / 560.8 |
-| HyMT2Sharp Q2_0C | 541.00 tok/s | **43.79 tok/s** | 560.4 / 506.6 / 559.7 |
-| HyMT2Sharp Q4_K_M | 416.33 tok/s | 24.79 tok/s | 417.0 / 412.7 / 419.4 |
-| llama.cpp Q4_K_M（此前记录） | 254.93 ± 3.10 tok/s | 27.39 ± 0.37 tok/s | `llama-bench -p 512 -n 128 -t 8 -ngl 0` |
+| HyMT2Sharp Q1.25 / STQ1_0 | **564.66 tok/s** | **47.75 tok/s** | 573.5 / 558.6 / 562.1 |
+| HyMT2Sharp Q2_0C | 488.95 tok/s | 47.53 tok/s | 494.6 / 492.0 / 480.5 |
+| HyMT2Sharp Q4_K_M | 423.99 tok/s | 26.55 tok/s | 426.8 / 419.8 / 425.5 |
+| HyMT2Sharp Q6_K | 403.25 tok/s | 22.96 tok/s | 410.0 / 391.5 / 408.9 |
+| HyMT2Sharp Q8_0 | 319.81 tok/s | 16.60 tok/s | 318.5 / 319.9 / 321.0 |
+| llama.cpp Q4_K_M | 246.24 ± 0.82 tok/s | 31.57 ± 0.17 tok/s | `llama-bench -p 512 -n 128 -t 8 -ngl 0 -dev none` |
 
-Q1.25 与 Q2 的 decode 基本持平；相比 Q4，Q1.25 prefill 快约 33%、decode 快约 74%。5800X 连续满载时频率与温度波动较大，上述数字不代表硬件上限。llama.cpp 一行为历史记录，未随本轮复测。
+Q1.25 与 Q2 的 decode 基本持平；相比 Q4，Q1.25 prefill 快约 33%、decode 快约 80%。decode 全部贴着内存带宽墙，吞吐近似反比于权重大小。5800X 连续满载时频率与温度波动较大，上述数字不代表硬件上限。llama.cpp 加载不了 Q2_0C / STQ1_0，只能对照 K 系量化。
 
-另一台**开发机B**（hybrid CPU，8 P-core，DDR4-3200，Release）上复测了 Q4 / Q6 / Q8，并与纯 CPU llama.cpp 同窗口对照：**prefill 约 4–6 倍于 llama.cpp**（Q6 463.7 vs 119.1、Q8 548.8 vs 93.0 tok/s）；decode 贴着内存带宽墙，与 llama.cpp 同量级、慢约 3–11%。完整数据、带宽微基准与噪声说明见 [docs/perf-B.md](docs/perf-B.md)。
+另一台**开发机B**（hybrid CPU，8 P-core + 16 E-core，DDR4-3200，AVX-VNNI）上复测过 Q4 / Q6 / Q8：**prefill 约 4–6 倍于 llama.cpp**（Q6 463.7 vs 119.1、Q8 548.8 vs 93.0 tok/s）；decode 同样贴带宽墙。完整数据、带宽微基准与噪声说明见 [docs/perf-B.md](docs/perf-B.md)。
 
 复现：
 
