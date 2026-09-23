@@ -28,7 +28,7 @@ public static unsafe class MulMatQ2
         float* y, int nIn, int nOut, CpuThreadPool? pool)
     {
         int nb = nIn / Q2_0C.BlockLength;
-        int groups = packed != null && Avx2.IsSupported ? nOut / 8 : 0;
+        int groups = packed != null && Simd.UseAvx2 ? nOut / 8 : 0;
         int tail = nOut - groups * 8;
         void Run(int worker, int workers)
         {
@@ -54,10 +54,11 @@ public static unsafe class MulMatQ2
             Gemv(packed, rows, input, output, nIn, nOut, pool, scratch);
             return;
         }
-        if (!Avx2.IsSupported || packed == null)
+        if (!Simd.UseAvx2 || packed == null)
         {
-            for (int t = 0; t < tokens; t++)
-                Gemv(null, rows, input + t * nIn, output + t * nOut, nIn, nOut, pool, scratch);
+            int nbv = nIn / Q2_0C.BlockLength;
+            VecGemmF.Gemm((byte*)rows, nbv * sizeof(BlockQ2_0C), sizeof(BlockQ2_0C), Q2_0C.BlockLength,
+                &DequantBlock, input, output, nIn, nOut, tokens, pool);
             return;
         }
 
@@ -112,7 +113,7 @@ public static unsafe class MulMatQ2
     private static void RunQuantized(float* input, float* up, BlockQ8Kx4* q8, int nIn, int tokens,
         CpuThreadPool? pool, Q2PanelWeight w0, Q2PanelWeight w1, Q2PanelWeight w2)
     {
-        if (!Avx2.IsSupported)
+        if (!Simd.UseAvx2)
             throw new PlatformNotSupportedException("Q2 panels require AVX2.");
         if (nIn <= 0 || nIn % Q2_0C.BlockLength != 0 || tokens <= 0 || (tokens & 3) != 0)
             throw new ArgumentException("Q2 panels require a positive multiple of 512 inputs and four tokens.");
@@ -146,6 +147,9 @@ public static unsafe class MulMatQ2
         if (w.NOut != 0 && (w.NOut < 0 || (w.NOut & 7) != 0 || w.Packed == null || w.Dst == null))
             throw new ArgumentException("Q2 panels require valid buffers and an output count divisible by eight.");
     }
+
+    private static void DequantBlock(byte* p, float* dst) =>
+        Q2_0C.DequantizeRow((BlockQ2_0C*)p, dst, Q2_0C.BlockLength);
 
     private static void RunRange(BlockQ2x8* packed, float* output, int groups, BlockQ8Kx4* q8,
         int nIn, int nOut, int tokens, int nb, int worker, int workers)

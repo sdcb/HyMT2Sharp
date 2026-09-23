@@ -87,16 +87,20 @@ public sealed class STQ1_0Tests
 
         using ScratchArena scratch = new();
         MulMatSTQ.Gemm(rows, ip, (float*)output.Pointer, nIn, nOut, tokens, null, scratch);
-        using NativeBuffer q8 = new((nuint)Q8K.RowBytes(nIn));
+        // Portable GEMM dequantizes weights and consumes raw f32 input.
+        using NativeBuffer dw = new((nuint)(nIn * sizeof(float)));
         float* op = (float*)output.Pointer;
         int nb = nIn / STQ1_0.BlockLength;
         for (int t = 0; t < tokens; t++)
         {
-            Q8K.QuantizeRow(ip + t * nIn, (BlockQ8K*)q8.Pointer, nIn);
             for (int r = 0; r < nOut; r++)
             {
-                float expected = STQ1_0.DotScalar(rows + r * nb, (BlockQ8K*)q8.Pointer, nIn);
-                Assert.True(MathF.Abs(expected - op[t * nOut + r]) < 1e-4f,
+                STQ1_0.DequantizeRow(rows + r * nb, (float*)dw.Pointer, nIn);
+                float expected = 0;
+                float* dwp = (float*)dw.Pointer;
+                for (int i = 0; i < nIn; i++)
+                    expected += dwp[i] * ip[t * nIn + i];
+                Assert.True(MathF.Abs(expected - op[t * nOut + r]) < 1e-3f,
                     $"t={t} r={r} expected={expected} got={op[t * nOut + r]}");
             }
         }
@@ -105,6 +109,8 @@ public sealed class STQ1_0Tests
     [Fact]
     public unsafe void PackedPanelMatchesScalarGemvAndGemm()
     {
+        if (!Simd.UseAvx2)
+            return;
         const int nIn = 512, nOut = 16, tokens = 4;
         Random rng = new(789);
         int nb = nIn / STQ1_0.BlockLength;
@@ -150,6 +156,8 @@ public sealed class STQ1_0Tests
     [Fact]
     public unsafe void PackedPanelParallelMatchesScalar()
     {
+        if (!Simd.UseAvx2)
+            return;
         const int nIn = 1024, nOut = 64, tokens = 8;
         Random rng = new(901);
         int nb = nIn / STQ1_0.BlockLength;

@@ -8,6 +8,8 @@ public sealed class Q4KKernelTests
     [Fact]
     public unsafe void Q2_0C_DotAvxMatchesScalar()
     {
+        if (!System.Runtime.Intrinsics.X86.Avx2.IsSupported)
+            return;
         const int n = 1024;
         using NativeBuffer w = new((nuint)(2 * sizeof(BlockQ2_0C)));
         using NativeBuffer x = new((nuint)(4 * sizeof(BlockQ8K)));
@@ -51,13 +53,29 @@ public sealed class Q4KKernelTests
         RepackQ2.Rows(rows, (BlockQ2x8*)panel.Pointer, nIn, nOut);
         using ScratchArena scratch = new();
         MulMatQ2.Gemm((BlockQ2x8*)panel.Pointer, rows, ip, (float*)output.Pointer, nIn, nOut, tokens, null, scratch);
+        using NativeBuffer dw = new((nuint)(nIn * sizeof(float)));
         for (int t = 0; t < tokens; t++)
             for (int r = 0; r < nOut; r++)
             {
-                using NativeBuffer rowQ8 = new((nuint)Q8K.RowBytes(nIn));
-                Q8K.QuantizeRow(ip + t * nIn, (BlockQ8K*)rowQ8.Pointer, nIn);
-                float expected = Q2_0C.DotScalarForTest(rows + r * 2, (BlockQ8K*)rowQ8.Pointer, nIn);
-                Assert.True(MathF.Abs(expected - ((float*)output.Pointer)[t * nOut + r]) < 1e-4f, $"t={t} r={r} exp={expected} got={((float*)output.Pointer)[t * nOut + r]}");
+                // Portable dispatch runs an f32 dequant GEMM; AVX2 runs the
+                // Q8-quantized packed panel.
+                float tol = Simd.UseAvx2 ? 1e-4f : 1e-3f;
+                float expected;
+                if (Simd.UseAvx2)
+                {
+                    using NativeBuffer rowQ8 = new((nuint)Q8K.RowBytes(nIn));
+                    Q8K.QuantizeRow(ip + t * nIn, (BlockQ8K*)rowQ8.Pointer, nIn);
+                    expected = Q2_0C.DotScalarForTest(rows + r * 2, (BlockQ8K*)rowQ8.Pointer, nIn);
+                }
+                else
+                {
+                    Q2_0C.DequantizeRow(rows + r * 2, (float*)dw.Pointer, nIn);
+                    float* dwp = (float*)dw.Pointer;
+                    expected = 0;
+                    for (int i = 0; i < nIn; i++)
+                        expected += dwp[i] * ip[t * nIn + i];
+                }
+                Assert.True(MathF.Abs(expected - ((float*)output.Pointer)[t * nOut + r]) < tol, $"t={t} r={r} exp={expected} got={((float*)output.Pointer)[t * nOut + r]}");
             }
     }
 
@@ -102,18 +120,38 @@ public sealed class Q4KKernelTests
         RepackQ2.Rows((BlockQ2_0C*)raw.Pointer, (BlockQ2x8*)panel.Pointer, nIn, 8);
         using ScratchArena scratch = new();
         MulMatQ2.Gemm((BlockQ2x8*)panel.Pointer, (BlockQ2_0C*)raw.Pointer, (float*)input.Pointer, (float*)output.Pointer, nIn, nOut, tokens, null, scratch);
+        using NativeBuffer dw = new((nuint)(nIn * sizeof(float)));
+        float* ip2 = (float*)input.Pointer;
+        float tol2 = Simd.UseAvx2 ? 1e-4f : 1e-3f;
         for (int t = 0; t < tokens; t++)
         {
-            using NativeBuffer q8 = new((nuint)Q8K.RowBytes(nIn));
-            Q8K.QuantizeRow((float*)input.Pointer + t * nIn, (BlockQ8K*)q8.Pointer, nIn);
             for (int r = 0; r < nOut; r++)
-                Assert.True(MathF.Abs(Q2_0C.DotScalarForTest((BlockQ2_0C*)raw.Pointer + r, (BlockQ8K*)q8.Pointer, nIn) - ((float*)output.Pointer)[t * nOut + r]) < 1e-4f);
+            {
+                float expected;
+                if (Simd.UseAvx2)
+                {
+                    using NativeBuffer q8 = new((nuint)Q8K.RowBytes(nIn));
+                    Q8K.QuantizeRow(ip2 + t * nIn, (BlockQ8K*)q8.Pointer, nIn);
+                    expected = Q2_0C.DotScalarForTest((BlockQ2_0C*)raw.Pointer + r, (BlockQ8K*)q8.Pointer, nIn);
+                }
+                else
+                {
+                    Q2_0C.DequantizeRow((BlockQ2_0C*)raw.Pointer + r, (float*)dw.Pointer, nIn);
+                    float* dwp = (float*)dw.Pointer;
+                    expected = 0;
+                    for (int i = 0; i < nIn; i++)
+                        expected += dwp[i] * ip2[t * nIn + i];
+                }
+                Assert.True(MathF.Abs(expected - ((float*)output.Pointer)[t * nOut + r]) < tol2);
+            }
         }
     }
 
     [Fact]
     public unsafe void Q2_QuantizeAndGemmMatchesRows()
     {
+        if (!Simd.UseAvx2)
+            return;
         const int nIn = 1024, nOut = 8, tokens = 4;
         Random rng = new(91);
         using NativeBuffer raw0 = new((nuint)(nOut * (nIn / Q2_0C.BlockLength) * sizeof(BlockQ2_0C)));

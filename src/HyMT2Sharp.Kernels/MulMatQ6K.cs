@@ -9,9 +9,16 @@ public static unsafe class MulMatQ6K
 {
     public static void Gemm(BlockQ6Kx8* packed, BlockQ6K* rows, float* input, float* output, int nIn, int nOut, int tokens, CpuThreadPool? pool = null, ScratchArena? scratch = null)
     {
-        if (tokens == 1 || packed == null)
+        if (tokens == 1)
         {
             Q6K.Gemm(rows, input, output, nIn, nOut, tokens, pool, scratch);
+            return;
+        }
+        if (packed == null || !Simd.UseAvx2)
+        {
+            int nbv = nIn / Qk.SuperBlock;
+            VecGemmF.Gemm((byte*)rows, nbv * sizeof(BlockQ6K), sizeof(BlockQ6K), Qk.SuperBlock,
+                &DequantBlock, input, output, nIn, nOut, tokens, pool);
             return;
         }
 
@@ -102,4 +109,7 @@ public static unsafe class MulMatQ6K
             q8rowOwn?.Dispose();
         }
     }
+
+    private static void DequantBlock(byte* p, float* dst) =>
+        Q6K.DequantizeRow((BlockQ6K*)p, dst, Qk.SuperBlock);
 }

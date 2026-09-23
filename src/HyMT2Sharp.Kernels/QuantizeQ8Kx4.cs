@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -9,10 +10,10 @@ public static unsafe class QuantizeQ8Kx4
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void Quantize4x8(float* x, BlockQ8Kx4* y, int k)
     {
-        if (Avx2.IsSupported)
+        if (Simd.UseAvx2)
             Quantize4x8Avx2(x, y, k);
         else
-            Quantize4x8Scalar(x, y, k);
+            Quantize4x8FromRows(x, y, k);
     }
 
     /// <summary>
@@ -37,7 +38,7 @@ public static unsafe class QuantizeQ8Kx4
     private static void SiluMulBlock(float* gate, float* up, float* dest)
     {
         int j = 0;
-        if (Avx2.IsSupported && Fma.IsSupported)
+        if (Simd.UseAvx2 && Simd.UseFma)
         {
             for (; j <= Qk.SuperBlock - 16; j += 16)
             {
@@ -47,6 +48,9 @@ public static unsafe class QuantizeQ8Kx4
                 Avx.Store(dest + j + 8, Avx.Multiply(FastExp.SiluAvx2(g1), Avx.LoadVector256(up + j + 8)));
             }
         }
+
+        for (; j + Vector<float>.Count <= Qk.SuperBlock; j += Vector<float>.Count)
+            VecF.Store(dest + j, FastExp.SiluVec(VecF.Load(gate + j)) * VecF.Load(up + j));
 
         for (; j < Qk.SuperBlock; j++)
         {

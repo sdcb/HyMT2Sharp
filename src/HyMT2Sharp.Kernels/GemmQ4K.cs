@@ -16,7 +16,7 @@ public static unsafe partial class GemmQ4K
             throw new ArgumentException("rows must be a multiple of 4.", nameof(rows));
         if ((cols & 7) != 0)
             throw new ArgumentException("cols must be a multiple of 8.", nameof(cols));
-        if (Avx2.IsSupported && meta != null)
+        if (Simd.UseAvx2 && meta != null)
             GemmAvx2(n, dst, ldc, weights, activations, rows, cols, meta);
         else
             GemmScalar(n, dst, ldc, weights, activations, rows, cols);

@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -25,6 +26,10 @@ public static unsafe class STQ1_0
         (byte)0x10, (byte)0x18, (byte)0x90, (byte)0x98,
         (byte)0x40, (byte)0x48, (byte)0x60, (byte)0x68);
     private static readonly Vector128<byte> NibbleMask = Vector128.Create((byte)0x0F);
+    // Interleave 16 lo-lanes with 16 hi-lanes: [0,16,1,17,…,15,31].
+    private static readonly Vector256<byte> InterleaveSlots = Vector256.Create(
+        (byte)0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23,
+        8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31);
     private static readonly Vector128<byte> LaneMask = Vector128.Create((byte)0x03);
     private static readonly Vector128<short> Ones = Vector128.Create((short)1);
     // Eight 0/0xff sign selectors per byte.  Keeping the expansion in a
@@ -96,7 +101,67 @@ public static unsafe class STQ1_0
     }
 
     public static float Dot(BlockSTQ1_0* x, BlockQ8K* y, int n) =>
-        Avx2.IsSupported ? DotAvx2(x, y, n) : DotScalar(x, y, n);
+        Simd.UseAvx2 ? DotAvx2(x, y, n) : DotVec(x, y, n);
+
+    /// <summary>
+    /// Portable fallback: vector codebook gather via <see cref="Vector128.Shuffle"/>
+    /// (pshufb/tbl semantics with a software fallback), then lane extraction and
+    /// widening dot. Encoded 0/1/2 sums are corrected by the activation sum
+    /// exactly like <see cref="DotAvx2"/>.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotVec(BlockSTQ1_0* x, BlockQ8K* y, int n)
+    {
+        if (n <= 0 || n % BlockLength != 0)
+            throw new ArgumentException("STQ1_0 rows must contain a positive multiple of 256 values.", nameof(n));
+
+        Vector128<byte> laneMask = Vector128.Create((byte)3);
+        float sum = 0;
+        for (int b = 0; b < n / BlockLength; b++)
+        {
+            Vector256<int> acc = Vector256<int>.Zero;
+            for (int chunk = 0; chunk < 4; chunk++)
+            {
+                byte* qs = x[b].Qs + chunk * 8;
+                byte* signs = x[b].Sign + chunk * 2;
+                sbyte* act = y[b].Qs + chunk * 64;
+
+                // Portable version of DotChunk16's gather: eight bytes hold
+                // sixteen 4-bit slots; a 256-wide shuffle interleaves the
+                // lo/hi nibble vectors into one slot per byte.
+                Vector128<byte> qbytes = Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(qs)).AsByte();
+                Vector128<byte> lo = qbytes & NibbleMask;
+                Vector128<byte> hi = (qbytes.AsUInt16() >> 4).AsByte() & NibbleMask;
+                Vector128<byte> slots = Vector256.Shuffle(Vector256.Create(lo, hi), InterleaveSlots).GetLower();
+
+                Vector128<byte> signMask = Vector128.Create(
+                    SignMaskLut[signs[0]].AsUInt64().ToScalar(),
+                    SignMaskLut[signs[1]].AsUInt64().ToScalar()).AsByte();
+                Vector128<byte> q0 = Vector128.Shuffle(CodebookLo, slots);
+                Vector128<byte> q1 = Vector128.Shuffle(CodebookHi, slots);
+                Vector128<byte> qp128 = (q0 & ~signMask) | (q1 & signMask);
+
+                for (int s = 0; s < 4; s++)
+                {
+                    Vector128<byte> codes = (qp128.AsUInt16() >> (2 * s)).AsByte() & laneMask;
+                    (Vector128<short> cwL, Vector128<short> cwH) = Vector128.Widen(codes.AsSByte());
+                    (Vector128<short> awL, Vector128<short> awH) =
+                        Vector128.Widen(Unsafe.ReadUnaligned<Vector128<sbyte>>(act + s * 16));
+                    (Vector128<int> p0, Vector128<int> p1) = Vector128.Widen(cwL * awL);
+                    (Vector128<int> p2, Vector128<int> p3) = Vector128.Widen(cwH * awH);
+                    acc += Vector256.Create(p0, p1) + Vector256.Create(p2, p3);
+                }
+            }
+
+            int actSum = 0;
+            for (int t = 0; t < Qk.SuperBlock / 16; t++)
+                actSum += y[b].Bsums[t];
+            int encoded = acc[0] + acc[1] + acc[2] + acc[3] + acc[4] + acc[5] + acc[6] + acc[7];
+            sum += HalfBits.ToSingle(x[b].D) * y[b].D * (encoded - actSum);
+        }
+
+        return sum;
+    }
 
     public static float DotScalar(BlockSTQ1_0* x, BlockQ8K* y, int n)
     {

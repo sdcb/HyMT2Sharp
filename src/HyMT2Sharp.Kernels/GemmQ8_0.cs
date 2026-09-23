@@ -17,9 +17,9 @@ public static unsafe class GemmQ8_0
             throw new ArgumentException("rows must be a multiple of 4.", nameof(rows));
         if ((cols & 7) != 0)
             throw new ArgumentException("cols must be a multiple of 8.", nameof(cols));
-        if (AvxVnni.IsSupported)
+        if (Simd.UseAvxVnni)
             GemmVnni(n, dst, ldc, weights, activations, rows, cols);
-        else if (Avx2.IsSupported)
+        else if (Simd.UseAvx2)
             GemmAvx2(n, dst, ldc, weights, activations, rows, cols);
         else
             GemmScalar(n, dst, ldc, weights, activations, rows, cols);
@@ -392,6 +392,6 @@ public static unsafe class GemmQ8_0
     {
         Vector256<float> scale = Avx.Multiply(colScale, Vector256.Create(rowScale));
         Vector256<float> v = Avx.ConvertToVector256Single(dots);
-        return Fma.IsSupported ? Fma.MultiplyAdd(v, scale, acc) : Avx.Add(acc, Avx.Multiply(v, scale));
+        return Simd.UseFma ? Fma.MultiplyAdd(v, scale, acc) : Avx.Add(acc, Avx.Multiply(v, scale));
     }
 }

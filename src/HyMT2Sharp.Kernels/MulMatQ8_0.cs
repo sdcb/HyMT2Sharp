@@ -49,7 +49,7 @@ public static unsafe class MulMatQ8_0
             return;
         }
 
-        if (packed == null)
+        if (packed == null || !Simd.UseAvx2)
         {
             Q8_0.Gemm(rows, input, output, nIn, nOut, tokens, pool, scratch);
             return;
@@ -102,7 +102,7 @@ public static unsafe class MulMatQ8_0
                     {
                         Q8_0.QuantizeActs(input + t * nIn, tail, nIn);
                         for (int row = packedCols; row < nOut; row++)
-                            dst[t * nOut + row] = Q8_0.DotScalar(rows + row * actNb, tail, nIn);
+                            dst[t * nOut + row] = Q8_0.Dot(rows + row * actNb, tail, nIn);
                     }
                 }
                 finally

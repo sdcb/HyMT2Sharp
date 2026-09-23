@@ -60,9 +60,25 @@ Prefill 领先 llama.cpp 约 1.7–2.9 倍；decode 同量级、慢约 7–16%�
 | Q8_0   |        319.81 |          548.82 | −42%   |        16.60 |          15.96 |  +4%   |
 
 - **Prefill**：Q4/Q6 两边都走 AVX2 `vpmaddubsw`，5800X 落后约 8–13%，主要是频率与微架构差。Q8 差距拉大到 −42%：开发机B 上 Q8 走 AVX-VNNI `vpdpbusd`，5800X 只能退回 `vpmaddubsw`——VNNI 缺失的影响集中在 Q8。
-- **Decode**：5800X 反而小幅领先。decode 是内存带宽墙（第 5 节），两台机器有效带宽同量级，差异落在 perf-B 自报的噪声范围内。
+- **Decode**：5800X 反而小幅领先。decode 是内存带宽墙（第 6 节），两台机器有效带宽同量级，差异落在 perf-B 自报的噪声范围内。
 
-## 5. 带宽与读数注意
+## 5. portable SIMD（`Vector<T>`）档实测
+
+运行时分发顺序是 AVX-VNNI → AVX2 → `Vector<T>` portable。portable 档面向 ARM64/NEON 与不支持 AVX2 的 x64，在本机可用 `HYMT2SHARP_FORCE_PORTABLE=1` 强制启用做验证。此时 `Vector<float>.Count=8`（256-bit lowering）；ARM64 上同一份代码 Count=4（128-bit NEON lowering），prefill 数字会相应更低，decode 依旧以带宽墙为主。
+
+| 量化           | portable prefill 512 | portable decode 128 | AVX2 对照（第 2 节） |
+| -------------- | -------------------: | ------------------: | -------------------: |
+| Q1.25 / STQ1_0 |            86.74 tok/s |           17.14 tok/s |      564.66 / 47.75 |
+| Q2_0C          |            92.69 tok/s |           26.02 tok/s |      488.95 / 47.53 |
+| Q4_K_M         |            89.56 tok/s |           17.82 tok/s |      423.99 / 26.55 |
+| Q6_K           |            85.06 tok/s |           20.78 tok/s |      403.25 / 22.96 |
+| Q8_0           |            87.15 tok/s |           17.16 tok/s |      319.81 / 16.60 |
+
+- Portable prefill 不走 packed panel，而是行分块 float GEMM：权重建行只反量化一次（`DequantizeRow`），8 行 tile 共享激活向量读，`Vector<float>` FMA 累加。各量化格式 prefill 因此收敛到同一水平（~85–93 tok/s），瓶颈是反量化+FMA 的算力而非内存格式。
+- Portable decode 用各格式的 `DotVec`（`Vector<T>` widen-mul-add），吞吐约为 AVX2 的 35–70%：Q2/Q4/Q6/Q8 差距小（点积结构规则），STQ 差距最大（ternary 码本查询需要 shuffle，portable 只能逐 chunk `Vector128.Shuffle`）。
+- 不设 portable 档时标量地板约为 prefill 4 / decode 2.5 tok/s（Q4_K_M，128/16 窗口实测），即 portable 相对纯标量约 20×/7×。
+
+## 6. 带宽与读数注意
 
 按 decode tok/s × 权重大小折算 HyMT2Sharp 的有效权重带宽：
 
@@ -78,13 +94,18 @@ Prefill 领先 llama.cpp 约 1.7–2.9 倍；decode 同量级、慢约 7–16%�
 - 5800X 连续满载时频率与温度会漂；相邻两次运行 decode 可差 10–20%，上表是单次代表性值，排序与倍数关系在多次复测中稳定。
 - 不要把带 `--profile` 的结果写进这些表。
 
-## 6. 复现
+## 7. 复现
 
 ```powershell
 dotnet run --project src/HyMT2Sharp.Benchmark -c Release -- `
   --model "D:\_\model\Hy-MT2-1.8B-Q4_K_M.gguf" --bench-prefill 512 --bench-decode 128 --threads 8
 
 llama-bench.exe -m "D:\_\model\Hy-MT2-1.8B-Q4_K_M.gguf" -p 512 -n 128 -t 8 -ngl 0 -dev none -r 3
+
+# portable（Vector<T>）档强制启用
+$env:HYMT2SHARP_FORCE_PORTABLE = "1"
+dotnet run --project src/HyMT2Sharp.Benchmark -c Release -- `
+  --model "D:\_\model\Hy-MT2-1.8B-Q4_K_M.gguf" --bench-prefill 512 --bench-decode 128 --threads 8
 ```
 
 其余量化换 `--model` 路径即可。`--micro-q8` 输出 packed GEMV 与只读带宽微基准；`--profile` 输出逐 op 分项耗时。

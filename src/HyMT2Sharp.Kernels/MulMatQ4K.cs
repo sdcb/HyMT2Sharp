@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -47,6 +48,12 @@ public static unsafe class MulMatQ4K
         if (tokens == 1)
         {
             Gemv(rows, input, output, nIn, nOut, pool, scratch);
+            return;
+        }
+
+        if (packed == null || !Simd.UseAvx2)
+        {
+            GemmRows(rows, input, output, nIn, nOut, tokens, pool, scratch);
             return;
         }
 
@@ -125,6 +132,21 @@ public static unsafe class MulMatQ4K
             scratchOutOwn?.Dispose();
         }
     }
+
+    /// <summary>
+    /// Portable prefill fallback: dequantize-then-FMA GEMM over
+    /// <see cref="Vector{T}"/>. Weight decode amortizes over tokens and row
+    /// tiles share activation reads; no Q8_K activation quantization needed.
+    /// </summary>
+    private static void GemmRows(BlockQ4K* rows, float* input, float* output, int nIn, int nOut, int tokens, CpuThreadPool? pool, ScratchArena? scratch)
+    {
+        int nb = nIn / Qk.SuperBlock;
+        VecGemmF.Gemm((byte*)rows, nb * sizeof(BlockQ4K), sizeof(BlockQ4K), Qk.SuperBlock,
+            &DequantBlock, input, output, nIn, nOut, tokens, pool);
+    }
+
+    private static void DequantBlock(byte* p, float* dst) =>
+        Q4K.DequantizeRow((BlockQ4K*)p, dst, Qk.SuperBlock);
 
     public static void QuantizeAligned(float* input, BlockQ8Kx4* q8, int nIn, int tokens, CpuThreadPool? pool)
     {

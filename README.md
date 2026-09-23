@@ -150,7 +150,8 @@ Q2 panel 默认 64 KiB tile，可用 `--q2-col-tile-kb 64` 显式指定。`--pro
 - **Q2_0C**：8 列压缩 panel，保留 2-bit 权重，不展开为逐字节副本。
 - **STQ1_0**：42 B / 256 权重的 stride-16 block，加载时重排为 8 行 panel，prefill / decode 均走 AVX2 GEMV / GEMM。
 - **Q2 prefill**：QKV、gate/up、SiLU→down 复用 Q8 激活量化；2-bit 点积用 int32 归约避免 int16 溢出。
-- Q2 尾部列、非对齐 token 与非 AVX2 路径仍保留；Q4 计算路径未改动。
+- **Portable SIMD**：分发顺序 AVX-VNNI → AVX2 → `Vector<T>`。无 AVX2 的平台（ARM64/NEON、老 x64）自动落到 portable 档：decode 走各格式 `DotVec`（widen-mul-add），prefill 走行分块 float GEMM（权重反量化一次 + 8 行 tile 共享激活）。此时跳过 panel repack，省 ~40% 权重内存。`HYMT2SHARP_FORCE_PORTABLE=1` 可强制启用验证，实测见 [docs/perf.md](docs/perf.md) 第 5 节。
+- Q2 尾部列与非对齐 token 路径保留。
 
 ## 开发与测试
 

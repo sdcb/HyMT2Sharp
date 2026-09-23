@@ -26,7 +26,7 @@ public static unsafe class Q8K
 
             y[i].D = delta;
             sbyte* qs = y[i].Qs;
-            if (Avx2.IsSupported)
+            if (Simd.UseAvx2)
             {
                 Vector256<float> isv = Vector256.Create(iscale);
                 Vector256<int> lo = Vector256.Create(-127);
@@ -42,16 +42,10 @@ public static unsafe class Q8K
             }
             else
             {
-                for (int j = 0; j < Qk.SuperBlock; j++)
-                {
-                    int v = (int)MathF.Round(iscale * src[j]);
-                    if (v > 127) v = 127;
-                    if (v < -127) v = -127;
-                    qs[j] = (sbyte)v;
-                }
+                VecF.QuantizeStore(src, iscale, qs, Qk.SuperBlock);
             }
 
-            if (Avx2.IsSupported)
+            if (Simd.UseAvx2)
             {
                 for (int j = 0; j < Qk.SuperBlock / 16; j++)
                 {
@@ -65,13 +59,7 @@ public static unsafe class Q8K
             }
             else
             {
-                for (int j = 0; j < Qk.SuperBlock / 16; j++)
-                {
-                    int sum = 0;
-                    for (int ii = 0; ii < 16; ii++)
-                        sum += qs[j * 16 + ii];
-                    y[i].Bsums[j] = (short)sum;
-                }
+                VecI8.Bsums16(qs, y[i].Bsums, Qk.SuperBlock);
             }
         }
     }
@@ -84,7 +72,7 @@ public static unsafe class Q8K
     {
         float amax;
         float max;
-        if (Avx.IsSupported)
+        if (Simd.UseAvx)
         {
             Vector256<float> vacc = Vector256<float>.Zero;
             Vector256<float> sign = Vector256.Create(-0.0f);
@@ -121,22 +109,23 @@ public static unsafe class Q8K
         }
         else
         {
-            amax = 0;
-            max = 0;
-            for (int j = 0; j < Qk.SuperBlock; j++)
-            {
-                float ax = MathF.Abs(src[j]);
-                if (ax > amax)
-                {
-                    amax = ax;
-                    max = src[j];
-                }
-            }
-
+            amax = VecF.AbsMax(src, Qk.SuperBlock);
             if (amax == 0)
             {
                 delta = 0;
                 return 0;
+            }
+
+            // First element attaining the absmax wins, matching the scalar loop.
+            max = 0;
+            for (int j = 0; j < Qk.SuperBlock; j++)
+            {
+                float ax = MathF.Abs(src[j]);
+                if (ax == amax)
+                {
+                    max = src[j];
+                    break;
+                }
             }
         }
 

@@ -27,7 +27,7 @@ public static unsafe class MulMatSTQ
     public static void GemvPrequant(BlockSTQ1_0x8* packed, BlockSTQ1_0* rows, BlockQ8K* x,
         float* output, int nIn, int nOut, CpuThreadPool? pool)
     {
-        if (packed == null || !Avx2.IsSupported)
+        if (packed == null || !Simd.UseAvx2)
         {
             GemvPrequant(rows, x, output, nIn, nOut, pool);
             return;
@@ -52,12 +52,12 @@ public static unsafe class MulMatSTQ
     public static void Gemm(BlockSTQ1_0x8* packed, BlockSTQ1_0* rows, float* input, float* output,
         int nIn, int nOut, int tokens, CpuThreadPool? pool, ScratchArena scratch)
     {
-        if (packed != null && Avx2.IsSupported && tokens == 1)
+        if (packed != null && Simd.UseAvx2 && tokens == 1)
         {
             Gemv(packed, rows, input, output, nIn, nOut, pool, scratch);
             return;
         }
-        if (packed == null || !Avx2.IsSupported || (tokens & 3) != 0 || (nOut & 7) != 0)
+        if (packed == null || !Simd.UseAvx2 || (tokens & 3) != 0 || (nOut & 7) != 0)
         {
             Gemm(rows, input, output, nIn, nOut, tokens, pool, scratch);
             return;
@@ -119,44 +119,17 @@ public static unsafe class MulMatSTQ
         }
 
         int nb = nIn / STQ1_0.BlockLength;
-        nuint q8Bytes = (nuint)((long)tokens * Q8K.RowBytes(nIn));
-        BlockQ8K* q8 = (BlockQ8K*)scratch.E(q8Bytes);
-
-        void Quantize(int worker, int workers)
-        {
-            int begin = tokens * worker / workers;
-            int end = tokens * (worker + 1) / workers;
-            for (int t = begin; t < end; t++)
-                Q8K.QuantizeRow(input + (long)t * nIn, q8 + (long)t * nb, nIn);
-        }
-
-        if (pool == null)
-            Quantize(0, 1);
-        else
-            pool.For(tokens, Quantize);
-
-        void Compute(int worker, int workers)
-        {
-            int begin = nOut * worker / workers;
-            int end = nOut * (worker + 1) / workers;
-            for (int r = begin; r < end; r++)
-            {
-                BlockSTQ1_0* row = rows + (long)r * nb;
-                for (int t = 0; t < tokens; t++)
-                    output[(long)t * nOut + r] = STQ1_0.Dot(row, q8 + (long)t * nb, nIn);
-            }
-        }
-
-        if (pool == null)
-            Compute(0, 1);
-        else
-            pool.For(nOut, Compute);
+        VecGemmF.Gemm((byte*)rows, nb * sizeof(BlockSTQ1_0), sizeof(BlockSTQ1_0), STQ1_0.BlockLength,
+            &DequantBlock, input, output, nIn, nOut, tokens, pool);
     }
+
+    private static void DequantBlock(byte* p, float* dst) =>
+        STQ1_0.DequantizeRow((BlockSTQ1_0*)p, dst, STQ1_0.BlockLength);
 
     private static void RunQuantized(float* input, float* up, BlockQ8Kx4* q8, int nIn, int tokens,
         CpuThreadPool? pool, STQPanelWeight w0, STQPanelWeight w1, STQPanelWeight w2)
     {
-        if (!Avx2.IsSupported)
+        if (!Simd.UseAvx2)
             throw new PlatformNotSupportedException("STQ panels require AVX2.");
         if (nIn <= 0 || nIn % STQ1_0.BlockLength != 0 || tokens <= 0 || (tokens & 3) != 0)
             throw new ArgumentException("STQ panels require a positive multiple of 256 inputs and four tokens.");

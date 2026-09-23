@@ -333,16 +333,17 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
             };
             if (info.Type == GgmlTensorType.Q4_K)
             {
-                NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q4Kx8Size));
-                if (nOut >= 8)
+                w.Q4 = (BlockQ4K*)quant.Pointer;
+                // Panels only feed the AVX2 kernels; portable hosts keep raw rows.
+                if (nOut >= 8 && Simd.UseAvx2)
                 {
+                    NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q4Kx8Size));
                     RepackQ4K.Rows((BlockQ4K*)quant.Pointer, (BlockQ4Kx8*)packed.Pointer, nIn, nOut & ~7);
                     NativeBuffer meta = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q4Kx8MetaSize));
                     RepackQ4K.BuildMeta((BlockQ4K*)quant.Pointer, (BlockQ4Kx8Meta*)meta.Pointer, nIn, nOut & ~7);
                     w.Meta = (BlockQ4Kx8Meta*)meta.Pointer;
+                    w.Packed = (BlockQ4Kx8*)packed.Pointer;
                 }
-                w.Q4 = (BlockQ4K*)quant.Pointer;
-                w.Packed = (BlockQ4Kx8*)packed.Pointer;
             }
             else if (info.Type == GgmlTensorType.Q5_K)
             {
@@ -353,7 +354,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
                 if (info.Type == GgmlTensorType.Q2_0C)
                 {
                     w.Q2 = (BlockQ2_0C*)quant.Pointer;
-                    if (nOut >= 8)
+                    if (nOut >= 8 && Simd.UseAvx2)
                     {
                         NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q2x8Size));
                         RepackQ2.Rows(w.Q2, (BlockQ2x8*)packed.Pointer, nIn, nOut & ~7);
@@ -366,7 +367,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
                     // Token lookup is a gather/dequant operation and never
                     // enters a matrix kernel; keep it in the compact source
                     // layout instead of paying for an unused panel copy.
-                    if (nOut >= 8 && !string.Equals(name, "token_embd.weight", StringComparison.Ordinal))
+                    if (nOut >= 8 && Simd.UseAvx2 && !string.Equals(name, "token_embd.weight", StringComparison.Ordinal))
                     {
                         NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.STQ1_0x8Size));
                         RepackSTQ.Rows(w.STQ, (BlockSTQ1_0x8*)packed.Pointer, nIn, nOut & ~7);
@@ -377,7 +378,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
                 {
                     w.Q6 = (BlockQ6K*)quant.Pointer;
                     // Only per-layer Q6 weights take the prefill panel; the tied lm_head stays a GEMV.
-                    if (name.StartsWith("blk.", StringComparison.Ordinal) && nOut >= 8)
+                    if (name.StartsWith("blk.", StringComparison.Ordinal) && nOut >= 8 && Simd.UseAvx2)
                     {
                         NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q6Kx8Size));
                         RepackQ6K.Rows(w.Q6, (BlockQ6Kx8*)packed.Pointer, nIn, nOut & ~7);
@@ -389,7 +390,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
                     w.Q8 = (BlockQ8_0*)quant.Pointer;
                     // token_embd is also packed: lm_head runs one panel GEMV per
                     // token, which reads weights as a single sequential stream.
-                    if (nOut >= 8)
+                    if (nOut >= 8 && Simd.UseAvx2)
                     {
                         NativeBuffer packed = Rent((nuint)((long)(nOut / 8) * nb * Qk.Q8_0x8Size));
                         RepackQ8_0.Rows(w.Q8, (BlockQ8_0x8*)packed.Pointer, nIn, nOut & ~7);

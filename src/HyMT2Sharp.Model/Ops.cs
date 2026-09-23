@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -33,23 +34,34 @@ public static unsafe class Ops
             float* dst = y + r * dim;
             float sum = 0;
             int i = 0;
-            if (Avx.IsSupported)
+            if (Simd.UseAvx)
             {
                 Vector256<float> acc = Vector256<float>.Zero;
                 for (; i <= dim - 8; i += 8)
                 {
                     Vector256<float> v = Avx.LoadVector256(src + i);
-                    acc = Fma.IsSupported ? Fma.MultiplyAdd(v, v, acc) : Avx.Add(acc, Avx.Multiply(v, v));
+                    acc = Simd.UseFma ? Fma.MultiplyAdd(v, v, acc) : Avx.Add(acc, Avx.Multiply(v, v));
                 }
 
                 sum = VecDotQ4K.HorizontalSum(acc);
+            }
+            else
+            {
+                Vector<float> acc = Vector<float>.Zero;
+                for (; i + Vector<float>.Count <= dim; i += Vector<float>.Count)
+                {
+                    Vector<float> v = VecF.Load(src + i);
+                    acc += v * v;
+                }
+
+                sum = Vector.Sum(acc);
             }
 
             for (; i < dim; i++)
                 sum += src[i] * src[i];
             float scale = 1f / MathF.Sqrt(sum / dim + eps);
             i = 0;
-            if (Avx.IsSupported)
+            if (Simd.UseAvx)
             {
                 Vector256<float> s = Vector256.Create(scale);
                 for (; i <= dim - 8; i += 8)
@@ -58,6 +70,17 @@ public static unsafe class Ops
                     if (weight != null)
                         v = Avx.Multiply(v, Avx.LoadVector256(weight + i));
                     Avx.Store(dst + i, v);
+                }
+            }
+            else
+            {
+                Vector<float> s = new Vector<float>(scale);
+                for (; i + Vector<float>.Count <= dim; i += Vector<float>.Count)
+                {
+                    Vector<float> v = VecF.Load(src + i) * s;
+                    if (weight != null)
+                        v *= VecF.Load(weight + i);
+                    VecF.Store(dst + i, v);
                 }
             }
 
@@ -106,7 +129,7 @@ public static unsafe class Ops
             float* sRow = sp + (startPos + t) * half;
             float* row = x + (t * heads + h) * headDim;
             int i = 0;
-            if (Avx.IsSupported)
+            if (Simd.UseAvx)
             {
                 for (; i <= half - 8; i += 8)
                 {
@@ -116,6 +139,18 @@ public static unsafe class Ops
                     Vector256<float> sv = Avx.LoadVector256(sRow + i);
                     Avx.Store(row + i, Avx.Subtract(Avx.Multiply(x0, cv), Avx.Multiply(x1, sv)));
                     Avx.Store(row + i + half, Avx.Add(Avx.Multiply(x0, sv), Avx.Multiply(x1, cv)));
+                }
+            }
+            else
+            {
+                for (; i + Vector<float>.Count <= half; i += Vector<float>.Count)
+                {
+                    Vector<float> x0 = VecF.Load(row + i);
+                    Vector<float> x1 = VecF.Load(row + i + half);
+                    Vector<float> cv = VecF.Load(cRow + i);
+                    Vector<float> sv = VecF.Load(sRow + i);
+                    VecF.Store(row + i, x0 * cv - x1 * sv);
+                    VecF.Store(row + i + half, x0 * sv + x1 * cv);
                 }
             }
 
@@ -191,7 +226,7 @@ public static unsafe class Ops
         int i = 0;
         float max;
         float sum;
-        if (Avx.IsSupported && n >= 8)
+        if (Simd.UseAvx && n >= 8)
         {
             Vector256<float> vmax = Vector256.Create(-80f);
             for (; i <= n - 8; i += 8)
@@ -208,7 +243,7 @@ public static unsafe class Ops
             for (; i <= n - 8; i += 8)
             {
                 Vector256<float> shifted = Avx.Max(Avx.Subtract(Avx.LoadVector256(row + i), vmaxb), floor);
-                Vector256<float> e = Avx2.IsSupported && Fma.IsSupported
+                Vector256<float> e = Simd.UseAvx2 && Simd.UseFma
                     ? FastExp.ExpAvx2(shifted)
                     : Vector256.Exp(shifted);
                 Avx.Store(row + i, e);
@@ -216,6 +251,38 @@ public static unsafe class Ops
             }
 
             sum = VecDotQ4K.HorizontalSum(vsum);
+            for (; i < n; i++)
+            {
+                float e = MathF.Exp(MathF.Max(row[i] - max, -80f));
+                row[i] = e;
+                sum += e;
+            }
+        }
+        else if (n >= Vector<float>.Count)
+        {
+            Vector<float> vmax = new Vector<float>(-80f);
+            for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
+                vmax = Vector.Max(vmax, VecF.Load(row + i));
+            max = vmax[0];
+            for (int l = 1; l < Vector<float>.Count; l++)
+                if (vmax[l] > max)
+                    max = vmax[l];
+            for (; i < n; i++)
+                if (row[i] > max)
+                    max = row[i];
+
+            Vector<float> vsum = Vector<float>.Zero;
+            Vector<float> vmaxb = new Vector<float>(max);
+            Vector<float> floor = new Vector<float>(-80f);
+            i = 0;
+            for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
+            {
+                Vector<float> e = FastExp.ExpVec(Vector.Max(VecF.Load(row + i) - vmaxb, floor));
+                VecF.Store(row + i, e);
+                vsum += e;
+            }
+
+            sum = Vector.Sum(vsum);
             for (; i < n; i++)
             {
                 float e = MathF.Exp(MathF.Max(row[i] - max, -80f));
@@ -240,11 +307,17 @@ public static unsafe class Ops
 
         float inv = sum > 0 ? 1f / sum : 0;
         i = 0;
-        if (Avx.IsSupported)
+        if (Simd.UseAvx)
         {
             Vector256<float> vinv = Vector256.Create(inv);
             for (; i <= n - 8; i += 8)
                 Avx.Store(row + i, Avx.Multiply(Avx.LoadVector256(row + i), vinv));
+        }
+        else
+        {
+            Vector<float> vinv = new Vector<float>(inv);
+            for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
+                VecF.Store(row + i, VecF.Load(row + i) * vinv);
         }
 
         for (; i < n; i++)
@@ -255,10 +328,15 @@ public static unsafe class Ops
     private static void FillZero(float* dst, int n)
     {
         int i = 0;
-        if (Avx.IsSupported)
+        if (Simd.UseAvx)
         {
             for (; i <= n - 8; i += 8)
                 Avx.Store(dst + i, Vector256<float>.Zero);
+        }
+        else
+        {
+            for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
+                VecF.Store(dst + i, Vector<float>.Zero);
         }
 
         for (; i < n; i++)
@@ -303,7 +381,7 @@ public static unsafe class Ops
                 int kvh = h / group;
                 float* kBase = cacheK + kvh * headDim;
                 int qt = 0;
-                if (Avx.IsSupported && Fma.IsSupported && (headDim & 7) == 0)
+                if (Simd.UseAvx && Simd.UseFma && (headDim & 7) == 0)
                 {
                     // Two q rows share each K load; row qt's extra (masked) score lands in the
                     // tail that SoftmaxCausal zeroes anyway.
@@ -406,7 +484,7 @@ public static unsafe class Ops
 
                 float* outH = output + h * headDim;
                 int d = 0;
-                if (Avx.IsSupported && Fma.IsSupported)
+                if (Simd.UseAvx && Simd.UseFma)
                 {
                     for (; d + 63 < headDim; d += 64)
                         Axpy64(row, vBase + d, kvStride, allowed, outH + d);
@@ -458,7 +536,7 @@ public static unsafe class Ops
                     float* outH = output + qt * qDim + h * headDim;
                     int allowed = Math.Min(kvLen, startPos + qt + 1);
                     int d = 0;
-                    if (Avx.IsSupported && Fma.IsSupported)
+                    if (Simd.UseAvx && Simd.UseFma)
                     {
                         // 64 output dims live in 8 accumulators; V streams through once per half.
                         for (; d + 63 < headDim; d += 64)
@@ -491,28 +569,43 @@ public static unsafe class Ops
     {
         int i = 0;
         float sum = 0;
-        if (Avx.IsSupported)
+        if (Simd.UseAvx)
         {
             Vector256<float> acc0 = Vector256<float>.Zero;
             Vector256<float> acc1 = Vector256<float>.Zero;
             for (; i <= n - 16; i += 16)
             {
-                acc0 = Fma.IsSupported
+                acc0 = Simd.UseFma
                     ? Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), acc0)
                     : Avx.Add(acc0, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
-                acc1 = Fma.IsSupported
+                acc1 = Simd.UseFma
                     ? Fma.MultiplyAdd(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8), acc1)
                     : Avx.Add(acc1, Avx.Multiply(Avx.LoadVector256(a + i + 8), Avx.LoadVector256(b + i + 8)));
             }
 
             for (; i <= n - 8; i += 8)
             {
-                acc0 = Fma.IsSupported
+                acc0 = Simd.UseFma
                     ? Fma.MultiplyAdd(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i), acc0)
                     : Avx.Add(acc0, Avx.Multiply(Avx.LoadVector256(a + i), Avx.LoadVector256(b + i)));
             }
 
             sum = VecDotQ4K.HorizontalSum(Avx.Add(acc0, acc1));
+        }
+        else
+        {
+            Vector<float> v0 = Vector<float>.Zero;
+            Vector<float> v1 = Vector<float>.Zero;
+            for (; i + 2 * Vector<float>.Count <= n; i += 2 * Vector<float>.Count)
+            {
+                v0 += VecF.Load(a + i) * VecF.Load(b + i);
+                v1 += VecF.Load(a + i + Vector<float>.Count) * VecF.Load(b + i + Vector<float>.Count);
+            }
+
+            for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
+                v0 += VecF.Load(a + i) * VecF.Load(b + i);
+
+            sum = Vector.Sum(v0 + v1);
         }
 
         for (; i < n; i++)
@@ -607,12 +700,9 @@ public static unsafe class Ops
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void DotF32x4(float* q, float* k0, float* k1, float* k2, float* k3, int n, float* dst, float scale)
     {
-        if (!Avx.IsSupported)
+        if (!Simd.UseAvx)
         {
-            dst[0] = DotF32(q, k0, n) * scale;
-            dst[1] = DotF32(q, k1, n) * scale;
-            dst[2] = DotF32(q, k2, n) * scale;
-            dst[3] = DotF32(q, k3, n) * scale;
+            DotF32x4Vec(q, k0, k1, k2, k3, n, dst, scale);
             return;
         }
 
@@ -624,7 +714,7 @@ public static unsafe class Ops
         for (; i <= n - 8; i += 8)
         {
             Vector256<float> qv = Avx.LoadVector256(q + i);
-            if (Fma.IsSupported)
+            if (Simd.UseFma)
             {
                 acc0 = Fma.MultiplyAdd(qv, Avx.LoadVector256(k0 + i), acc0);
                 acc1 = Fma.MultiplyAdd(qv, Avx.LoadVector256(k1 + i), acc1);
@@ -659,16 +749,53 @@ public static unsafe class Ops
         dst[3] = s3 * scale;
     }
 
+    /// <summary>Portable counterpart of <see cref="DotF32x4"/> using <see cref="Vector{T}"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void DotF32x4Vec(float* q, float* k0, float* k1, float* k2, float* k3, int n, float* dst, float scale)
+    {
+        Vector<float> acc0 = Vector<float>.Zero;
+        Vector<float> acc1 = Vector<float>.Zero;
+        Vector<float> acc2 = Vector<float>.Zero;
+        Vector<float> acc3 = Vector<float>.Zero;
+        int i = 0;
+        for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
+        {
+            Vector<float> qv = VecF.Load(q + i);
+            acc0 += qv * VecF.Load(k0 + i);
+            acc1 += qv * VecF.Load(k1 + i);
+            acc2 += qv * VecF.Load(k2 + i);
+            acc3 += qv * VecF.Load(k3 + i);
+        }
+
+        float s0 = Vector.Sum(acc0);
+        float s1 = Vector.Sum(acc1);
+        float s2 = Vector.Sum(acc2);
+        float s3 = Vector.Sum(acc3);
+        for (; i < n; i++)
+        {
+            float qv = q[i];
+            s0 += qv * k0[i];
+            s1 += qv * k1[i];
+            s2 += qv * k2[i];
+            s3 += qv * k3[i];
+        }
+
+        dst[0] = s0 * scale;
+        dst[1] = s1 * scale;
+        dst[2] = s2 * scale;
+        dst[3] = s3 * scale;
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void AxpyF32(float* y, float* x, float a, int n)
     {
         int i = 0;
-        if (Avx.IsSupported)
+        if (Simd.UseAvx)
         {
             Vector256<float> av = Vector256.Create(a);
             for (; i <= n - 16; i += 16)
             {
-                if (Fma.IsSupported)
+                if (Simd.UseFma)
                 {
                     Avx.Store(y + i, Fma.MultiplyAdd(av, Avx.LoadVector256(x + i), Avx.LoadVector256(y + i)));
                     Avx.Store(y + i + 8, Fma.MultiplyAdd(av, Avx.LoadVector256(x + i + 8), Avx.LoadVector256(y + i + 8)));
@@ -682,11 +809,17 @@ public static unsafe class Ops
 
             for (; i <= n - 8; i += 8)
             {
-                if (Fma.IsSupported)
+                if (Simd.UseFma)
                     Avx.Store(y + i, Fma.MultiplyAdd(av, Avx.LoadVector256(x + i), Avx.LoadVector256(y + i)));
                 else
                     Avx.Store(y + i, Avx.Add(Avx.LoadVector256(y + i), Avx.Multiply(av, Avx.LoadVector256(x + i))));
             }
+        }
+        else
+        {
+            Vector<float> av = new Vector<float>(a);
+            for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
+                VecF.Store(y + i, av * VecF.Load(x + i) + VecF.Load(y + i));
         }
 
         for (; i < n; i++)
@@ -713,7 +846,7 @@ public static unsafe class Ops
     public static void SiLUMulRange(float* gate, float* up, int begin, int end)
     {
         int i = begin;
-        if (Avx2.IsSupported && Fma.IsSupported)
+        if (Simd.UseAvx2 && Simd.UseFma)
         {
             for (; i <= end - 16; i += 16)
             {
@@ -726,7 +859,7 @@ public static unsafe class Ops
             for (; i <= end - 8; i += 8)
                 Avx.Store(gate + i, Avx.Multiply(FastExp.SiluAvx2(Avx.LoadVector256(gate + i)), Avx.LoadVector256(up + i)));
         }
-        else if (Avx.IsSupported)
+        else if (Simd.UseAvx)
         {
             Vector256<float> one = Vector256.Create(1f);
             Vector256<float> sign = Vector256.Create(-0.0f);
@@ -737,6 +870,11 @@ public static unsafe class Ops
                 Vector256<float> silu = Avx.Divide(g, Avx.Add(one, Vector256.Exp(Avx.Xor(g, sign))));
                 Avx.Store(gate + i, Avx.Multiply(silu, u));
             }
+        }
+        else
+        {
+            for (; i + Vector<float>.Count <= end; i += Vector<float>.Count)
+                VecF.Store(gate + i, FastExp.SiluVec(VecF.Load(gate + i)) * VecF.Load(up + i));
         }
 
         for (; i < end; i++)
@@ -766,7 +904,7 @@ public static unsafe class Ops
     private static void AddInPlaceRange(float* dest, float* src, int begin, int end)
     {
         int i = begin;
-        if (Avx.IsSupported)
+        if (Simd.UseAvx)
         {
             for (; i <= end - 16; i += 16)
             {
@@ -776,6 +914,11 @@ public static unsafe class Ops
 
             for (; i <= end - 8; i += 8)
                 Avx.Store(dest + i, Avx.Add(Avx.LoadVector256(dest + i), Avx.LoadVector256(src + i)));
+        }
+        else
+        {
+            for (; i + Vector<float>.Count <= end; i += Vector<float>.Count)
+                VecF.Store(dest + i, VecF.Load(dest + i) + VecF.Load(src + i));
         }
 
         for (; i < end; i++)

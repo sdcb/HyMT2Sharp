@@ -211,5 +211,5 @@ public static unsafe class STQPanel
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<float> Fmadd(Vector256<float> x, Vector256<float> y, Vector256<float> z) =>
-        Fma.IsSupported ? Fma.MultiplyAdd(x, y, z) : Avx.Add(Avx.Multiply(x, y), z);
+        Simd.UseFma ? Fma.MultiplyAdd(x, y, z) : Avx.Add(Avx.Multiply(x, y), z);
 }

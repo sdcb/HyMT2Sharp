@@ -209,7 +209,7 @@ public static class HalfBits
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static unsafe Vector256<float> Load8(ushort* src)
     {
-        if (Avx2.IsSupported)
+        if (Simd.UseAvx2)
         {
             Vector128<ushort> h = Avx.LoadVector128(src);
             Vector256<int> bits = Avx2.ConvertToVector256Int32(h);

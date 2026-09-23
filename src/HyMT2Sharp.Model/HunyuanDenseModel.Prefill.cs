@@ -85,7 +85,7 @@ public sealed unsafe partial class HunyuanDenseModel
         int hidden = Config.HiddenSize;
         int qDim = Config.NumHeads * Config.HeadDim;
         int kDim = Config.NumKvHeads * Config.HeadDim;
-        if (Avx2.IsSupported && (seq & 3) == 0 &&
+        if (Simd.UseAvx2 && (seq & 3) == 0 &&
             wq.Type == GgmlTensorType.STQ1_0 && wk.Type == GgmlTensorType.STQ1_0 && wv.Type == GgmlTensorType.STQ1_0 &&
             wq.PackedSTQ != null && wk.PackedSTQ != null && wv.PackedSTQ != null &&
             (qDim & 7) == 0 && (kDim & 7) == 0)
@@ -99,7 +99,7 @@ public sealed unsafe partial class HunyuanDenseModel
             if (ProfileEnabled) TicksSTQ += Stopwatch.GetTimestamp() - t2;
             return;
         }
-        if (Avx2.IsSupported && (seq & 3) == 0 &&
+        if (Simd.UseAvx2 && (seq & 3) == 0 &&
             wq.Type == GgmlTensorType.Q2_0C && wk.Type == GgmlTensorType.Q2_0C && wv.Type == GgmlTensorType.Q2_0C &&
             wq.Packed2 != null && wk.Packed2 != null && wv.Packed2 != null &&
             (qDim & 7) == 0 && (kDim & 7) == 0)
@@ -113,7 +113,7 @@ public sealed unsafe partial class HunyuanDenseModel
             if (ProfileEnabled) TicksQ2 += Stopwatch.GetTimestamp() - t2;
             return;
         }
-        if (Avx2.IsSupported && (seq & 3) == 0 &&
+        if (Simd.UseAvx2 && (seq & 3) == 0 &&
             wq.Type == GgmlTensorType.Q8_0 && wk.Type == GgmlTensorType.Q8_0 && wv.Type == GgmlTensorType.Q8_0 &&
             wq.Packed8 != null && wk.Packed8 != null && wv.Packed8 != null &&
             (qDim & 7) == 0 && (kDim & 7) == 0)
@@ -127,7 +127,7 @@ public sealed unsafe partial class HunyuanDenseModel
             if (ProfileEnabled) TicksQ8 += Stopwatch.GetTimestamp() - t8;
             return;
         }
-        if ((seq & 3) == 0 && wq.Packed6 != null && wk.Packed6 != null && wv.Packed6 != null &&
+        if (Simd.UseAvx2 && (seq & 3) == 0 && wq.Packed6 != null && wk.Packed6 != null && wv.Packed6 != null &&
             (qDim & 7) == 0 && (kDim & 7) == 0)
         {
             int nb6 = hidden / Qk.SuperBlock;
@@ -143,7 +143,7 @@ public sealed unsafe partial class HunyuanDenseModel
                 TicksQ6 += Stopwatch.GetTimestamp() - t6;
             return;
         }
-        if ((seq & 3) == 0 && wq.Packed != null && wk.Packed != null && (wv.Packed != null || wv.Packed6 != null))
+        if (Simd.UseAvx2 && (seq & 3) == 0 && wq.Packed != null && wk.Packed != null && (wv.Packed != null || wv.Packed6 != null))
         {
             int nb = hidden / Qk.SuperBlock;
             nuint actBytes = (nuint)((seq / 4) * nb * Qk.Q8Kx4Size);
@@ -173,7 +173,7 @@ public sealed unsafe partial class HunyuanDenseModel
         Weight wu = _weights[$"blk.{layer}.ffn_up.weight"];
         int hidden = Config.HiddenSize;
         int ffn = Config.FfnSize;
-        if (Avx2.IsSupported && (seq & 3) == 0 &&
+        if (Simd.UseAvx2 && (seq & 3) == 0 &&
             wg.Type == GgmlTensorType.STQ1_0 && wu.Type == GgmlTensorType.STQ1_0 &&
             wg.PackedSTQ != null && wu.PackedSTQ != null && (ffn & 7) == 0)
         {
@@ -185,7 +185,7 @@ public sealed unsafe partial class HunyuanDenseModel
             if (ProfileEnabled) TicksSTQ += Stopwatch.GetTimestamp() - t2;
             return;
         }
-        if ((seq & 3) == 0 && wg.Packed6 != null && wu.Packed6 != null && (ffn & 7) == 0)
+        if (Simd.UseAvx2 && (seq & 3) == 0 && wg.Packed6 != null && wu.Packed6 != null && (ffn & 7) == 0)
         {
             int nb6 = hidden / Qk.SuperBlock;
             nuint actBytes6 = (nuint)((seq / 4) * nb6 * Qk.Q8Kx4Size);
@@ -199,7 +199,7 @@ public sealed unsafe partial class HunyuanDenseModel
                 TicksQ6 += Stopwatch.GetTimestamp() - t6;
             return;
         }
-        if (Avx2.IsSupported && (seq & 3) == 0 &&
+        if (Simd.UseAvx2 && (seq & 3) == 0 &&
             wg.Type == GgmlTensorType.Q8_0 && wu.Type == GgmlTensorType.Q8_0 &&
             wg.Packed8 != null && wu.Packed8 != null && (ffn & 7) == 0)
         {
@@ -211,7 +211,7 @@ public sealed unsafe partial class HunyuanDenseModel
             if (ProfileEnabled) TicksQ8 += Stopwatch.GetTimestamp() - t8;
             return;
         }
-        if ((seq & 3) == 0 && wg.Packed != null && wu.Packed != null)
+        if (Simd.UseAvx2 && (seq & 3) == 0 && wg.Packed != null && wu.Packed != null)
         {
             int nb = hidden / Qk.SuperBlock;
             nuint actBytes = (nuint)((seq / 4) * nb * Qk.Q8Kx4Size);
@@ -226,7 +226,7 @@ public sealed unsafe partial class HunyuanDenseModel
             return;
         }
 
-        if (Avx2.IsSupported && (seq & 3) == 0 &&
+        if (Simd.UseAvx2 && (seq & 3) == 0 &&
             wg.Type == GgmlTensorType.Q2_0C && wu.Type == GgmlTensorType.Q2_0C &&
             wg.Packed2 != null && wu.Packed2 != null && (ffn & 7) == 0)
         {
@@ -248,7 +248,7 @@ public sealed unsafe partial class HunyuanDenseModel
         Weight wd = _weights[$"blk.{layer}.ffn_down.weight"];
         int hidden = Config.HiddenSize;
         int ffn = Config.FfnSize;
-        if (Avx2.IsSupported && (seq & 3) == 0 && wd.Type == GgmlTensorType.STQ1_0 &&
+        if (Simd.UseAvx2 && (seq & 3) == 0 && wd.Type == GgmlTensorType.STQ1_0 &&
             wd.PackedSTQ != null && (hidden & 7) == 0)
         {
             long t2 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
@@ -258,7 +258,7 @@ public sealed unsafe partial class HunyuanDenseModel
             if (ProfileEnabled) TicksSTQ += Stopwatch.GetTimestamp() - t2;
             return;
         }
-        if (Avx2.IsSupported && (seq & 3) == 0 && wd.Type == GgmlTensorType.Q8_0 &&
+        if (Simd.UseAvx2 && (seq & 3) == 0 && wd.Type == GgmlTensorType.Q8_0 &&
             wd.Packed8 != null && (hidden & 7) == 0)
         {
             long t8 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
@@ -268,7 +268,7 @@ public sealed unsafe partial class HunyuanDenseModel
             if (ProfileEnabled) TicksQ8 += Stopwatch.GetTimestamp() - t8;
             return;
         }
-        if ((seq & 3) == 0 && (wd.Packed != null || wd.Packed6 != null))
+        if (Simd.UseAvx2 && (seq & 3) == 0 && (wd.Packed != null || wd.Packed6 != null))
         {
             int nb = ffn / Qk.SuperBlock;
             nuint actBytes = (nuint)((seq / 4) * nb * Qk.Q8Kx4Size);
@@ -286,7 +286,7 @@ public sealed unsafe partial class HunyuanDenseModel
             return;
         }
 
-        if (Avx2.IsSupported && (seq & 3) == 0 && wd.Type == GgmlTensorType.Q2_0C &&
+        if (Simd.UseAvx2 && (seq & 3) == 0 && wd.Type == GgmlTensorType.Q2_0C &&
             wd.Packed2 != null && (hidden & 7) == 0)
         {
             long t2 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;

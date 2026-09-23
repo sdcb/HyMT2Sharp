@@ -10,7 +10,8 @@ public sealed class FastExpTests
     [Fact]
     public void ExpAvx2_TracksMathF()
     {
-        Assert.True(Avx2.IsSupported && Fma.IsSupported);
+        if (!Avx2.IsSupported || !Fma.IsSupported)
+            return;
         float[] x = new float[8];
         float[] exp = new float[8];
         for (int i = 0; i < 8; i++)

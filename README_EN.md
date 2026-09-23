@@ -150,7 +150,8 @@ Q2 panels default to a 64 KiB tile (`--q2-col-tile-kb 64`). `--profile` prints S
 - **Q2_0C**: compressed 8-column panels; 2-bit weights stay packed (no per-weight byte expansion).
 - **STQ1_0**: 42 B / 256-weight stride-16 blocks, repacked to 8-row panels; prefill and decode both use AVX2 GEMV / GEMM.
 - **Q2 prefill**: QKV, gate/up, and SiLU→down reuse Q8 activation quant; 2-bit dots reduce in int32 to avoid int16 overflow.
-- Q2 tail columns, non-aligned token counts, and the non-AVX2 path remain; the Q4 compute path is unchanged.
+- **Portable SIMD**: dispatch order is AVX-VNNI → AVX2 → `Vector<T>`. Platforms without AVX2 (ARM64/NEON, older x64) fall to the portable tier automatically: decode runs per-format `DotVec` (widen-mul-add), prefill runs a row-tiled float GEMM (weights dequantized once, 8-row tiles share activation loads). Panel repack is skipped in this mode, saving ~40% weight memory. `HYMT2SHARP_FORCE_PORTABLE=1` forces it for verification; measured numbers are in [docs/perf.md](docs/perf.md) section 5.
+- Q2 tail columns and non-aligned token paths remain.
 
 ## Development
 

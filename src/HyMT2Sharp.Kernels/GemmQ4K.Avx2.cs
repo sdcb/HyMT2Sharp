@@ -214,5 +214,5 @@ public static unsafe partial class GemmQ4K
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<float> Fmadd(Vector256<float> acc, Vector256<float> a, Vector256<float> b) =>
-        Fma.IsSupported ? Fma.MultiplyAdd(a, b, acc) : Avx.Add(acc, Avx.Multiply(a, b));
+        Simd.UseFma ? Fma.MultiplyAdd(a, b, acc) : Avx.Add(acc, Avx.Multiply(a, b));
 }

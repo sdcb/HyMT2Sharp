@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -7,7 +8,7 @@ namespace Sdcb.HyMT2Sharp.Kernels;
 
 /// <summary>
 /// Q8_0 dequant, activation quant, and GEMV. Prefill GEMM lives in <see cref="GemmQ8_0"/>.
-/// Dots use <c>vpdpbusd</c> when <see cref="AvxVnni.IsSupported"/>, otherwise AVX2 <c>vpmaddubsw</c>.
+/// Dots use <c>vpdpbusd</c> when <see cref="Simd.UseAvxVnni"/>, otherwise AVX2 <c>vpmaddubsw</c>.
 /// </summary>
 public static unsafe class Q8_0
 {
@@ -19,15 +20,14 @@ public static unsafe class Q8_0
             float d = HalfBits.ToSingle(x[i].D);
             sbyte* qs = x[i].Qs;
             float* dst = y + i * Qk.Q8_0Block;
-            if (Avx2.IsSupported && Sse41.IsSupported)
+            if (Simd.UseAvx2 && Sse41.IsSupported)
             {
                 for (int j = 0; j < Qk.Q8_0Block; j += 8)
                     Store8(qs + j, dst + j, d);
             }
             else
             {
-                for (int j = 0; j < Qk.Q8_0Block; j++)
-                    dst[j] = d * qs[j];
+                VecF.DequantI8(qs, d, dst, Qk.Q8_0Block);
             }
         }
     }
@@ -39,10 +39,7 @@ public static unsafe class Q8_0
         {
             Quantize32(x + i * Qk.Q8_0Block, y[i].Qs, out float d);
             y[i].D = d;
-            int sum = 0;
-            for (int j = 0; j < Qk.Q8_0Block; j++)
-                sum += y[i].Qs[j];
-            y[i].Sum = sum;
+            y[i].Sum = VecI8.SumI8(y[i].Qs, Qk.Q8_0Block);
         }
     }
 
@@ -56,10 +53,7 @@ public static unsafe class Q8_0
                 sbyte* qs = y[i].Qs + r * Qk.Q8_0Block;
                 Quantize32(src + r * k + i * Qk.Q8_0Block, qs, out float d);
                 y[i].D[r] = d;
-                int sum = 0;
-                for (int j = 0; j < Qk.Q8_0Block; j++)
-                    sum += qs[j];
-                y[i].Bias[r] = sum << 7;
+                y[i].Bias[r] = VecI8.SumI8(qs, Qk.Q8_0Block) << 7;
             }
         }
     }
@@ -91,6 +85,19 @@ public static unsafe class Q8_0
         return sum;
     }
 
+    /// <summary>Row dot on raw blocks; portable widening path on non-AVX2 hosts.</summary>
+    public static float Dot(BlockQ8_0* weight, BlockQ8_0Act* act, int n) =>
+        Simd.UseAvx2 ? DotScalar(weight, act, n) : DotVec(weight, act, n);
+
+    public static float DotVec(BlockQ8_0* weight, BlockQ8_0Act* act, int n)
+    {
+        int nb = n / Qk.Q8_0Block;
+        float sum = 0;
+        for (int i = 0; i < nb; i++)
+            sum += HalfBits.ToSingle(weight[i].D) * act[i].D * VecI8.DotI8(weight[i].Qs, act[i].Qs, Qk.Q8_0Block);
+        return sum;
+    }
+
     public static void Gemv(BlockQ8_0* weights, float* input, float* output, int nIn, int nOut, CpuThreadPool? pool = null, ScratchArena? scratch = null)
     {
         int nb = nIn / Qk.Q8_0Block;
@@ -115,7 +122,7 @@ public static unsafe class Q8_0
             int begin = nOut * worker / workers;
             int end = nOut * (worker + 1) / workers;
             int row = begin;
-            if (Avx2.IsSupported)
+            if (Simd.UseAvx2)
             {
                 for (; row + 3 < end; row += 4)
                     Dot4Rows(weights, act, output, nIn, row);
@@ -123,7 +130,7 @@ public static unsafe class Q8_0
 
             int nb = nIn / Qk.Q8_0Block;
             for (; row < end; row++)
-                output[row] = DotScalar(weights + row * nb, act, nIn);
+                output[row] = Dot(weights + row * nb, act, nIn);
         }
 
         if (pool == null)
@@ -155,9 +162,9 @@ public static unsafe class Q8_0
                 for (; g < gEnd; g++)
                 {
                     BlockQ8_0x8* w = packed + g * nb;
-                    if (AvxVnni.IsSupported)
+                    if (Simd.UseAvxVnni)
                         PackedGroupVnni(w, act, output + g * 8, nb);
-                    else if (Avx2.IsSupported)
+                    else if (Simd.UseAvx2)
                         PackedGroupAvx2(w, act, output + g * 8, nb);
                     else
                         PackedGroupScalar(w, act, output + g * 8, nb);
@@ -198,14 +205,14 @@ public static unsafe class Q8_0
             if (t.Packed == null)
             {
                 for (int row = g * 8; row < g * 8 + 8; row++)
-                    t.Dst[row] = DotScalar(t.Rows + row * nb, act, nIn);
+                    t.Dst[row] = Dot(t.Rows + row * nb, act, nIn);
                 return;
             }
 
             BlockQ8_0x8* w = t.Packed + g * nb;
-            if (AvxVnni.IsSupported)
+            if (Simd.UseAvxVnni)
                 PackedGroupVnni(w, act, t.Dst + g * 8, nb);
-            else if (Avx2.IsSupported)
+            else if (Simd.UseAvx2)
                 PackedGroupAvx2(w, act, t.Dst + g * 8, nb);
             else
                 PackedGroupScalar(w, act, t.Dst + g * 8, nb);
@@ -247,7 +254,7 @@ public static unsafe class Q8_0
         void Tail(Q8GemvTarget t)
         {
             for (int row = t.NOut & ~7; row < t.NOut; row++)
-                t.Dst[row] = DotScalar(t.Rows + row * nb, act, nIn);
+                t.Dst[row] = Dot(t.Rows + row * nb, act, nIn);
         }
 
         if (pool == null || total == 0)
@@ -274,7 +281,7 @@ public static unsafe class Q8_0
 
             j = Avx2.Subtract(j, Vector256.Create(act[b].Sum << 7));
             Vector256<float> d = Avx.Multiply(Avx.LoadVector256(wb->D), Vector256.Create(act[b].D));
-            acc = Fma.IsSupported
+            acc = Simd.UseFma
                 ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(j), d, acc)
                 : Avx.Add(acc, Avx.Multiply(Avx.ConvertToVector256Single(j), d));
         }
@@ -301,7 +308,7 @@ public static unsafe class Q8_0
             }
 
             Vector256<float> d = Avx.Multiply(Avx.LoadVector256(wb->D), Vector256.Create(act[b].D));
-            acc = Fma.IsSupported
+            acc = Simd.UseFma
                 ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(j), d, acc)
                 : Avx.Add(acc, Avx.Multiply(Avx.ConvertToVector256Single(j), d));
         }
@@ -335,45 +342,12 @@ public static unsafe class Q8_0
         }
 
         int nb = nIn / Qk.Q8_0Block;
-        nuint actBytes = (nuint)((long)tokens * nb * Qk.Q8_0ActSize);
-        NativeBuffer? owned = scratch == null ? new NativeBuffer(actBytes) : null;
-        BlockQ8_0Act* act = (BlockQ8_0Act*)(scratch != null ? scratch.A(actBytes) : owned!.Pointer);
-        try
-        {
-            void QuantBody(int worker, int workers)
-            {
-                int t0 = tokens * worker / workers;
-                int t1 = tokens * (worker + 1) / workers;
-                for (int t = t0; t < t1; t++)
-                    QuantizeActs(input + t * nIn, act + t * nb, nIn);
-            }
-
-            if (pool == null)
-                QuantBody(0, 1);
-            else
-                pool.For(tokens, QuantBody);
-
-            void Body(int worker, int workers)
-            {
-                int begin = nOut * worker / workers;
-                int end = nOut * (worker + 1) / workers;
-                for (int row = begin; row < end; row++)
-                {
-                    for (int t = 0; t < tokens; t++)
-                        output[t * nOut + row] = DotScalar(weights + row * nb, act + t * nb, nIn);
-                }
-            }
-
-            if (pool == null)
-                Body(0, 1);
-            else
-                pool.For(nOut, Body);
-        }
-        finally
-        {
-            owned?.Dispose();
-        }
+        VecGemmF.Gemm((byte*)weights, nb * sizeof(BlockQ8_0), sizeof(BlockQ8_0), Qk.Q8_0Block,
+            &DequantBlock, input, output, nIn, nOut, tokens, pool);
     }
+
+    private static void DequantBlock(byte* p, float* dst) =>
+        DequantizeRow((BlockQ8_0*)p, dst, Qk.Q8_0Block);
 
     /// <summary>32 signed weights × 32 signed activations. AVX2 sign trick, no int16 saturation for |q|≤128.</summary>
     public static int Dot32Avx2(sbyte* weight, sbyte* act)
@@ -407,7 +381,7 @@ public static unsafe class Q8_0
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static int Dot32(sbyte* weight, sbyte* act, int actSum) =>
-        AvxVnni.IsSupported ? Dot32Vnni(weight, act, actSum) : Dot32Avx2(weight, act);
+        Simd.UseAvxVnni ? Dot32Vnni(weight, act, actSum) : Dot32Avx2(weight, act);
 
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void Dot4Rows(BlockQ8_0* weights, BlockQ8_0Act* act, float* output, int nIn, int row)
@@ -451,7 +425,7 @@ public static unsafe class Q8_0
 
         float id = 127f / amax;
         delta = amax / 127f;
-        if (Avx2.IsSupported)
+        if (Simd.UseAvx2)
         {
             Vector256<float> idv = Vector256.Create(id);
             Vector256<int> lo = Vector256.Create(-127);
@@ -467,19 +441,13 @@ public static unsafe class Q8_0
         }
         else
         {
-            for (int j = 0; j < Qk.Q8_0Block; j++)
-            {
-                int v = (int)MathF.Round(id * src[j]);
-                if (v > 127) v = 127;
-                if (v < -127) v = -127;
-                qs[j] = (sbyte)v;
-            }
+            VecF.QuantizeStore(src, id, qs, Qk.Q8_0Block);
         }
     }
 
     private static float AbsMax32(float* src)
     {
-        if (Avx.IsSupported)
+        if (Simd.UseAvx)
         {
             Vector256<float> sign = Vector256.Create(-0.0f);
             Vector256<float> vacc = Avx.AndNot(sign, Avx.LoadVector256(src));
@@ -492,10 +460,7 @@ public static unsafe class Q8_0
             return lane.ToScalar();
         }
 
-        float amax = 0;
-        for (int j = 0; j < Qk.Q8_0Block; j++)
-            amax = MathF.Max(amax, MathF.Abs(src[j]));
-        return amax;
+        return VecF.AbsMax(src, Qk.Q8_0Block);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -514,18 +479,14 @@ public static unsafe class Q8_0
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static void Silu32(float* gate, float* up, float* dest)
     {
-        if (Avx2.IsSupported && Fma.IsSupported)
+        if (Simd.UseAvx2 && Simd.UseFma)
         {
             for (int j = 0; j < Qk.Q8_0Block; j += 8)
                 Avx.Store(dest + j, Avx.Multiply(FastExp.SiluAvx2(Avx.LoadVector256(gate + j)), Avx.LoadVector256(up + j)));
             return;
         }
 
-        for (int j = 0; j < Qk.Q8_0Block; j++)
-        {
-            float g = gate[j];
-            float s = g / (1f + MathF.Exp(-g));
-            dest[j] = s * up[j];
-        }
+        for (int j = 0; j < Qk.Q8_0Block; j += Vector<float>.Count)
+            VecF.Store(dest + j, FastExp.SiluVec(VecF.Load(gate + j)) * VecF.Load(up + j));
     }
 }

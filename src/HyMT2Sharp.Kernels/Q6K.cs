@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -39,7 +40,71 @@ public static unsafe class Q6K
     }
 
     public static float Dot(BlockQ6K* x, BlockQ8K* y, int n)
-        => Avx2.IsSupported ? DotAvx2(x, y, n) : DotScalar(x, y, n);
+        => Simd.UseAvx2 ? DotAvx2(x, y, n) : DotVec(x, y, n);
+
+    /// <summary>Portable widening fallback; vectorized decode then per-16 scaled dots.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotVec(BlockQ6K* x, BlockQ8K* y, int n)
+    {
+        int nb = n / Qk.SuperBlock;
+        sbyte* aux = stackalloc sbyte[Qk.SuperBlock];
+        float sumf = 0;
+        for (int i = 0; i < nb; i++)
+        {
+            DecodeBlockVec(x + i, aux);
+            int acc = 0;
+            sbyte* a = aux;
+            sbyte* q8 = y[i].Qs;
+            for (int j = 0; j < Qk.SuperBlock / 32; j++)
+            {
+                VecI8.Dot16x2(a, q8, out int s0, out int s1);
+                acc += x[i].Scales[2 * j] * s0 + x[i].Scales[2 * j + 1] * s1;
+                a += 32;
+                q8 += 32;
+            }
+
+            sumf += HalfBits.ToSingle(x[i].D) * y[i].D * acc;
+        }
+
+        return sumf;
+    }
+
+    /// <summary>Decode one Q6_K superblock to signed values (-32..31) like <see cref="DotScalar"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void DecodeBlockVec(BlockQ6K* x, sbyte* a)
+    {
+        byte* ql = x->Ql;
+        byte* qh = x->Qh;
+        Vector<byte> m15 = new Vector<byte>(15);
+        Vector<byte> m3 = new Vector<byte>(3);
+        Vector<sbyte> bias = new Vector<sbyte>(-32);
+        for (int j = 0; j < Qk.SuperBlock / 128; j++)
+        {
+            int l = 0;
+            for (; l + Vector<byte>.Count <= 32; l += Vector<byte>.Count)
+            {
+                Vector<byte> lo1 = VecI8.LoadU8(ql + l);
+                Vector<byte> lo2 = VecI8.LoadU8(ql + 32 + l);
+                Vector<byte> hb = VecI8.LoadU8(qh + l);
+                Unsafe.WriteUnaligned(a + l, Vector.AsVectorSByte((lo1 & m15) | ((hb & m3) << 4)) + bias);
+                Unsafe.WriteUnaligned(a + l + 32, Vector.AsVectorSByte((lo2 & m15) | (((hb >> 2) & m3) << 4)) + bias);
+                Unsafe.WriteUnaligned(a + l + 64, Vector.AsVectorSByte((lo1 >> 4) | (((hb >> 4) & m3) << 4)) + bias);
+                Unsafe.WriteUnaligned(a + l + 96, Vector.AsVectorSByte((lo2 >> 4) | ((hb >> 6) << 4)) + bias);
+            }
+
+            for (; l < 32; l++)
+            {
+                a[l] = (sbyte)(((ql[l] & 0xF) | ((qh[l] & 3) << 4)) - 32);
+                a[l + 32] = (sbyte)(((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32);
+                a[l + 64] = (sbyte)(((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32);
+                a[l + 96] = (sbyte)(((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32);
+            }
+
+            a += 128;
+            ql += 64;
+            qh += 32;
+        }
+    }
 
     public static float DotScalar(BlockQ6K* x, BlockQ8K* y, int n)
     {
@@ -153,7 +218,7 @@ public static unsafe class Q6K
 
             sumi = Avx2.Subtract(sumi, q8sclsub);
             Vector256<float> dv = Vector256.Create(d);
-            acc = Fma.IsSupported
+            acc = Simd.UseFma
                 ? Fma.MultiplyAdd(dv, Avx.ConvertToVector256Single(sumi), acc)
                 : Avx.Add(acc, Avx.Multiply(dv, Avx.ConvertToVector256Single(sumi)));
         }
@@ -288,7 +353,7 @@ public static unsafe class Q6K
     {
         Vector256<float> dv = Vector256.Create(d);
         Vector256<float> v = Avx.ConvertToVector256Single(sumi);
-        return Fma.IsSupported ? Fma.MultiplyAdd(dv, v, acc) : Avx.Add(acc, Avx.Multiply(dv, v));
+        return Simd.UseFma ? Fma.MultiplyAdd(dv, v, acc) : Avx.Add(acc, Avx.Multiply(dv, v));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -397,7 +462,7 @@ public static unsafe class Q6K
         int end = nOut * (worker + 1) / workers;
         float* tmp = stackalloc float[4];
         int t = 0;
-        if (Avx2.IsSupported)
+        if (Simd.UseAvx2)
         {
             for (; t + 3 < tokens; t += 4)
             {

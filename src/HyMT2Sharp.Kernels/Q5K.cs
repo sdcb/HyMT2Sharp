@@ -1,3 +1,6 @@
+using System.Numerics;
+using System.Runtime.CompilerServices;
+
 namespace Sdcb.HyMT2Sharp.Kernels;
 
 public static unsafe class Q5K
@@ -35,6 +38,74 @@ public static unsafe class Q5K
     }
 
     public static float Dot(BlockQ5K* x, BlockQ8K* y, int n)
+    {
+        return DotVec(x, y, n);
+    }
+
+    /// <summary>Portable widening fallback; vectorized 5-bit decode then per-32 scaled dots.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotVec(BlockQ5K* x, BlockQ8K* y, int n)
+    {
+        int nb = n / Qk.SuperBlock;
+        uint* utmp = stackalloc uint[4];
+        sbyte* aux = stackalloc sbyte[Qk.SuperBlock];
+        Vector<byte> m15 = new Vector<byte>(15);
+        Vector<byte> one = Vector<byte>.One;
+        float sumf = 0;
+        for (int i = 0; i < nb; i++)
+        {
+            byte* q5 = x[i].Qs;
+            byte* hm = x[i].Qh;
+            uint u1 = 1;
+            for (int j = 0; j < Qk.SuperBlock / 64; j++)
+            {
+                int l = 0;
+                for (; l + Vector<byte>.Count <= 32; l += Vector<byte>.Count)
+                {
+                    Vector<byte> lo = VecI8.LoadU8(q5 + 32 * j + l);
+                    Vector<byte> hb = VecI8.LoadU8(hm + l);
+                    Vector<byte> h1 = Vector.Min(hb & new Vector<byte>((byte)u1), one);
+                    Vector<byte> h2 = Vector.Min(hb & new Vector<byte>((byte)(u1 * 2)), one);
+                    Unsafe.WriteUnaligned(aux + 64 * j + l, Vector.AsVectorSByte((lo & m15) | (h1 << 4)));
+                    Unsafe.WriteUnaligned(aux + 64 * j + 32 + l, Vector.AsVectorSByte((lo >> 4) | (h2 << 4)));
+                }
+
+                for (; l < 32; l++)
+                {
+                    aux[64 * j + l] = (sbyte)((q5[32 * j + l] & 0xF) + ((hm[l] & u1) != 0 ? 16 : 0));
+                    aux[64 * j + 32 + l] = (sbyte)((q5[32 * j + l] >> 4) + ((hm[l] & (u1 * 2)) != 0 ? 16 : 0));
+                }
+
+                u1 *= 4;
+            }
+
+            Q4K.UnpackScales(x[i].Scales, utmp);
+            byte* scales = (byte*)utmp;
+            byte* mins = (byte*)(utmp + 2);
+
+            int sumi = 0;
+            for (int j = 0; j < Qk.SuperBlock / 16; j++)
+                sumi += y[i].Bsums[j] * mins[j / 2];
+
+            sbyte* a = aux;
+            sbyte* q8 = y[i].Qs;
+            int acc = 0;
+            for (int j = 0; j < Qk.SuperBlock / 32; j++)
+            {
+                acc += scales[j] * VecI8.DotI8(a, q8, 32);
+                a += 32;
+                q8 += 32;
+            }
+
+            float d = HalfBits.ToSingle(x[i].D) * y[i].D;
+            float dmin = HalfBits.ToSingle(x[i].Dmin) * y[i].D;
+            sumf += d * acc - dmin * sumi;
+        }
+
+        return sumf;
+    }
+
+    public static float DotScalar(BlockQ5K* x, BlockQ8K* y, int n)
     {
         int nb = n / Qk.SuperBlock;
         uint* utmp = stackalloc uint[4];
@@ -108,7 +179,17 @@ public static unsafe class Q5K
 
     public static void Gemm(BlockQ5K* weights, float* input, float* output, int nIn, int nOut, int tokens, CpuThreadPool? pool = null)
     {
-        for (int t = 0; t < tokens; t++)
-            Gemv(weights, input + t * nIn, output + t * nOut, nIn, nOut, pool);
+        if (tokens == 1)
+        {
+            Gemv(weights, input, output, nIn, nOut, pool);
+            return;
+        }
+
+        int nb = nIn / Qk.SuperBlock;
+        VecGemmF.Gemm((byte*)weights, nb * sizeof(BlockQ5K), sizeof(BlockQ5K), Qk.SuperBlock,
+            &DequantBlock, input, output, nIn, nOut, tokens, pool);
     }
+
+    private static void DequantBlock(byte* p, float* dst) =>
+        DequantizeRow((BlockQ5K*)p, dst, Qk.SuperBlock);
 }

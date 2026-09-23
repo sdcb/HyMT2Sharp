@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
 using System.Runtime.Intrinsics.X86;
@@ -8,9 +9,43 @@ public static unsafe class VecDotQ4K
 {
     public static float Dot(BlockQ4K* x, BlockQ8K* y, int n)
     {
-        if (Avx2.IsSupported)
+        if (Simd.UseAvx2)
             return DotAvx2(x, y, n);
-        return DotScalar(x, y, n);
+        return DotVec(x, y, n);
+    }
+
+    /// <summary>Portable widening fallback; same structure as <see cref="DotScalar"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotVec(BlockQ4K* x, BlockQ8K* y, int n)
+    {
+        int nb = n / Qk.SuperBlock;
+        uint* utmp = stackalloc uint[4];
+        float sumf = 0;
+        for (int i = 0; i < nb; i++)
+        {
+            Q4K.UnpackScales(x[i].Scales, utmp);
+            byte* scales = (byte*)utmp;
+            byte* mins = (byte*)(utmp + 2);
+
+            int sumi = 0;
+            for (int j = 0; j < Qk.SuperBlock / 16; j++)
+                sumi += y[i].Bsums[j] * mins[j / 2];
+
+            byte* q4 = x[i].Qs;
+            sbyte* q8 = y[i].Qs;
+            int acc = 0;
+            for (int j = 0; j < Qk.SuperBlock / 64; j++)
+            {
+                VecI8.DotNibblesI8(q4 + j * 32, q8 + j * 64, q8 + j * 64 + 32, out int lo, out int hi);
+                acc += scales[2 * j] * lo + scales[2 * j + 1] * hi;
+            }
+
+            float d = HalfBits.ToSingle(x[i].D) * y[i].D;
+            float dmin = HalfBits.ToSingle(x[i].Dmin) * y[i].D;
+            sumf += d * acc - dmin * sumi;
+        }
+
+        return sumf;
     }
 
     public static float DotScalar(BlockQ4K* x, BlockQ8K* y, int n)
@@ -115,7 +150,7 @@ public static unsafe class VecDotQ4K
                 sumi = Avx2.Add(sumi, Avx2.Add(p32l, p32h));
             }
 
-            acc = Fma.IsSupported
+            acc = Simd.UseFma
                 ? Fma.MultiplyAdd(Avx.ConvertToVector256Single(sumi), Vector256.Create(d), acc)
                 : Avx.Add(acc, Avx.Multiply(Avx.ConvertToVector256Single(sumi), Vector256.Create(d)));
         }
