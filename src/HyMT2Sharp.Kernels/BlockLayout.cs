@@ -228,6 +228,15 @@ public static class HalfBits
         uint mag = bits & 0x7FFFu;
         if (mag >= 0x7C00u)
             return (float)BitConverter.UInt16BitsToHalf(bits);
+        if (mag < 0x400u)
+        {
+            // fp16 subnormal: value = mag * 2^-24. mag<<13 would be an fp32
+            // subnormal and the 2^112 multiply would hit a microcode assist
+            // (~150cy) — real GGUF d/dmin fields are dense with these, so keep
+            // the computation on the integer mantissa where inputs stay normal.
+            float fs = mag * 5.960464477539063e-8f;
+            return BitConverter.UInt32BitsToSingle(BitConverter.SingleToUInt32Bits(fs) | ((uint)(bits & 0x8000) << 16));
+        }
         float f = BitConverter.UInt32BitsToSingle(mag << 13) * TwoPow112;
         return BitConverter.UInt32BitsToSingle(BitConverter.SingleToUInt32Bits(f) | ((uint)(bits & 0x8000) << 16));
     }
