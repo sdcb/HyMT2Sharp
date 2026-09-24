@@ -116,6 +116,12 @@ kernel void rope_neox(
 }
 
 // append one token's K and V (fp32) into flat bf16 caches at `pos`
+// paged KV: logical position j -> physical row via block table.
+// tab[logicalBlock] = physical block index; physical row = phys * (1<<lg) + (j % (1<<lg)).
+inline uint kv_row(device const int* tab, uint j, uint lg) {
+    return ((uint)tab[j >> lg] << lg) | (j & ((1u << lg) - 1u));
+}
+
 kernel void kv_append_bf16(
     device const float* kSrc [[buffer(0)]],
     device const float* vSrc [[buffer(1)]],
@@ -124,15 +130,18 @@ kernel void kv_append_bf16(
     constant int& kDim [[buffer(4)]],
     constant int& kvStride [[buffer(5)]],
     constant int& pos [[buffer(6)]],
+    device const int* tab [[buffer(7)]],
+    constant int& lg [[buffer(8)]],
     uint gid [[thread_position_in_grid]])
 {
     if ((int)gid >= kDim) return;
-    kDst[pos * kvStride + (int)gid] = f32_to_bf16(kSrc[gid]);
-    vDst[pos * kvStride + (int)gid] = f32_to_bf16(vSrc[gid]);
+    uint prow = kv_row(tab, (uint)pos, (uint)lg);
+    kDst[prow * kvStride + (int)gid] = f32_to_bf16(kSrc[gid]);
+    vDst[prow * kvStride + (int)gid] = f32_to_bf16(vSrc[gid]);
 }
 
 // decode attention: one threadgroup per q head, 128 threads.
-// scores over [0, kvLen), softmax, weighted V sum — all bf16 KV.
+// scores over [0, kvLen) via paged block table, softmax, weighted V sum — all bf16 KV.
 // kvLen <= 4096 (16KB threadgroup scores buffer).
 kernel void attn_decode(
     device const float* q [[buffer(0)]],
@@ -145,6 +154,8 @@ kernel void attn_decode(
     constant int& kvStride [[buffer(7)]],
     constant int& kvLen [[buffer(8)]],
     constant float& scale [[buffer(9)]],
+    device const int* tab [[buffer(10)]],
+    constant int& lg [[buffer(11)]],
     uint g [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
@@ -155,7 +166,7 @@ kernel void attn_decode(
 
     threadgroup float sc[4096];
     for (int t = (int)tid; t < kvLen; t += 128) {
-        device const ushort* kk = kb + t * kvStride;
+        device const ushort* kk = kb + (ulong)kv_row(tab, (uint)t, (uint)lg) * kvStride;
         float acc = 0.0f;
         for (int d = 0; d < headDim; d++)
             acc += qh[d] * bf16_to_f32(kk[d]);
@@ -194,7 +205,7 @@ kernel void attn_decode(
     for (int d = (int)tid; d < headDim; d += 128) {
         float acc = 0.0f;
         for (int t = 0; t < kvLen; t++)
-            acc += sc[t] * bf16_to_f32(vb[t * kvStride + d]);
+            acc += sc[t] * bf16_to_f32(vb[(ulong)kv_row(tab, (uint)t, (uint)lg) * kvStride + d]);
         oh[d] = acc / sm;
     }
 }
@@ -605,6 +616,8 @@ kernel void attn_scores(
     constant int& posBase [[buffer(8)]],
     constant int& T [[buffer(9)]],
     constant float& scale [[buffer(10)]],
+    device const int* tab [[buffer(11)]],
+    constant int& lg [[buffer(12)]],
     uint2 g [[threadgroup_position_in_grid]],
     uint2 tp [[thread_position_in_threadgroup]])
 {
@@ -618,7 +631,7 @@ kernel void attn_scores(
     threadgroup_barrier(mem_flags::mem_threadgroup);
     device const ushort* kb = K + kvh * headDim;
     for (int j = tid; j < kvHere; j += 128) {
-        device const ushort* krow = kb + (ulong)j * kvStride;
+        device const ushort* krow = kb + (ulong)kv_row(tab, (uint)j, (uint)lg) * kvStride;
         float acc = 0.0f;
         for (int i = 0; i < headDim; i++)
             acc += qs[i] * bf16_to_f32(krow[i]);
@@ -639,6 +652,8 @@ kernel void attn_combine(
     constant int& kvLen [[buffer(7)]],
     constant int& posBase [[buffer(8)]],
     constant int& T [[buffer(9)]],
+    device const int* tab [[buffer(10)]],
+    constant int& lg [[buffer(11)]],
     uint2 g [[threadgroup_position_in_grid]],
     uint2 tp [[thread_position_in_threadgroup]])
 {
@@ -681,12 +696,12 @@ kernel void attn_combine(
     for (int d = tid; d < headDim; d += 128) {
         float acc = 0.0f;
         for (int j = 0; j < kvHere; j++)
-            acc += sc[j] * bf16_to_f32(vb[(ulong)j * kvStride + d]);
+            acc += sc[j] * bf16_to_f32(vb[(ulong)kv_row(tab, (uint)j, (uint)lg) * kvStride + d]);
         out[(ulong)t * heads * headDim + h * headDim + d] = acc / sm;
     }
 }
 
-// append T tokens' K/V (fp32, [T x kDim]) into flat bf16 caches starting at posBase.
+// append T tokens' K/V (fp32, [T x kDim]) into paged bf16 caches (block table) starting at posBase.
 kernel void kv_append_multi(
     device const float* kSrc [[buffer(0)]],
     device const float* vSrc [[buffer(1)]],
@@ -695,12 +710,39 @@ kernel void kv_append_multi(
     constant int& kDim [[buffer(4)]],
     constant int& kvStride [[buffer(5)]],
     constant int& posBase [[buffer(6)]],
+    device const int* tab [[buffer(7)]],
+    constant int& lg [[buffer(8)]],
     uint gid [[thread_position_in_grid]])
 {
     int t = (int)gid / kDim;
     int e = (int)gid % kDim;
-    kDst[(ulong)(posBase + t) * kvStride + e] = f32_to_bf16(kSrc[gid]);
-    vDst[(ulong)(posBase + t) * kvStride + e] = f32_to_bf16(vSrc[gid]);
+    uint prow = kv_row(tab, (uint)(posBase + t), (uint)lg);
+    kDst[prow * kvStride + e] = f32_to_bf16(kSrc[gid]);
+    vDst[prow * kvStride + e] = f32_to_bf16(vSrc[gid]);
+}
+
+// copy the first nRows rows of one physical KV block to another (both K and V).
+// Used when appends diverge mid-block over a store-pinned physical block:
+// the pinned block keeps its old contents for future restores, so the live
+// logical block gets a fresh phys with its front rows copied over.
+kernel void kv_copy_block(
+    device const ushort* srcK [[buffer(0)]],
+    device const ushort* srcV [[buffer(1)]],
+    device ushort* dstK [[buffer(2)]],
+    device ushort* dstV [[buffer(3)]],
+    constant int& kvStride [[buffer(4)]],
+    constant int& srcPhys [[buffer(5)]],
+    constant int& dstPhys [[buffer(6)]],
+    constant int& nRows [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int t = (int)gid / kvStride;
+    int e = (int)gid % kvStride;
+    if (t >= nRows) return;
+    ulong so = ((ulong)srcPhys * 64 + (uint)t) * (uint)kvStride + (uint)e;
+    ulong dto = ((ulong)dstPhys * 64 + (uint)t) * (uint)kvStride + (uint)e;
+    dstK[dto] = srcK[so];
+    dstV[dto] = srcV[so];
 }
 ";
 }

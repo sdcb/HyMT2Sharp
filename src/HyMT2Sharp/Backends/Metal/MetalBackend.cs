@@ -21,10 +21,29 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private readonly Dictionary<string, GgmlTensorType> _wtype = new(StringComparer.Ordinal);
     private IntPtr _psoGemv, _psoGemvQ6, _psoEmbedQ4, _psoEmbedQ6, _psoRms, _psoRope, _psoKvAppend, _psoAttn, _psoSilu, _psoAdd;
     private IntPtr _psoGemm, _psoGemmQ6, _psoEmbedRowsQ4, _psoEmbedRowsQ6, _psoRopeMulti, _psoKvAppendMulti;
-    private IntPtr _psoAttnScores, _psoAttnCombine;
+    private IntPtr _psoAttnScores, _psoAttnCombine, _psoKvCopy;
     private IntPtr[] _kvK = null!, _kvV = null!;
     private int _kvCap;
     private int _kvStride;
+
+    // ---- paged KV + device block store (M4) ----
+    // Device KV pools stay contiguous per layer, but logical positions reach
+    // them through _kvTab: tab[logicalBlk] -> physical block (64 positions).
+    // _store hashes token blocks to phys blocks; restoring a shared prefix is
+    // a table rewrite — zero KV copies, zero uploads.
+    private const int BlkShift = 6;                  // 64 positions per physical block
+    private const int BlkTok = 1 << BlkShift;
+    private IntPtr _kvTab;
+    private int[] _tab = null!;                      // host shadow, -1 = unmapped
+    private bool _tabDirty;
+    private int _maxBlk;
+    private int _physNext;
+    private readonly Stack<int> _freePhys = new();
+    private int _liveLen;                            // positions the model may still read
+    private sealed class DevBlk { public int Phys; public int[] Toks = null!; public LinkedListNode<ulong>? Node; }
+    private readonly Dictionary<ulong, DevBlk> _store = new();
+    private readonly LinkedList<ulong> _storeLru = new();   // front = oldest
+    private readonly Dictionary<int, ulong> _physToHash = new();
     private IntPtr _embd, _outNorm;
     private IntPtr _h, _n1, _n2, _q, _k, _v, _ao, _attnOut, _gate, _up, _down, _normed, _logitsBuf, _tok;
     // ForwardStep returns this shared buffer — callers must consume it before the next call.
@@ -74,6 +93,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
         _psoKvAppendMulti = NewPso(lib2, "kv_append_multi");
         _psoAttnScores = NewPso(lib2, "attn_scores");
         _psoAttnCombine = NewPso(lib2, "attn_combine");
+        _psoKvCopy = NewPso(lib2, "kv_copy_block");
 
         foreach ((string name, GgufTensorInfo info) in gguf.Tensors)
         {
@@ -100,8 +120,9 @@ public sealed unsafe class MetalBackend : IComputeBackend
         }
         if (_outNorm == 0) throw new KeyNotFoundException("output_norm.weight");
 
-        // Buffers: flat bf16 KV (cap = context length, clamped to threadgroup
-        // score capacity of attn_decode: kvLen <= 4096)
+        // Buffers: bf16 KV pools indexed through the block table
+        // (cap = context length, clamped to threadgroup score capacity of
+        // attn_decode/attn_combine: kvLen <= 4096)
         _kvStride = cfg.NumKvHeads * cfg.HeadDim;
         _kvCap = Math.Min(cfg.ContextLength, 4096);
         _kvK = new IntPtr[cfg.NumLayers];
@@ -111,6 +132,11 @@ public sealed unsafe class MetalBackend : IComputeBackend
             _kvK[l] = _dev.NewBuffer((nuint)(_kvCap * _kvStride * sizeof(ushort)));
             _kvV[l] = _dev.NewBuffer((nuint)(_kvCap * _kvStride * sizeof(ushort)));
         }
+        _maxBlk = _kvCap >> BlkShift;
+        _tab = new int[_maxBlk];
+        Array.Fill(_tab, -1);
+        fixed (int* tp = _tab)
+            _kvTab = _dev.NewBufferBytes(tp, (nuint)(_tab.Length * sizeof(int)));
 
         int hidden = cfg.HiddenSize, ffn = cfg.FfnSize;
         int qDim = cfg.NumHeads * cfg.HeadDim, kDim = _kvStride;
@@ -135,13 +161,177 @@ public sealed unsafe class MetalBackend : IComputeBackend
     public void UploadKv(int layer, int pos, int len, ushort* k, ushort* v)
     {
         if (pos + len > _kvCap)
-            throw new NotSupportedException($"Metal KV capacity {_kvCap} exceeded at {pos + len} (M2 flat cap)");
-        nuint off = (nuint)(pos * _kvStride * sizeof(ushort));
-        nuint bytes = (nuint)(len * _kvStride * sizeof(ushort));
-        Buffer.MemoryCopy(k + pos * _kvStride, (byte*)Contents(_kvK[layer]) + off, bytes, bytes);
-        Buffer.MemoryCopy(v + pos * _kvStride, (byte*)Contents(_kvV[layer]) + off, bytes, bytes);
-        MtlDevice.DidModifyRange(_kvK[layer], off, bytes);
-        MtlDevice.DidModifyRange(_kvV[layer], off, bytes);
+            throw new NotSupportedException($"Metal KV capacity {_kvCap} exceeded at {pos + len}");
+        EnsureWrittenRange(pos, len);
+        int rowBytes = _kvStride * sizeof(ushort);
+        for (int j = pos; j < pos + len; j++)
+        {
+            nuint off = (nuint)(_tab[j >> BlkShift] * BlkTok + (j & (BlkTok - 1))) * (nuint)rowBytes;
+            Buffer.MemoryCopy(k + j * _kvStride, (byte*)Contents(_kvK[layer]) + off, rowBytes, rowBytes);
+            Buffer.MemoryCopy(v + j * _kvStride, (byte*)Contents(_kvV[layer]) + off, rowBytes, rowBytes);
+        }
+        MtlDevice.DidModifyRange(_kvK[layer], 0, (nuint)(_kvCap * rowBytes));
+        MtlDevice.DidModifyRange(_kvV[layer], 0, (nuint)(_kvCap * rowBytes));
+    }
+
+    public bool SupportsBlockStore => true;
+    public int DeviceBlockTokens => BlkTok;
+
+    public void SetCacheLen(int len) => _liveLen = len;
+
+    // Physical block allocator + hash store. A physical block is owned by the
+    // current table mapping and/or one store entry; freeing a phys clears every
+    // table slot still pointing at it so no two logical blocks ever alias.
+    private int AllocPhys()
+    {
+        if (_freePhys.Count > 0) return _freePhys.Pop();
+        if (_physNext < _maxBlk) return _physNext++;
+        // Evict LRU entries until a physical block outside the live range frees.
+        int liveBlk = (_liveLen + BlkTok - 1) >> BlkShift;
+        var live = new HashSet<int>();
+        for (int i = 0; i < liveBlk; i++) if (_tab[i] >= 0) live.Add(_tab[i]);
+        var node = _storeLru.First;
+        while (node != null)
+        {
+            var next = node.Next;
+            if (!live.Contains(_store[node.Value].Phys))
+            {
+                RemoveEntry(node.Value);
+                return _freePhys.Pop();
+            }
+            node = next;
+        }
+        throw new NotSupportedException($"Metal KV block pool exhausted ({_maxBlk} blocks x {BlkTok} tok)");
+    }
+
+    private void Unpin(ulong hash)
+    {
+        DevBlk e = _store[hash];
+        _store.Remove(hash);
+        _physToHash.Remove(e.Phys);
+        if (e.Node is not null) _storeLru.Remove(e.Node);
+    }
+
+    // Eviction path: the phys is guaranteed outside the live range — clear any
+    // stale (dead) table slots pointing at it, then recycle.
+    private void RemoveEntry(ulong hash)
+    {
+        int phys = _store[hash].Phys;
+        Unpin(hash);
+        for (int i = 0; i < _maxBlk; i++) if (_tab[i] == phys) _tab[i] = -1;
+        _freePhys.Push(phys);
+    }
+
+    // Free phys only if no table slot references it anymore.
+    private void ReleaseOrFree(int phys)
+    {
+        for (int i = 0; i < _maxBlk; i++) if (_tab[i] == phys) return;
+        _freePhys.Push(phys);
+    }
+
+    // Map every logical block covering [pos, pos+len) to a physical block.
+    // A phys pinned by a store entry is never written — the logical block gets
+    // a fresh phys instead (copy-on-write). For a partial first block the rows
+    // before pos must be copied over; they queue into _copies for the next
+    // command buffer.
+    private readonly List<(int srcPhys, int dstPhys, int rows)> _copies = new();
+    private void EnsureWrittenRange(int pos, int len)
+    {
+        int first = pos >> BlkShift, last = (pos + len - 1) >> BlkShift;
+        for (int i = first; i <= last && i < _maxBlk; i++)
+        {
+            if (_tab[i] < 0)
+            {
+                _tab[i] = AllocPhys();
+                _tabDirty = true;
+            }
+            else if (_physToHash.ContainsKey(_tab[i]))
+            {
+                // Phys is pinned by a store entry describing its current
+                // content — keep entry and block intact, write elsewhere.
+                int fresh = AllocPhys();
+                if (i == first && (pos & (BlkTok - 1)) != 0)
+                    _copies.Add((_tab[i], fresh, pos & (BlkTok - 1)));
+                _tab[i] = fresh;
+                _tabDirty = true;
+            }
+        }
+    }
+
+    private void FlushTab()
+    {
+        if (!_tabDirty) return;
+        _tabDirty = false;
+        fixed (int* tp = _tab)
+            Buffer.MemoryCopy(tp, Contents(_kvTab), (nuint)(_tab.Length * sizeof(int)), (nuint)(_tab.Length * sizeof(int)));
+        MtlDevice.DidModifyRange(_kvTab, 0, (nuint)(_tab.Length * sizeof(int)));
+    }
+
+    private void ExecCopies(CmdCtx cc)
+    {
+        if (_copies.Count == 0) return;
+        foreach ((int srcPhys, int dstPhys, int rows) in _copies)
+        {
+            for (int l = 0; l < _cfg.NumLayers; l++)
+            {
+                cc.SetPso(_psoKvCopy);
+                cc.SetBuffer(_kvK[l], 0, 0); cc.SetBuffer(_kvV[l], 0, 1);
+                cc.SetBuffer(_kvK[l], 0, 2); cc.SetBuffer(_kvV[l], 0, 3);
+                cc.SetInt(4, _kvStride); cc.SetInt(5, srcPhys); cc.SetInt(6, dstPhys); cc.SetInt(7, rows);
+                cc.Dispatch((nuint)((rows * _kvStride + 255) / 256), 1, 1, 256, 1, 1);
+            }
+        }
+        _copies.Clear();
+    }
+
+    public void HarvestPrefix(ReadOnlySpan<int> tokens, int blockTokens)
+    {
+        if (Environment.GetEnvironmentVariable("HYMT_METAL_DEBUG") == "1")
+            Console.Error.WriteLine($"[blk] harvest tokens={tokens.Length} store={_store.Count} tab0={_tab[0]}");
+        if (blockTokens != BlkTok)
+            throw new NotSupportedException($"Metal block store requires --kv-block-tokens {BlkTok}, got {blockTokens}");
+        ulong h = KvBlockStore.Seed;
+        for (int b = 0; b * BlkTok + BlkTok <= tokens.Length && b < _maxBlk; b++)
+        {
+            ReadOnlySpan<int> toks = tokens.Slice(b * BlkTok, BlkTok);
+            h = KvBlockStore.ChainHash(h, toks);
+            int phys = _tab[b];
+            if (phys < 0) continue;  // block never touched device KV
+            if (_store.TryGetValue(h, out DevBlk? cur) && cur.Toks.AsSpan().SequenceEqual(toks))
+            {
+                if (cur.Node is not null) { _storeLru.Remove(cur.Node); _storeLru.AddLast(cur.Node); }
+                continue;
+            }
+            if (cur is not null) { int op = cur.Phys; Unpin(h); ReleaseOrFree(op); }
+            if (_physToHash.TryGetValue(phys, out ulong prev)) Unpin(prev);
+            var e2 = new DevBlk { Phys = phys, Toks = toks.ToArray() };
+            e2.Node = _storeLru.AddLast(h);
+            _store[h] = e2;
+            _physToHash[phys] = h;
+        }
+    }
+
+    public int RestorePrefix(ReadOnlySpan<int> tokens, int blockTokens)
+    {
+        if (blockTokens != BlkTok)
+            throw new NotSupportedException($"Metal block store requires --kv-block-tokens {BlkTok}, got {blockTokens}");
+        ulong h = KvBlockStore.Seed;
+        int hit = 0;
+        for (int i = 0; i * BlkTok + BlkTok <= tokens.Length && i < _maxBlk; i++)
+        {
+            ReadOnlySpan<int> toks = tokens.Slice(i * BlkTok, BlkTok);
+            h = KvBlockStore.ChainHash(h, toks);
+            if (!_store.TryGetValue(h, out DevBlk? e) || !e.Toks.AsSpan().SequenceEqual(toks))
+                break;
+            _tab[i] = e.Phys;
+            hit++;
+        }
+        if (Environment.GetEnvironmentVariable("HYMT_METAL_DEBUG") == "1")
+            Console.Error.WriteLine($"[blk] restore tokens={tokens.Length} hit={hit} store={_store.Count}");
+        if (hit == 0) return 0;
+        _tabDirty = true;
+        FlushTab();
+        return hit * BlkTok;
     }
 
     public float[] ForwardStep(ReadOnlySpan<int> tokens, int pos)
@@ -153,14 +343,18 @@ public sealed unsafe class MetalBackend : IComputeBackend
         int hidden = c.HiddenSize, heads = c.NumHeads, kvHeads = c.NumKvHeads;
         int dim = c.HeadDim, qDim = heads * dim, kDim = kvHeads * dim, kvLen = pos + 1;
         if (kvLen > _kvCap)
-            throw new NotSupportedException($"Metal KV capacity {_kvCap} exceeded at {kvLen} (M2 flat cap)");
+            throw new NotSupportedException($"Metal KV capacity {_kvCap} exceeded at {kvLen}");
         float scale = 1f / MathF.Sqrt(dim);
+        EnsureWrittenRange(pos, 1);
+        FlushTab();
+        _liveLen = Math.Max(_liveLen, kvLen);
 
         _sw.Restart();
         *(int*)Contents(_tok) = tokenId;
         MtlDevice.DidModifyRange(_tok, 0, 4);
 
         var cc = CmdCtx.Begin(_dev.Queue);  // owns the autorelease pool for this step
+        ExecCopies(cc);
         // embed: h = dequant(embd[token])
         cc.SetPso(_wtype["token_embd.weight"] switch
         {
@@ -189,6 +383,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
             cc.SetBuffer(_k, 0, 0); cc.SetBuffer(_v, 0, 1);
             cc.SetBuffer(_kvK[l], 0, 2); cc.SetBuffer(_kvV[l], 0, 3);
             cc.SetInt(4, kDim); cc.SetInt(5, _kvStride); cc.SetInt(6, pos);
+            cc.SetBuffer(_kvTab, 0, 7); cc.SetInt(8, BlkShift);
             cc.Dispatch((nuint)((kDim + 255) / 256), 1, 1, 256, 1, 1);
             // attention -> ao
             cc.SetPso(_psoAttn);
@@ -196,6 +391,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
             cc.SetBuffer(_ao, 0, 3);
             cc.SetInt(4, heads); cc.SetInt(5, kvHeads); cc.SetInt(6, dim);
             cc.SetInt(7, _kvStride); cc.SetInt(8, kvLen); cc.SetFloat(9, scale);
+            cc.SetBuffer(_kvTab, 0, 10); cc.SetInt(11, BlkShift);
             cc.Dispatch((nuint)heads, 1, 1, 128, 1, 1);
             Gemv(cc, $"blk.{l}.attn_output.weight", _ao, _attnOut, qDim, hidden);
             Add(cc, _h, _attnOut, hidden);
@@ -245,8 +441,11 @@ public sealed unsafe class MetalBackend : IComputeBackend
         int dim = c.HeadDim, qDim = heads * dim, kDim = kvHeads * dim, ffn = c.FfnSize;
         int T = tokens.Length, kvLen = start + T;
         if (kvLen > _kvCap)
-            throw new NotSupportedException($"Metal KV capacity {_kvCap} exceeded at {kvLen} (M3 flat cap)");
+            throw new NotSupportedException($"Metal KV capacity {_kvCap} exceeded at {kvLen}");
         float scale = 1f / MathF.Sqrt(dim);
+        EnsureWrittenRange(start, T);
+        FlushTab();
+        _liveLen = Math.Max(_liveLen, kvLen);
 
         IntPtr toks;
         fixed (int* tp = tokens) toks = _dev.NewBufferBytes(tp, (nuint)(T * 4));
@@ -265,6 +464,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
         IntPtr scores = _dev.NewBuffer((nuint)heads * (nuint)T * (nuint)kvLen * 4);
 
         var cc = CmdCtx.Begin(_dev.Queue);
+        ExecCopies(cc);
         cc.SetPso(PsoFor("token_embd.weight", _psoEmbedRowsQ4, _psoEmbedRowsQ6));
         cc.SetBuffer(_embd, 0, 0); cc.SetBuffer(toks, 0, 1); cc.SetBuffer(h, 0, 2);
         cc.SetInt(3, hidden);
@@ -284,6 +484,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
             cc.SetBuffer(kb, 0, 0); cc.SetBuffer(vb, 0, 1);
             cc.SetBuffer(_kvK[l], 0, 2); cc.SetBuffer(_kvV[l], 0, 3);
             cc.SetInt(4, kDim); cc.SetInt(5, _kvStride); cc.SetInt(6, start);
+            cc.SetBuffer(_kvTab, 0, 7); cc.SetInt(8, BlkShift);
             cc.Dispatch((nuint)((T * kDim + 255) / 256), 1, 1, 256, 1, 1);
             if (Environment.GetEnvironmentVariable("HYMT_METAL_SLOWATTN") == "1")
             {
@@ -295,6 +496,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
                     cc.SetBuffer(ao, (nuint)(t * qDim * 4), 3);
                     cc.SetInt(4, heads); cc.SetInt(5, kvHeads); cc.SetInt(6, dim);
                     cc.SetInt(7, _kvStride); cc.SetInt(8, start + t + 1); cc.SetFloat(9, scale);
+                    cc.SetBuffer(_kvTab, 0, 10); cc.SetInt(11, BlkShift);
                     cc.Dispatch((nuint)heads, 1, 1, 128, 1, 1);
                 }
             }
@@ -305,11 +507,13 @@ public sealed unsafe class MetalBackend : IComputeBackend
                 cc.SetInt(3, heads); cc.SetInt(4, kvHeads); cc.SetInt(5, dim);
                 cc.SetInt(6, _kvStride); cc.SetInt(7, kvLen); cc.SetInt(8, start); cc.SetInt(9, T);
                 cc.SetFloat(10, scale);
+                cc.SetBuffer(_kvTab, 0, 11); cc.SetInt(12, BlkShift);
                 cc.Dispatch((nuint)T, (nuint)heads, 1, 128, 1, 1);
                 cc.SetPso(_psoAttnCombine);
                 cc.SetBuffer(scores, 0, 0); cc.SetBuffer(_kvV[l], 0, 1); cc.SetBuffer(ao, 0, 2);
                 cc.SetInt(3, heads); cc.SetInt(4, kvHeads); cc.SetInt(5, dim);
                 cc.SetInt(6, _kvStride); cc.SetInt(7, kvLen); cc.SetInt(8, start); cc.SetInt(9, T);
+                cc.SetBuffer(_kvTab, 0, 10); cc.SetInt(11, BlkShift);
                 cc.Dispatch((nuint)T, (nuint)heads, 1, 128, 1, 1);
             }
             Gemm(cc, $"blk.{l}.attn_output.weight", ao, attnOut, qDim, hidden, T);

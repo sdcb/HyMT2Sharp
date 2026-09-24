@@ -289,7 +289,7 @@ public static class MetalGemvMicro
 
     // attn_scores/attn_combine synthetic check: random q, KV; compare vs managed.
     // --micro-metal-attn
-    public static void RunAttn()
+    public static unsafe void RunAttn()
     {
         if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
             throw new PlatformNotSupportedException("Metal backend requires macOS.");
@@ -334,12 +334,18 @@ public static class MetalGemvMicro
         c.SetBuffer(qb, 0, 0); c.SetBuffer(kb, 0, 1); c.SetBuffer(sb, 0, 2);
         c.SetInt(3, heads); c.SetInt(4, kvHeads); c.SetInt(5, headDim);
         c.SetInt(6, kvStride); c.SetInt(7, kvLen); c.SetInt(8, posBase); c.SetInt(9, T);
+        int[] tab = new int[64];
+        for (int i = 0; i < tab.Length; i++) tab[i] = i;  // identity table
+        IntPtr tabB;
+        fixed (int* tp = tab) tabB = dev.NewBufferBytes(tp, (nuint)(tab.Length * 4));
         c.SetFloat(10, 1f / MathF.Sqrt(headDim));
+        c.SetBuffer(tabB, 0, 11); c.SetInt(12, 6);
         c.Dispatch((nuint)T, (nuint)heads, 1, 128, 1, 1);
         c.SetPso(psC);
         c.SetBuffer(sb, 0, 0); c.SetBuffer(vb, 0, 1); c.SetBuffer(ob, 0, 2);
         c.SetInt(3, heads); c.SetInt(4, kvHeads); c.SetInt(5, headDim);
         c.SetInt(6, kvStride); c.SetInt(7, kvLen); c.SetInt(8, posBase); c.SetInt(9, T);
+        c.SetBuffer(tabB, 0, 10); c.SetInt(11, 6);
         c.Dispatch((nuint)T, (nuint)heads, 1, 128, 1, 1);
         c.Finish();
 
