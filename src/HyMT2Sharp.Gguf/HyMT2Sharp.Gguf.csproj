@@ -1,5 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <Description>GGUF v2/v3 reader aligned to ggml tensor offsets.</Description>
-  </PropertyGroup>
-</Project>

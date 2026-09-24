@@ -1,5 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <Description>AVX2/AVX-VNNI Q4_K panel GEMM and GEMV kernels.</Description>
-  </PropertyGroup>
-</Project>

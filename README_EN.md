@@ -1,4 +1,4 @@
-# HyMT2Sharp [![NuGet](https://img.shields.io/nuget/v/Sdcb.HyMT2Sharp.Model.svg)](https://www.nuget.org/packages/Sdcb.HyMT2Sharp.Model) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE) [![QQ](https://img.shields.io/badge/QQ_Group-495782587-52B6EF?style=social&logo=tencent-qq&logoColor=000&logoWidth=20)](https://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=&authKey=&noverify=0&group_code=495782587)
+# HyMT2Sharp [![NuGet](https://img.shields.io/nuget/v/Sdcb.HyMT2Sharp.svg)](https://www.nuget.org/packages/Sdcb.HyMT2Sharp) [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE) [![QQ](https://img.shields.io/badge/QQ_Group-495782587-52B6EF?style=social&logo=tencent-qq&logoColor=000&logoWidth=20)](https://qm.qq.com/cgi-bin/qm/qr?_wv=1027&k=&authKey=&noverify=0&group_code=495782587)
 
 [中文](README.md) | **English**
 
@@ -44,10 +44,10 @@ curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/jso
 
 ## Use as a library
 
-Install the inference entry package (`Sdcb.HyMT2Sharp.Gguf` and `Sdcb.HyMT2Sharp.Kernels` come in transitively):
+Install the inference package (Gguf / Kernels / backends are merged into a single assembly):
 
 ```powershell
-dotnet add package Sdcb.HyMT2Sharp.Model
+dotnet add package Sdcb.HyMT2Sharp
 ```
 
 `HunyuanDenseModel` loads the GGUF, tokenizes, owns the KV cache, and runs `Forward`. Sampling and string assembly are left to the caller — there is no built-in `Generate` / `ArgMax`. Minimal greedy streaming example:
@@ -108,9 +108,7 @@ static int ArgMax(float[] logits)
 
 | Package | Version | Notes |
 | --- | --- | --- |
-| `Sdcb.HyMT2Sharp.Model` | [![NuGet](https://img.shields.io/nuget/v/Sdcb.HyMT2Sharp.Model.svg)](https://www.nuget.org/packages/Sdcb.HyMT2Sharp.Model) | Inference entry: load, tokenize, KV cache, `Forward` |
-| `Sdcb.HyMT2Sharp.Gguf` | [![NuGet](https://img.shields.io/nuget/v/Sdcb.HyMT2Sharp.Gguf.svg)](https://www.nuget.org/packages/Sdcb.HyMT2Sharp.Gguf) | GGUF v2/v3 reader (usually referenced transitively) |
-| `Sdcb.HyMT2Sharp.Kernels` | [![NuGet](https://img.shields.io/nuget/v/Sdcb.HyMT2Sharp.Kernels.svg)](https://www.nuget.org/packages/Sdcb.HyMT2Sharp.Kernels) | AVX2 / AVX-VNNI quantized kernels (usually referenced transitively) |
+| `Sdcb.HyMT2Sharp` | [![NuGet](https://img.shields.io/nuget/v/Sdcb.HyMT2Sharp.svg)](https://www.nuget.org/packages/Sdcb.HyMT2Sharp) | Single dll: GGUF, tokenizer, KV cache, CPU SIMD kernels, `Forward` |
 
 `HyMT2Sharp.Cli`, `HyMT2Sharp.Server`, and `HyMT2Sharp.Benchmark` live in this repo as samples and tooling. They are not published to NuGet.
 

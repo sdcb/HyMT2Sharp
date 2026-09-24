@@ -4,9 +4,7 @@
     `dotnet pack -p:Version=` must not flow into referenced projects; see Directory.Build.targets.
   -->
   <PropertyGroup>
-    <HyMT2SharpGgufVersion Condition="'$(HyMT2SharpGgufVersion)' == ''">1.0.0</HyMT2SharpGgufVersion>
-    <HyMT2SharpKernelsVersion Condition="'$(HyMT2SharpKernelsVersion)' == ''">1.0.0</HyMT2SharpKernelsVersion>
-    <HyMT2SharpModelVersion Condition="'$(HyMT2SharpModelVersion)' == ''">1.0.0</HyMT2SharpModelVersion>
+    <HyMT2SharpVersion Condition="'$(HyMT2SharpVersion)' == ''">1.0.0</HyMT2SharpVersion>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -36,20 +34,10 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
-  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'HyMT2Sharp.Gguf'">
-    <Version>$(HyMT2SharpGgufVersion)</Version>
+  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'HyMT2Sharp'">
+    <Version>$(HyMT2SharpVersion)</Version>
     <IsPackable>true</IsPackable>
-    <Description>GGUF v2/v3 reader aligned to ggml tensor offsets.</Description>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'HyMT2Sharp.Kernels'">
-    <Version>$(HyMT2SharpKernelsVersion)</Version>
-    <IsPackable>true</IsPackable>
-    <Description>AVX2/AVX-VNNI Q4_K / Q2_0C / STQ1_0 panel GEMM and GEMV kernels.</Description>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(MSBuildProjectName)' == 'HyMT2Sharp.Model'">
-    <Version>$(HyMT2SharpModelVersion)</Version>
-    <IsPackable>true</IsPackable>
-    <Description>Hy-MT2 hunyuan-dense CPU inference: load GGUF, tokenize, KV cache and Forward.</Description>
+    <Description>Hy-MT2 hunyuan-dense inference: GGUF, tokenize, KV cache, CPU (SIMD) and Metal backends.</Description>
   </PropertyGroup>
 
   <PropertyGroup Condition="'$(IsPackable)' == 'true'">
