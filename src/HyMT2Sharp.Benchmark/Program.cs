@@ -36,6 +36,12 @@ if (args.Contains("--micro-metal-q4"))
     return;
 }
 
+if (args.Contains("--micro-metal-q6"))
+{
+    Sdcb.HyMT2Sharp.Backends.Metal.MetalGemvMicro.RunQ6();
+    return;
+}
+
 if (args.Contains("--micro-vec-q4"))
 {
     MicroVecQ4(Args.GetInt(args, "--micro-in", 2048), Args.GetInt(args, "--micro-out", 6144), Args.GetInt(args, "--micro-tokens", 512), Args.GetInt(args, "--micro-reps", 5), threads);
@@ -99,7 +105,18 @@ if (!bench && !args.Contains("--verify-prefill"))
 Console.WriteLine($"HyMT2Sharp  model={modelPath}");
 Console.WriteLine($"threads={threads}  avx2={System.Runtime.Intrinsics.X86.Avx2.IsSupported}  vnni={System.Runtime.Intrinsics.X86.AvxVnni.IsSupported}");
 
-using HunyuanDenseModel model = new(modelPath, threads);
+IComputeBackend? backend = null;
+string? backendName = Args.Get(args, "--backend");
+if (backendName is not null and not "cpu")
+{
+    if (backendName == "metal" && RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+        backend = new Sdcb.HyMT2Sharp.Backends.Metal.MetalBackend();
+    else
+        Console.WriteLine($"backend {backendName} unavailable here — using cpu");
+}
+Console.WriteLine($"backend={backend?.Name ?? "cpu"}");
+
+using HunyuanDenseModel model = new(modelPath, threads, backend: backend);
 Console.WriteLine($"arch={model.Config.Architecture} layers={model.Config.NumLayers} hidden={model.Config.HiddenSize} heads={model.Config.NumHeads}/{model.Config.NumKvHeads} vocab={model.Config.VocabSize}");
 
 if (args.Contains("--verify-prefill"))

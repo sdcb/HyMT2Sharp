@@ -73,7 +73,7 @@ kernel void q4k_gemv_fast(
     int ng = in_dim >> 5;
     const device uchar* row = w + (ulong)out_col * bpr * 144;
 
-    threadgroup float2 sf[176];
+    threadgroup float2 sf[192];
     if ((int)tid < ng) {
         int blk = (int)tid >> 3;
         const device uchar* bp = row + blk * 144;
@@ -132,14 +132,14 @@ kernel void q4k_gemv_fast4(
     if (!valid) col = out_dim - 1;
     const device uchar* row = w + (ulong)col * bpr * 144;
 
-    threadgroup float2 sf[4 * 176];
+    threadgroup float2 sf[4 * 192];
     for (int gi = st; gi < ng; gi += 64) {
         const device uchar* bp = row + (gi >> 3) * 144;
         int sc, mn;
         get_scale_min_k4(gi & 7, bp + 4, sc, mn);
         float d = float(*reinterpret_cast<const device half*>(bp));
         float dm = float(*reinterpret_cast<const device half*>(bp + 2));
-        sf[sub * 176 + gi] = float2(d * float(sc), dm * float(mn));
+        sf[sub * 192 + gi] = float2(d * float(sc), dm * float(mn));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -154,8 +154,8 @@ kernel void q4k_gemv_fast4(
         uint q4 = *reinterpret_cast<const device uint*>(bp + 16 + pi * 32 + p4);
         int g0 = pi << 1;
         int kbase = blk * 256 + (pi << 6) + p4;
-        float2 s0 = sf[sub * 176 + (blk << 3) + g0];
-        float2 s1 = sf[sub * 176 + (blk << 3) + g0 + 1];
+        float2 s0 = sf[sub * 192 + (blk << 3) + g0];
+        float2 s1 = sf[sub * 192 + (blk << 3) + g0 + 1];
         for (int j = 0; j < 4; j++) {
             uint nib = (q4 >> (j * 8)) & 0xffu;
             acc += x[kbase + j]      * (s0.x * float(nib & 15u) - s0.y);

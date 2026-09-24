@@ -34,6 +34,10 @@ public static unsafe partial class ObjC
     [LibraryImport(LibObjC, EntryPoint = "objc_msgSend")]
     public static partial IntPtr Send2P1N(IntPtr recv, IntPtr sel, IntPtr a, IntPtr b, nuint c);
 
+    // newBufferWithBytes:length:options: — (ptr, nuint, nuint)
+    [LibraryImport(LibObjC, EntryPoint = "objc_msgSend")]
+    public static partial IntPtr Send1P2N(IntPtr recv, IntPtr sel, IntPtr a, nuint b, nuint c);
+
     // setBuffer:offset:atIndex: / setBytes:length:atIndex:
     [LibraryImport(LibObjC, EntryPoint = "objc_msgSend")]
     public static partial void SendV1P2N(IntPtr recv, IntPtr sel, IntPtr a, nuint b, nuint c);
