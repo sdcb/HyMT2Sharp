@@ -23,6 +23,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     private readonly List<int> _cacheTokens = [];
     private int _cacheLen;
     private int _cacheCap;
+    private readonly KvBlockStore? _blockStore;
     private float[]? _logits;
 
     public ModelConfig Config { get; private set; }
@@ -100,11 +101,13 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         else
         {
             // Buffers grow lazily through EnsureCache — under KeepFlatCache
-            // they stay warm (block-store prefixes live in _blockStore);
-            // without it they're returned at end of request so an idle
-            // service holds no KV memory.
+            // they stay warm (restored blocks land there; prefixes live in
+            // _blockStore), without it they're returned at end of request
+            // so an idle service holds no KV memory.
             _cacheCap = 0;
         }
+        if (CacheConfig.Blocks is { } blocks)
+            _blockStore = new KvBlockStore(Config.NumLayers, kvStride, blocks.BlockTokens, blocks.CapBytes);
     }
 
     public KvCacheConfig CacheConfig { get; }
@@ -122,6 +125,8 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     /// </summary>
     public void EndRequest()
     {
+        if (CacheConfig.Blocks is not null)
+            HarvestBlocks();
         TruncateCache(0);
         if (!CacheConfig.KeepFlatCache)
             FreeCache();
@@ -164,9 +169,70 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
 
     public PromptAlignment AlignPrompt(ReadOnlySpan<int> promptIds)
     {
+        if (CacheConfig.Blocks is not null)
+            RestoreBlocks(promptIds);
         PromptReuse plan = KvCacheAlign.Plan(CollectionsMarshal.AsSpan(_cacheTokens), promptIds);
         TruncateCache(plan.TruncateTo);
         return new PromptAlignment(plan.TruncateTo, promptIds[plan.SuffixStart..].ToArray());
+    }
+
+    // Snapshot every complete block of the live cache into the block store.
+    // Put dedups by hash, so this is cheap to re-run; call it before the
+    // cache's tokens are disturbed.
+    private void HarvestBlocks()
+    {
+        KvBlockStore store = _blockStore!;
+        int bt = store.BlockTokens;
+        ulong h = KvBlockStore.Seed;
+        Span<int> tokens = CollectionsMarshal.AsSpan(_cacheTokens);
+        for (int b = 0; b * bt + bt <= _cacheLen; b++)
+        {
+            int[] blockTokens = tokens.Slice(b * bt, bt).ToArray();
+            h = KvBlockStore.ChainHash(h, blockTokens);
+            store.Put(h, blockTokens, _cacheK, _cacheV, b);
+        }
+    }
+
+    // Chain-hash the prompt's complete blocks and restore the longest
+    // contiguous hit into the cache front. Restored tokens then take part in
+    // the ordinary longest-common-prefix plan below; any leftover warm-cache
+    // tail that also matches is a free bonus.
+    private void RestoreBlocks(ReadOnlySpan<int> promptIds)
+    {
+        KvBlockStore store = _blockStore!;
+        HarvestBlocks();
+        int bt = store.BlockTokens;
+        ulong h = KvBlockStore.Seed;
+        int hit = 0;
+        List<KvBlockStore.Entry>? hits = null;
+        for (int i = 0; i * bt + bt <= promptIds.Length; i++)
+        {
+            ReadOnlySpan<int> toks = promptIds.Slice(i * bt, bt);
+            h = KvBlockStore.ChainHash(h, toks);
+            KvBlockStore.Entry? e = store.Find(h, toks);
+            if (e is null)
+                break;
+            (hits ??= []).Add(e);
+            hit++;
+        }
+        if (hit == 0)
+            return;
+        int n = hit * bt;
+        // KV at positions >= n was computed under the warm cache's old
+        // prefix — reusable only when that prefix is token-identical to
+        // this prompt's, else matching tail tokens would reuse stale KV.
+        bool tailValid = KvCacheAlign.PrefixMatches(
+            CollectionsMarshal.AsSpan(_cacheTokens), promptIds, n);
+        EnsureCache(n);
+        for (int i = 0; i < hit; i++)
+            store.Restore(hits![i], _cacheK, _cacheV, i);
+        while (_cacheTokens.Count < n)
+            _cacheTokens.Add(0);
+        promptIds[..n].CopyTo(CollectionsMarshal.AsSpan(_cacheTokens));
+        if (_cacheLen < n)
+            _cacheLen = n;
+        else if (!tailValid && _cacheLen > n)
+            TruncateCache(n);
     }
 
     public float[] Forward(int[] tokens)
