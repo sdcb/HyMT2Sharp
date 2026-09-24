@@ -25,7 +25,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private int _kvStride;
     private IntPtr _embd, _outNorm;
     private IntPtr _h, _n1, _n2, _q, _k, _v, _ao, _attnOut, _gate, _up, _down, _normed, _logitsBuf, _tok;
-    // DecodeStep returns this shared buffer — callers must consume it before the next call.
+    // ForwardStep returns this shared buffer — callers must consume it before the next call.
     private float[] _logitsHost = null!;
     private int _vocab;
     private readonly bool _timing = Environment.GetEnvironmentVariable("HYMT_METAL_TIMING") == "1";
@@ -34,6 +34,8 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private int _n;
 
     public string Name => "metal";
+
+    public bool SupportsPrefill => false;
 
     public MetalBackend()
     {
@@ -132,8 +134,12 @@ public sealed unsafe class MetalBackend : IComputeBackend
         MtlDevice.DidModifyRange(_kvV[layer], off, bytes);
     }
 
-    public float[] DecodeStep(int tokenId, int pos)
+    public float[] ForwardStep(ReadOnlySpan<int> tokens, int pos)
     {
+        if (tokens.Length != 1)
+            throw new NotSupportedException(
+                "Metal backend (M2) runs decode only (seq == 1); prefill stays on CPU — use --backend cpu if that is not desired");
+        int tokenId = tokens[0];
         ModelConfig c = _cfg;
         int hidden = c.HiddenSize, heads = c.NumHeads, kvHeads = c.NumKvHeads;
         int dim = c.HeadDim, qDim = heads * dim, kDim = kvHeads * dim, kvLen = pos + 1;
