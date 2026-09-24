@@ -25,6 +25,12 @@ public sealed class MtlDevice
         return ObjC.Send1P1N(H, ObjC.Sel("newBufferWithLength:options:"), IntPtr.Zero + (nint)bytes, 0);
     }
 
+    public unsafe IntPtr NewBufferBytes(void* src, nuint bytes)
+    {
+        // newBufferWithBytes:length:options:  StorageModeShared=0
+        return ObjC.Send1P2N(H, ObjC.Sel("newBufferWithBytes:length:options:"), (IntPtr)src, bytes, 0);
+    }
+
     public IntPtr NewLibraryFromSource(string msl)
     {
         IntPtr src = ObjC.NsStr(msl);
@@ -87,6 +93,11 @@ public struct CmdCtx : IDisposable
     public void SetBuffer(IntPtr buf, nuint offset, nuint index) =>
         ObjC.SendV1P2N(Enc, ObjC.Sel("setBuffer:offset:atIndex:"), buf, offset, index);
     public void SetInt(nuint index, int v)
+    {
+        unsafe { ObjC.SendV1P2N(Enc, ObjC.Sel("setBytes:length:atIndex:"), (IntPtr)(&v), 4, index); }
+    }
+
+    public void SetFloat(nuint index, float v)
     {
         unsafe { ObjC.SendV1P2N(Enc, ObjC.Sel("setBytes:length:atIndex:"), (IntPtr)(&v), 4, index); }
     }

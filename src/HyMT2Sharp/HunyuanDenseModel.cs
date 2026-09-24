@@ -24,6 +24,8 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     private int _cacheLen;
     private int _cacheCap;
     private readonly KvBlockStore? _blockStore;
+    private readonly IComputeBackend? _backend;
+    private int _kvDirtyFrom = int.MaxValue;  // device KV positions < this must be re-uploaded
     private float[]? _logits;
 
     public ModelConfig Config { get; private set; }
@@ -64,11 +66,14 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         TicksEmbed = 0;
     }
 
-    public HunyuanDenseModel(string ggufPath, int threads = 0, KvCacheConfig? cacheConfig = null)
+    public HunyuanDenseModel(string ggufPath, int threads = 0, KvCacheConfig? cacheConfig = null, IComputeBackend? backend = null)
     {
         CacheConfig = cacheConfig ?? KvCacheConfig.Memory;
+        if (backend is not null && CacheConfig.Blocks is not null)
+            throw new NotSupportedException("Device backends do not support KvCacheConfig.Blocks yet (M4: paged KV).");
         _gguf = new GgufFile(ggufPath);
         Config = ModelConfig.FromGguf(_gguf);
+        _backend = backend;
         if (Config.VocabSize == 0)
         {
             // Filled after weights load from token_embd rows.
@@ -80,6 +85,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         LoadWeights();
         if (Config.VocabSize == 0 && _weights.TryGetValue("token_embd.weight", out Weight emb) && emb.NOut > 0)
             Config.VocabSize = emb.NOut;
+        _backend?.LoadModel(_gguf, Config);
         _cacheCap = Math.Min(Config.ContextLength, 4096);
         _cacheK = new ushort*[Config.NumLayers];
         _cacheV = new ushort*[Config.NumLayers];
@@ -226,6 +232,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         EnsureCache(n);
         for (int i = 0; i < hit; i++)
             store.Restore(hits![i], _cacheK, _cacheV, i);
+        _kvDirtyFrom = 0;  // device KV must be re-uploaded from CPU state
         while (_cacheTokens.Count < n)
             _cacheTokens.Add(0);
         promptIds[..n].CopyTo(CollectionsMarshal.AsSpan(_cacheTokens));
@@ -257,6 +264,16 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         EnsureScratch(seq, start + seq);
         int hidden = Config.HiddenSize;
         float* h = (float*)Bump((nuint)((long)seq * hidden * sizeof(float)));
+        if (_backend is not null && seq == 1)
+        {
+            // Decode on device: KV is appended on-GPU, CPU caches only hold
+            // prefill positions (a subsequent prefill re-uploads its range).
+            float[] devLogits = _backend.DecodeStep(tokens[0], start);
+            _cacheLen += seq;
+            _cacheTokens.AddRange(tokens);
+            return devLogits;
+        }
+
         Embed(tokens, h);
         nuint layerMark = _scratchUsed;
         if (seq == 1)
@@ -284,6 +301,16 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         float[] logits = _logits ??= new float[vocab];
         fixed (float* lp = logits)
             Linear(last, "output.weight", lp, hidden, vocab, 1, fallback: "token_embd.weight");
+
+        if (_backend is not null)
+        {
+            // Push the prefill-written bf16 KV to the device; _kvDirtyFrom
+            // covers prefix regions rewritten by block restore.
+            int upFrom = Math.Min(_kvDirtyFrom, start);
+            for (int l = 0; l < Config.NumLayers; l++)
+                _backend.UploadKv(l, upFrom, start + seq - upFrom, _cacheK[l], _cacheV[l]);
+            _kvDirtyFrom = int.MaxValue;
+        }
 
         _cacheLen += seq;
         _cacheTokens.AddRange(tokens);
@@ -671,6 +698,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
             buf.Dispose();
         _gemmScratch.Dispose();
         _pool.Dispose();
+        _backend?.Dispose();
         _gguf.Dispose();
     }
 

@@ -14,7 +14,19 @@ Console.InputEncoding = Encoding.UTF8;
 Console.WriteLine($"HyMT2Sharp  model={modelPath}");
 Console.WriteLine($"threads={(threads <= 0 ? "auto" : threads.ToString())}  avx2={System.Runtime.Intrinsics.X86.Avx2.IsSupported}  vnni={System.Runtime.Intrinsics.X86.AvxVnni.IsSupported}");
 
-using HunyuanDenseModel model = new(modelPath, threads);
+IComputeBackend? backend = null;
+string? backendName = Args.Get(args, "--backend");
+if (backendName is not null and not "cpu")
+{
+    if (backendName == "metal" && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
+        backend = new Sdcb.HyMT2Sharp.Backends.Metal.MetalBackend();
+    else
+        Console.WriteLine($"backend {backendName} unavailable here — using cpu");
+}
+if (backend is not null)
+    Console.WriteLine($"backend={backend.Name}");
+
+using HunyuanDenseModel model = new(modelPath, threads, backend: backend);
 Console.WriteLine($"threads={model.ThreadCount}{(threads <= 0 ? $" ({model.ThreadAutoHint})" : "")}  arch={model.Config.Architecture} layers={model.Config.NumLayers} hidden={model.Config.HiddenSize} heads={model.Config.NumHeads}/{model.Config.NumKvHeads} vocab={model.Config.VocabSize}");
 
 List<ChatMessage> messages = [];

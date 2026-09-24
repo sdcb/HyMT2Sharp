@@ -126,12 +126,151 @@ public static class MetalGemvMicro
         }
     }
 
-    // q4k_gemv_fast/fast4 stage their per-group scales in threadgroup sf[176]/sf[4*176] —
-    // any tensor with in_dim > 5632 would overflow threadgroup memory. Guard on the host side.
+    // Q6_K gemv bandwidth on the real model shapes (v=2048x512, down=6144x2048,
+    // embd-as-lm_head=2048x120818). --micro-metal-q6
+    public static void RunQ6()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            throw new PlatformNotSupportedException("Metal backend requires macOS.");
+
+        var dev = MtlDevice.Create();
+        var lib = dev.NewLibraryFromSource(MslDecodeKernels.Source);
+        IntPtr pso = dev.NewPso(dev.NewFunction(lib, "q6k_gemv_fast4"));
+
+        var shapes = new (int InDim, int OutDim)[] {
+            (2048, 512), (6144, 2048), (2048, 512), (6144, 2048),
+            (2048, 512), (6144, 2048), (2048, 512), (6144, 2048),
+            (2048, 512), (6144, 2048), (2048, 512), (6144, 2048),
+            (2048, 512), (6144, 2048), (2048, 512), (6144, 2048),
+            (2048, 512), (6144, 2048), (2048, 512), (6144, 2048),
+            (2048, 512), (6144, 2048), (2048, 512), (6144, 2048),
+            (2048, 120818)
+        };
+        long totalBytes = 0;
+        var bufs = new List<(IntPtr W, IntPtr X, IntPtr Y, int InDim, int OutDim)>();
+        foreach (var (inDim, outDim) in shapes)
+        {
+            long wb = (long)outDim * (inDim / 256) * 210;
+            totalBytes += wb;
+            var (W, X, Y) = (dev.NewBuffer((nuint)wb), dev.NewBuffer((nuint)(inDim * 4)), dev.NewBuffer((nuint)(outDim * 4)));
+            unsafe
+            {
+                var p = (byte*)ObjC.Send0(W, ObjC.Sel("contents"));
+                for (long j = 0; j < wb; j++) p[j] = (byte)(j * 31 + 7);
+                var xp = (float*)ObjC.Send0(X, ObjC.Sel("contents"));
+                for (int j = 0; j < inDim; j++) xp[j] = 0.001f * j;
+            }
+            MtlDevice.DidModifyRange(W, 0, (nuint)wb);
+            MtlDevice.DidModifyRange(X, 0, (nuint)(inDim * 4));
+            bufs.Add((W, X, Y, inDim, outDim));
+        }
+        Console.WriteLine($"q6k weights/pass = {totalBytes / 1e9:F3} GB");
+
+        // correctness vs managed dequant on a small shape
+        {
+            int inDim = 512, outDim = 64;
+            var rng = new Random(42);
+            var w = new byte[outDim * (inDim / 256) * 210];
+            rng.NextBytes(w);
+            var dB = BitConverter.GetBytes((Half)0.01f);
+            for (int b = 0; b < w.Length / 210; b++) Array.Copy(dB, 0, w, b * 210 + 208, 2);
+            var x = new float[inDim];
+            for (int i = 0; i < inDim; i++) x[i] = (float)(rng.NextDouble() - 0.5);
+            IntPtr wb = dev.NewBuffer((nuint)w.Length), xb = dev.NewBuffer((nuint)(inDim * 4)), yb = dev.NewBuffer((nuint)(outDim * 4));
+            Marshal.Copy(w, 0, ObjC.Send0(wb, ObjC.Sel("contents")), w.Length);
+            Marshal.Copy(x, 0, ObjC.Send0(xb, ObjC.Sel("contents")), inDim);
+            MtlDevice.DidModifyRange(wb, 0, (nuint)w.Length);
+            MtlDevice.DidModifyRange(xb, 0, (nuint)(inDim * 4));
+            var c = CmdCtx.Begin(dev.Queue);
+            c.SetPso(pso); c.SetBuffer(wb, 0, 0); c.SetBuffer(xb, 0, 1); c.SetBuffer(yb, 0, 2);
+            c.SetInt(3, inDim); c.SetInt(4, outDim);
+            c.Dispatch((nuint)((outDim + 3) / 4), 1, 1, 256, 1, 1);
+            c.Finish();
+            var y = new float[outDim];
+            Marshal.Copy(ObjC.Send0(yb, ObjC.Sel("contents")), y, 0, outDim);
+            double maxErr = 0;
+            for (int r = 0; r < outDim; r++)
+            {
+                float acc = 0;
+                for (int k = 0; k < inDim; k++)
+                    acc += x[k] * DequantQ6K(w, r * (inDim / 256) * 210 + (k >> 8) * 210, k & 255);
+                maxErr = Math.Max(maxErr, Math.Abs(y[r] - acc));
+            }
+            Console.WriteLine($"q6k correctness maxErr={maxErr:F4}");
+
+            // bisect: raw q6 codes via scalar kernel vs unit-unpack kernel
+            IntPtr psD = dev.NewPso(dev.NewFunction(lib, "q6k_debug_row"));
+            IntPtr psU = dev.NewPso(dev.NewFunction(lib, "q6k_debug_row_u"));
+            var ya = new float[inDim]; var yu = new float[inDim];
+            var c2 = CmdCtx.Begin(dev.Queue);
+            c2.SetPso(psD); c2.SetBuffer(wb, 0, 0); c2.SetBuffer(yb, 0, 1); c2.SetInt(2, inDim);
+            c2.Dispatch((nuint)inDim, 1, 1, 64, 1, 1);
+            c2.Finish();
+            Marshal.Copy(ObjC.Send0(yb, ObjC.Sel("contents")), ya, 0, inDim);
+            c2 = CmdCtx.Begin(dev.Queue);
+            c2.SetPso(psU); c2.SetBuffer(wb, 0, 0); c2.SetBuffer(yb, 0, 1); c2.SetInt(2, inDim);
+            c2.Dispatch((nuint)(inDim >> 4), 1, 1, 32, 1, 1);
+            c2.Finish();
+            Marshal.Copy(ObjC.Send0(yb, ObjC.Sel("contents")), yu, 0, inDim);
+            int diffs = 0;
+            for (int i = 0; i < inDim; i++)
+            {
+                int q = Q6Code(w, (i >> 8) * 210, i & 255);
+                if (ya[i] != q || yu[i] != q)
+                {
+                    if (diffs++ < 8)
+                        Console.WriteLine($"  i={i} q={q} scalar={ya[i]:F0} unit={yu[i]:F0}");
+                }
+            }
+            Console.WriteLine($"q6 code diffs: {diffs}/{inDim}");
+        }
+
+        double encMs = 0, gpuMs = 0;
+        for (int t = 0; t < 13; t++)
+        {
+            var sw = Stopwatch.StartNew();
+            var c = CmdCtx.Begin(dev.Queue);
+            foreach (var b in bufs)
+            {
+                c.SetPso(pso);
+                c.SetBuffer(b.W, 0, 0); c.SetBuffer(b.X, 0, 1); c.SetBuffer(b.Y, 0, 2);
+                c.SetInt(3, b.InDim); c.SetInt(4, b.OutDim);
+                c.Dispatch((nuint)((b.OutDim + 3) / 4), 1, 1, 256, 1, 1);
+            }
+            c.EndEnc();
+            c.Commit();
+            double enc = sw.Elapsed.TotalMilliseconds;
+            c.Wait();
+            c.Drain();
+            double gpu = sw.Elapsed.TotalMilliseconds - enc;
+            if (t >= 3) { encMs += enc; gpuMs += gpu; }
+        }
+        encMs /= 10; gpuMs /= 10;
+        Console.WriteLine($"q6k_gemv_fast4: enc={encMs:F2}ms gpu={gpuMs:F2}ms -> {totalBytes / gpuMs / 1e6:F0} GB/s");
+    }
+
+    private static int Q6Code(byte[] blk, int off, int i)
+    {
+        int j = i >> 7, w = i & 127, l = w & 31, sub = w >> 5;
+        int ql = blk[off + j * 64 + l + ((sub & 1) << 5)];
+        return ((sub & 2) == 0 ? ql & 15 : ql >> 4) | (((blk[off + 128 + j * 32 + l] >> (sub * 2)) & 3) << 4);
+    }
+
+    private static float DequantQ6K(byte[] blk, int off, int i)
+    {
+        int j = i >> 7, w = i & 127, l = w & 31, sub = w >> 5;
+        int ql = blk[off + j * 64 + l + ((sub & 1) << 5)];
+        int q6 = ((sub & 2) == 0 ? ql & 15 : ql >> 4) | (((blk[off + 128 + j * 32 + l] >> (sub * 2)) & 3) << 4);
+        float d = (float)BitConverter.ToHalf(blk, off + 208);
+        return d * (sbyte)blk[off + 192 + j * 8 + (l >> 4) + sub * 2] * (q6 - 32);
+    }
+
+    // q4k_gemv_fast/fast4 stage their per-group scales in threadgroup sf[192]/sf[4*192] —
+    // any tensor with in_dim > 6144 would overflow threadgroup memory. Guard on the host side.
     private static void CheckKernelLimit(string name, int inDim)
     {
-        if ((name is "fast" or "fast4") && inDim > 176 * 32)
-            throw new NotSupportedException($"{name} kernel supports in_dim <= {176 * 32} (sf[176] groups/row), got {inDim}");
+        if ((name is "fast" or "fast4") && inDim > 192 * 32)
+            throw new NotSupportedException($"{name} kernel supports in_dim <= {192 * 32} (sf[192] groups/row), got {inDim}");
     }
 
     private static float DequantQ4K(byte[] blk, int off, int i)
