@@ -13,6 +13,13 @@ namespace Sdcb.HyMT2Sharp.Kernels;
 /// </summary>
 public static unsafe class GemmQ6K
 {
+    /// <summary>
+    /// Packed-panel GEMM for the active dispatch tier. <paramref name="weights"/> must be
+    /// produced by the matching repacker: <see cref="RepackQ6K.RowsNeon"/> when
+    /// <see cref="Simd.UseDp"/> (ARM64, signed NEON layout) or <see cref="RepackQ6K.Rows"/>
+    /// otherwise (canonical layout). Feeding a canonical <c>Rows</c> panel on ARM64 reads
+    /// unsigned codes as signed and yields wrong results.
+    /// </summary>
     public static void Gemm8x8(int n, float* dst, int ldc, BlockQ6Kx8* weights, BlockQ8Kx4* activations, int rows, int cols)
     {
         if ((rows & 3) != 0)

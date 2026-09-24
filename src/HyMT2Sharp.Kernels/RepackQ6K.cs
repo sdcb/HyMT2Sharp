@@ -60,10 +60,15 @@ public static unsafe class RepackQ6K
         }
     }
 
-    /// <summary>Canonical (AVX2-order) panel repack; also read by <see cref="GemmQ6K.GemmScalar"/>.</summary>
+    /// <summary>
+    /// Canonical (AVX2-order) panel repack; also read by <see cref="GemmQ6K.GemmScalar"/>.
+    /// On ARM64 (<see cref="Simd.UseDp"/>) panels for <see cref="GemmQ6K.Gemm8x8"/> must come
+    /// from <see cref="RowsNeon"/> instead — the NEON kernel reads signed codes.
+    /// </summary>
     public static void Rows(BlockQ6K* src, BlockQ6Kx8* dst, int nIn, int nOut) => RowsImpl(src, dst, nIn, nOut, neon: false);
 
-    /// <summary>NEON panel repack (signed weights, natural scales) for <see cref="GemmQ6K.GemmNeon"/>.</summary>
+    /// <summary>NEON panel repack (signed weights, natural scales); required input for
+    /// <see cref="GemmQ6K.Gemm8x8"/> on ARM64 (<see cref="Simd.UseDp"/>).</summary>
     public static void RowsNeon(BlockQ6K* src, BlockQ6Kx8* dst, int nIn, int nOut) => RowsImpl(src, dst, nIn, nOut, neon: true);
 
     private static void RowsImpl(BlockQ6K* src, BlockQ6Kx8* dst, int nIn, int nOut, bool neon)
