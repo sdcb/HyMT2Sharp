@@ -109,6 +109,8 @@ public sealed class ChatCompletionService : IDisposable
             throw new ArgumentException($"prompt is {promptIds.Length} tokens, exceeding context {_model.Config.ContextLength}.");
 
         PromptAlignment align = _model.AlignPrompt(promptIds);
+        Sampler sampler = new(request.ResolveSampling());
+        sampler.FeedHistory(align.Suffix);
         Stopwatch timer = Stopwatch.StartNew();
         float[] logits = _model.Forward(align.Suffix);
         double promptMs = timer.Elapsed.TotalMilliseconds;
@@ -124,7 +126,7 @@ public sealed class ChatCompletionService : IDisposable
             };
         }
 
-        int token = ArgMax(logits);
+        int token = sampler.Sample(logits);
         List<int> generated = [];
         string visible = "";
         string finish = "length";
@@ -147,7 +149,7 @@ public sealed class ChatCompletionService : IDisposable
             }
 
             logits = _model.Forward([token]);
-            token = ArgMax(logits);
+            token = sampler.Sample(logits);
             decoded++;
         }
 
@@ -238,22 +240,6 @@ public sealed class ChatCompletionService : IDisposable
 
         visible = next;
         return deltas;
-    }
-
-    private static int ArgMax(float[] logits)
-    {
-        int best = 0;
-        float max = logits[0];
-        for (int i = 1; i < logits.Length; i++)
-        {
-            if (logits[i] > max)
-            {
-                max = logits[i];
-                best = i;
-            }
-        }
-
-        return best;
     }
 
     public void Dispose()

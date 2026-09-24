@@ -129,21 +129,7 @@ static void WriteDelta(HunyuanDenseModel model, List<int> generated, ref string 
     Console.Out.Flush();
 }
 
-static int ArgMax(float[] logits)
-{
-    int best = 0;
-    float max = logits[0];
-    for (int i = 1; i < logits.Length; i++)
-    {
-        if (logits[i] > max)
-        {
-            max = logits[i];
-            best = i;
-        }
-    }
-
-    return best;
-}
+static int ArgMax(float[] logits) => Sampler.ArgMax(logits);
 
 static class Args
 {
