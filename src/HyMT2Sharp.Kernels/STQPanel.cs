@@ -14,6 +14,12 @@ public static unsafe class STQPanel
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void Gemv(BlockSTQ1_0x8* w, BlockQ8K* x, float* dst, int n)
     {
+        if (Simd.UseAvx512)
+        {
+            GemvAvx512(w, x, dst, n);
+            return;
+        }
+
         if (Simd.UseDp && !Simd.UseAvx2)
         {
             GemvNeon(w, x, dst, n);
@@ -54,6 +60,44 @@ public static unsafe class STQPanel
         }
 
         Avx.Store(dst, Avx2.PermuteVar8x32(acc, ColumnOrder));
+    }
+
+    /// <summary>
+    /// 512-bit GEMV: same layout folding as <see cref="Q2Panel.GemvAvx512"/> —
+    /// one zmm per 64-byte tile, even/odd vpermd gives natural column order and
+    /// removes the ColumnOrder permutes; the correction is a single Σa broadcast.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void GemvAvx512(BlockSTQ1_0x8* w, BlockQ8K* x, float* dst, int n)
+    {
+        int nb = n / STQ1_0.BlockLength;
+        Vector512<byte> mask = Vector512.Create((byte)3);
+        Vector512<short> ones = Vector512.Create((short)1);
+        Vector256<float> acc = Vector256<float>.Zero;
+
+        for (int b = 0; b < nb; b++)
+        {
+            byte* q = w[b].Qs;
+            long* a = (long*)x[b].Qs;
+            Vector512<short> i = Vector512<short>.Zero;
+            for (int k = 0; k < 8; k++)
+            {
+                Vector512<byte> p = Avx512F.LoadVector512(q);
+                for (int plane = 0; plane < 4; plane++)
+                {
+                    i = Avx512BW.Add(i, Avx512BW.MultiplyAddAdjacent(Avx512BW.And(p, mask), Vector512.Create(*a++).AsSByte()));
+                    p = Avx512BW.ShiftRightLogical(p.AsUInt16(), 2).AsByte();
+                }
+                q += 64;
+            }
+
+            Vector256<int> dot = Q8_0.FoldDoubled512(Avx512BW.MultiplyAddAdjacent(i, ones));
+            dot = Avx2.Subtract(dot, Vector256.Create(TotalSum(x + b)));
+            Vector256<float> scale = Avx.Multiply(Avx.LoadVector256(w[b].D), Vector256.Create(x[b].D));
+            acc = Fmadd(Avx.ConvertToVector256Single(dot), scale, acc);
+        }
+
+        Avx.Store(dst, acc);
     }
 
     /// <summary>SDOT GEMV: 2-bit planes decoded per 64-byte tile, one correction per block.</summary>
@@ -110,6 +154,12 @@ public static unsafe class STQPanel
     public static void Gemm(BlockSTQ1_0x8* weights, BlockQ8Kx4* x, float* dst,
         int n, int ldc, int tokens, int groups)
     {
+        if (Simd.UseAvx512)
+        {
+            GemmAvx512(weights, x, dst, n, ldc, tokens, groups);
+            return;
+        }
+
         if (Simd.UseDp && !Simd.UseAvx2)
         {
             GemmNeon(weights, x, dst, n, ldc, tokens, groups);
@@ -241,6 +291,85 @@ public static unsafe class STQPanel
                 Avx.Store(dst + c * 8 + (t * 4 + 1) * ldc, Avx2.PermuteVar8x32(acc1, ColumnOrder));
                 Avx.Store(dst + c * 8 + (t * 4 + 2) * ldc, Avx2.PermuteVar8x32(acc2, ColumnOrder));
                 Avx.Store(dst + c * 8 + (t * 4 + 3) * ldc, Avx2.PermuteVar8x32(acc3, ColumnOrder));
+            }
+        }
+    }
+
+    /// <summary>
+    /// 512-bit 4×8 GEMM on the same STQ1_0x8 tile as the AVX2 path: one zmm load covers
+    /// the p0+p1 pair (cols 0-3 | 4-7), activations broadcast with a single vpbroadcastq
+    /// zmm, and doubled maddwd columns fold via even/odd vpermd to natural order — no
+    /// ColumnOrder permutes on scales or stores.
+    /// </summary>
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void GemmAvx512(BlockSTQ1_0x8* weights, BlockQ8Kx4* x, float* dst,
+        int n, int ldc, int tokens, int groups)
+    {
+        int nb = n / STQ1_0.BlockLength;
+        Vector512<byte> mask = Vector512.Create((byte)3);
+        Vector512<short> ones = Vector512.Create((short)1);
+        Vector256<int>* corrections = stackalloc Vector256<int>[nb];
+        Vector256<float>* activationScales = stackalloc Vector256<float>[nb * 4];
+
+        for (int t = 0; t < tokens / 4; t++)
+        {
+            BlockQ8Kx4* rows = x + (long)t * nb;
+            for (int b = 0; b < nb; b++)
+            {
+                corrections[b] = TotalSums(rows + b);
+                activationScales[b * 4 + 0] = Vector256.Create(rows[b].D[0]);
+                activationScales[b * 4 + 1] = Vector256.Create(rows[b].D[1]);
+                activationScales[b * 4 + 2] = Vector256.Create(rows[b].D[2]);
+                activationScales[b * 4 + 3] = Vector256.Create(rows[b].D[3]);
+            }
+
+            for (int c = 0; c < groups; c++)
+            {
+                BlockSTQ1_0x8* w = weights + (long)c * nb;
+                Vector256<float> acc0 = Vector256<float>.Zero;
+                Vector256<float> acc1 = Vector256<float>.Zero;
+                Vector256<float> acc2 = Vector256<float>.Zero;
+                Vector256<float> acc3 = Vector256<float>.Zero;
+
+                for (int b = 0; b < nb; b++)
+                {
+                    byte* q = w[b].Qs;
+                    long* a = (long*)rows[b].Qs;
+                    Vector512<short> i0 = Vector512<short>.Zero, i1 = Vector512<short>.Zero;
+                    Vector512<short> i2 = Vector512<short>.Zero, i3 = Vector512<short>.Zero;
+                    for (int k = 0; k < 8; k++)
+                    {
+                        Vector512<byte> p = Avx512F.LoadVector512(q);
+                        for (int plane = 0; plane < 4; plane++)
+                        {
+                            Vector512<byte> r = Avx512BW.And(p, mask);
+                            i0 = Avx512BW.Add(i0, Avx512BW.MultiplyAddAdjacent(r, Vector512.Create(a[0]).AsSByte()));
+                            i1 = Avx512BW.Add(i1, Avx512BW.MultiplyAddAdjacent(r, Vector512.Create(a[1]).AsSByte()));
+                            i2 = Avx512BW.Add(i2, Avx512BW.MultiplyAddAdjacent(r, Vector512.Create(a[2]).AsSByte()));
+                            i3 = Avx512BW.Add(i3, Avx512BW.MultiplyAddAdjacent(r, Vector512.Create(a[3]).AsSByte()));
+                            p = Avx512BW.ShiftRightLogical(p.AsUInt16(), 2).AsByte();
+                            a += 4;
+                        }
+                        q += 64;
+                    }
+
+                    Vector256<float> weightScale = Avx.LoadVector256(w[b].D);
+                    Vector256<int> correction = corrections[b];
+                    acc0 = Fmadd(Avx.ConvertToVector256Single(Avx2.Subtract(Q8_0.FoldDoubled512(Avx512BW.MultiplyAddAdjacent(i0, ones)), Avx2.Shuffle(correction, 0x00))),
+                        Avx.Multiply(weightScale, activationScales[b * 4 + 0]), acc0);
+                    acc1 = Fmadd(Avx.ConvertToVector256Single(Avx2.Subtract(Q8_0.FoldDoubled512(Avx512BW.MultiplyAddAdjacent(i1, ones)), Avx2.Shuffle(correction, 0x55))),
+                        Avx.Multiply(weightScale, activationScales[b * 4 + 1]), acc1);
+                    acc2 = Fmadd(Avx.ConvertToVector256Single(Avx2.Subtract(Q8_0.FoldDoubled512(Avx512BW.MultiplyAddAdjacent(i2, ones)), Avx2.Shuffle(correction, 0xAA))),
+                        Avx.Multiply(weightScale, activationScales[b * 4 + 2]), acc2);
+                    acc3 = Fmadd(Avx.ConvertToVector256Single(Avx2.Subtract(Q8_0.FoldDoubled512(Avx512BW.MultiplyAddAdjacent(i3, ones)), Avx2.Shuffle(correction, 0xFF))),
+                        Avx.Multiply(weightScale, activationScales[b * 4 + 3]), acc3);
+                }
+
+                Avx.Store(dst + c * 8 + (t * 4 + 0) * ldc, acc0);
+                Avx.Store(dst + c * 8 + (t * 4 + 1) * ldc, acc1);
+                Avx.Store(dst + c * 8 + (t * 4 + 2) * ldc, acc2);
+                Avx.Store(dst + c * 8 + (t * 4 + 3) * ldc, acc3);
             }
         }
     }

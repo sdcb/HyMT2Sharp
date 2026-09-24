@@ -315,6 +315,25 @@ public static unsafe class Q8_0
         Avx.Store(dst, acc);
     }
 
+    /// <summary>
+    /// Helpers shared by the 512-bit kernels (Q4K/Q2/STQ panel GEMM). The int8
+    /// dot layouts all accumulate into a doubled-column i32 order
+    /// [c0,c0,c1,c1,…,c7,c7]; folding to natural [c0..c7] costs two vpermd.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector512<int> EvenLanes512() =>
+        Vector512.Create(0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector512<int> OddLanes512() =>
+        Vector512.Create(1, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27, 29, 31);
+
+    /// <summary>Fold doubled-column dwords [c0,c0,c1,c1,…,c7,c7] to natural [c0..c7].</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static Vector256<int> FoldDoubled512(Vector512<int> j) => Avx2.Add(
+        Avx512F.PermuteVar16x32(j, EvenLanes512()).GetLower(),
+        Avx512F.PermuteVar16x32(j, OddLanes512()).GetLower());
+
     private static void PackedGroupAvx2(BlockQ8_0x8* w, BlockQ8_0Act* act, float* dst, int nb)
     {
         Vector256<short> ones = Vector256<short>.One;

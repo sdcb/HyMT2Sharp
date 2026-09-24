@@ -252,6 +252,12 @@ public sealed class Q4KKernelTests
                 float avx = VecDotQ4K.DotAvx2((BlockQ4K*)packed.Pointer, y, nIn);
                 Assert.True(MathF.Abs(avx - scalar) < 1e-3f * nIn, $"avx {avx} vs scalar {scalar}");
             }
+
+            if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported)
+            {
+                float avx = VecDotQ4K.DotAvx512((BlockQ4K*)packed.Pointer, y, nIn);
+                Assert.True(MathF.Abs(avx - scalar) < 1e-3f * nIn, $"avx512 {avx} vs scalar {scalar}");
+            }
         }
     }
 
@@ -297,6 +303,13 @@ public sealed class Q4KKernelTests
             {
                 NativeMemory.Clear(got.Pointer, got.Bytes);
                 GemmQ4K.GemmAvx2(nIn, (float*)got.Pointer, nOut, (BlockQ4Kx8*)q4x8.Pointer, (BlockQ8Kx4*)q8x4.Pointer, tokens, nOut, (BlockQ4Kx8Meta*)meta.Pointer);
+                AssertClose((float*)expected.Pointer, (float*)got.Pointer, tokens * nOut, 2e-2f);
+            }
+
+            if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported)
+            {
+                NativeMemory.Clear(got.Pointer, got.Bytes);
+                GemmQ4K.GemmAvx512(nIn, (float*)got.Pointer, nOut, (BlockQ4Kx8*)q4x8.Pointer, (BlockQ8Kx4*)q8x4.Pointer, tokens, nOut, (BlockQ4Kx8Meta*)meta.Pointer);
                 AssertClose((float*)expected.Pointer, (float*)got.Pointer, tokens * nOut, 2e-2f);
             }
         }
@@ -348,6 +361,11 @@ public sealed class Q4KKernelTests
             float scalar = Q6K.DotScalar((BlockQ6K*)q6.Pointer, (BlockQ8K*)q8.Pointer, nIn);
             float avx = Q6K.DotAvx2((BlockQ6K*)q6.Pointer, (BlockQ8K*)q8.Pointer, nIn);
             Assert.True(MathF.Abs(avx - scalar) < 1e-2f * nIn, $"avx {avx} vs scalar {scalar}");
+            if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported)
+            {
+                float avx512 = Q6K.DotAvx512((BlockQ6K*)q6.Pointer, (BlockQ8K*)q8.Pointer, nIn);
+                Assert.True(MathF.Abs(avx512 - scalar) < 1e-2f * nIn, $"avx512 {avx512} vs scalar {scalar}");
+            }
 
             Q6K.DequantizeRow((BlockQ6K*)q6.Pointer, (float*)f32.Pointer, nIn);
             float expected = 0;
@@ -389,6 +407,22 @@ public sealed class Q4KKernelTests
                 Assert.True(MathF.Abs(got4[1] - Q6K.DotAvx2((BlockQ6K*)q6.Pointer, (BlockQ8K*)y1.Pointer, nIn)) < 1e-3f * nIn);
                 Assert.True(MathF.Abs(got4[2] - Q6K.DotAvx2((BlockQ6K*)q6.Pointer, (BlockQ8K*)y2.Pointer, nIn)) < 1e-3f * nIn);
                 Assert.True(MathF.Abs(got4[3] - Q6K.DotAvx2((BlockQ6K*)q6.Pointer, (BlockQ8K*)y3.Pointer, nIn)) < 1e-3f * nIn);
+
+                if (System.Runtime.Intrinsics.X86.Avx512F.IsSupported)
+                {
+                    Q6K.DotAvx512x4(
+                        (BlockQ6K*)q6.Pointer,
+                        (BlockQ8K*)y0.Pointer,
+                        (BlockQ8K*)y1.Pointer,
+                        (BlockQ8K*)y2.Pointer,
+                        (BlockQ8K*)y3.Pointer,
+                        nIn,
+                        got4);
+                    Assert.True(MathF.Abs(got4[0] - Q6K.DotAvx512((BlockQ6K*)q6.Pointer, (BlockQ8K*)y0.Pointer, nIn)) < 1e-3f * nIn);
+                    Assert.True(MathF.Abs(got4[1] - Q6K.DotAvx512((BlockQ6K*)q6.Pointer, (BlockQ8K*)y1.Pointer, nIn)) < 1e-3f * nIn);
+                    Assert.True(MathF.Abs(got4[2] - Q6K.DotAvx512((BlockQ6K*)q6.Pointer, (BlockQ8K*)y2.Pointer, nIn)) < 1e-3f * nIn);
+                    Assert.True(MathF.Abs(got4[3] - Q6K.DotAvx512((BlockQ6K*)q6.Pointer, (BlockQ8K*)y3.Pointer, nIn)) < 1e-3f * nIn);
+                }
             }
         }
     }

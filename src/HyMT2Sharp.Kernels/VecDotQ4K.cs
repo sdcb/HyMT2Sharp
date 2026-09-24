@@ -10,6 +10,8 @@ public static unsafe class VecDotQ4K
 {
     public static float Dot(BlockQ4K* x, BlockQ8K* y, int n)
     {
+        if (Simd.UseAvx512)
+            return DotAvx512(x, y, n);
         if (Simd.UseAvx2)
             return DotAvx2(x, y, n);
         if (Simd.UseDp)
@@ -288,6 +290,78 @@ public static unsafe class VecDotQ4K
         accMin = Sse.AddScalar(accMin, Sse.Shuffle(accMin, accMin, 0x55));
         return HorizontalSum(acc) + accMin.ToScalar();
     }
+
+    /// <summary>
+    /// 512-bit row dot: same math as <see cref="DotAvx2"/> but a 64-byte weight load
+    /// covers two 32-byte groups per step — the lo-nibble zmm holds sub-blocks
+    /// (4m, 4m+2) and the hi-nibble zmm (4m+1, 4m+3), so the activation zmm is two
+    /// unaligned ymm loads and the per-sub scales come from one vpermw each.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotAvx512(BlockQ4K* x, BlockQ8K* y, int n)
+    {
+        int nb = n / Qk.SuperBlock;
+        uint* utmp = stackalloc uint[4];
+        Vector512<byte> m4 = Vector512.Create((byte)0x0F);
+        Vector512<float> acc = Vector512<float>.Zero;
+        Vector128<float> accMin = Vector128<float>.Zero;
+
+        for (int i = 0; i < nb; i++)
+        {
+            float d = y[i].D * HalfBits.ToSingle(x[i].D);
+            float dmin = -y[i].D * HalfBits.ToSingle(x[i].Dmin);
+            Q4K.UnpackScales(x[i].Scales, utmp);
+
+            byte* q4 = x[i].Qs;
+            sbyte* q8 = y[i].Qs;
+
+            Vector128<byte> packed = Vector128.Create(utmp[0], utmp[1], utmp[2], utmp[3]).AsByte();
+            Vector256<short> minsAndScales = Avx2.ConvertToVector256Int16(packed);
+            Vector256<short> q8sums = Avx.LoadVector256((short*)y[i].Bsums);
+            Vector128<short> q8s = Ssse3.HorizontalAdd(q8sums.GetLower(), q8sums.GetUpper());
+            Vector128<int> prod = Sse2.MultiplyAddAdjacent(minsAndScales.GetUpper(), q8s);
+            accMin = Sse.Add(accMin, Sse.Multiply(Vector128.Create(dmin), Sse2.ConvertToVector128Single(prod)));
+
+            Vector128<short> sc128 = minsAndScales.GetLower();
+            Vector256<short> scDup = Vector256.Create(sc128, sc128);
+            Vector512<short> scv = Vector512.Create(scDup, scDup);
+            Vector512<int> sumi = Vector512<int>.Zero;
+
+            for (int m = 0; m < Qk.SuperBlock / 128; m++)
+            {
+                Vector512<short> scaleL = Avx512BW.PermuteVar32x16(scv, ScaleIdx512(4 * m + 0, 4 * m + 2));
+                Vector512<short> scaleH = Avx512BW.PermuteVar32x16(scv, ScaleIdx512(4 * m + 1, 4 * m + 3));
+
+                Vector512<byte> q4bits = Avx512F.LoadVector512(q4);
+                q4 += 64;
+                Vector512<byte> q4l = Avx512BW.And(q4bits, m4);
+                Vector512<byte> q4h = Avx512BW.And(Avx512BW.ShiftRightLogical(q4bits.AsUInt16(), 4).AsByte(), m4);
+
+                sbyte* a = q8 + m * 128;
+                Vector512<sbyte> q8l = Vector512.Create(Avx.LoadVector256(a), Avx.LoadVector256(a + 64));
+                Vector512<short> p16l = Avx512BW.MultiplyAddAdjacent(q4l, q8l);
+                Vector512<int> p32l = Avx512BW.MultiplyAddAdjacent(p16l, scaleL);
+
+                Vector512<sbyte> q8h = Vector512.Create(Avx.LoadVector256(a + 32), Avx.LoadVector256(a + 96));
+                Vector512<short> p16h = Avx512BW.MultiplyAddAdjacent(q4h, q8h);
+                Vector512<int> p32h = Avx512BW.MultiplyAddAdjacent(p16h, scaleH);
+                sumi = Avx512F.Add(sumi, Avx512F.Add(p32l, p32h));
+            }
+
+            acc = Simd.UseFma
+                ? Avx512F.FusedMultiplyAdd(Avx512F.ConvertToVector512Single(sumi), Vector512.Create(d), acc)
+                : Avx512F.Add(acc, Avx512F.Multiply(Avx512F.ConvertToVector512Single(sumi), Vector512.Create(d)));
+        }
+
+        accMin = Sse.Add(accMin, Sse.MoveHighToLow(accMin, accMin));
+        accMin = Sse.AddScalar(accMin, Sse.Shuffle(accMin, accMin, 0x55));
+        return HorizontalSum(acc.GetLower() + acc.GetUpper()) + accMin.ToScalar();
+    }
+
+    /// <summary>vpermw indices that replicate sub-block scales s0 (lo half) and s1 (hi half).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector512<short> ScaleIdx512(int s0, int s1) =>
+        Vector512.Create(Vector256.Create((short)s0), Vector256.Create((short)s1));
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static Vector256<byte> ScaleShuffle(int i)

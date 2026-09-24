@@ -67,7 +67,7 @@ public static unsafe class Q6K
     }
 
     public static float Dot(BlockQ6K* x, BlockQ8K* y, int n)
-        => Simd.UseAvx2 ? DotAvx2(x, y, n) : Simd.UseDp ? DotNeon(x, y, n) : DotVec(x, y, n);
+        => Simd.UseAvx512 ? DotAvx512(x, y, n) : Simd.UseAvx2 ? DotAvx2(x, y, n) : Simd.UseDp ? DotNeon(x, y, n) : DotVec(x, y, n);
 
     /// <summary>
     /// ARM64 NEON row dot: raw (unsigned) 6-bit weights go straight into SDOT,
@@ -400,6 +400,84 @@ public static unsafe class Q6K
     }
 
     /// <summary>
+    /// 512-bit row dot: same structure as <see cref="DotAvx2"/> with a 64-byte Ql
+    /// load covering both 32-byte halves per step — group pairs (0,1) and (2,3)
+    /// each become one zmm. The qh hi-masks still form on ymm (each half needs a
+    /// different shift), then two vinserti64x4 join them with the nibble halves.
+    /// Scales widen once to a 16-entry s16 zmm and each group pair takes one vpermw.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotAvx512(BlockQ6K* x, BlockQ8K* y, int n)
+    {
+        int nb = n / Qk.SuperBlock;
+        Vector256<byte> m3 = Vector256.Create((byte)3);
+        Vector256<byte> m12 = Vector256.Create((byte)12);
+        Vector256<byte> m48 = Vector256.Create((byte)48);
+        Vector256<byte> mC0 = Vector256.Create((byte)0xC0);
+        Vector512<byte> m15 = Vector512.Create((byte)15);
+        Vector512<float> acc = Vector512<float>.Zero;
+
+        for (int i = 0; i < nb; i++)
+        {
+            float d = y[i].D * HalfBits.ToSingle(x[i].D);
+            byte* q4 = x[i].Ql;
+            byte* qh = x[i].Qh;
+            sbyte* q8 = y[i].Qs;
+
+            Vector256<short> q8sums = Avx.LoadVector256((short*)y[i].Bsums);
+            Vector256<short> scales16 = Avx2.ConvertToVector256Int16(Avx.LoadVector128(x[i].Scales));
+            Vector512<short> scv = Vector512.Create(scales16, scales16);
+            Vector512<int> sumi = Vector512<int>.Zero;
+
+            for (int j = 0; j < Qk.SuperBlock / 128; j++)
+            {
+                Vector512<byte> q4bits = Avx512F.LoadVector512(q4);
+                q4 += 64;
+                Vector256<byte> q4bitsH = Avx.LoadVector256(qh);
+                qh += 32;
+
+                Vector256<byte> q4h0 = Avx2.ShiftLeftLogical(Avx2.And(q4bitsH, m3).AsUInt16(), 4).AsByte();
+                Vector256<byte> q4h1 = Avx2.ShiftLeftLogical(Avx2.And(q4bitsH, m12).AsUInt16(), 2).AsByte();
+                Vector256<byte> q4h2 = Avx2.And(q4bitsH, m48);
+                Vector256<byte> q4h3 = Avx2.ShiftRightLogical(Avx2.And(q4bitsH, mC0).AsUInt16(), 2).AsByte();
+
+                Vector512<byte> q01 = Avx512BW.Or(Avx512BW.And(q4bits, m15), Vector512.Create(q4h0, q4h1));
+                Vector512<byte> q23 = Avx512BW.Or(
+                    Avx512BW.And(Avx512BW.ShiftRightLogical(q4bits.AsUInt16(), 4).AsByte(), m15),
+                    Vector512.Create(q4h2, q4h3));
+
+                Vector512<sbyte> a01 = Avx512F.LoadVector512(q8);
+                Vector512<sbyte> a23 = Avx512F.LoadVector512(q8 + 64);
+                q8 += 128;
+
+                Vector512<short> sc01 = Avx512BW.PermuteVar32x16(scv, PermIdx(8 * j + 0, 8 * j + 1, 8 * j + 2, 8 * j + 3));
+                Vector512<short> sc23 = Avx512BW.PermuteVar32x16(scv, PermIdx(8 * j + 4, 8 * j + 5, 8 * j + 6, 8 * j + 7));
+                sumi = Avx512F.Add(sumi,
+                    Avx512F.Add(
+                        Avx512BW.MultiplyAddAdjacent(Avx512BW.MultiplyAddAdjacent(q01, a01), sc01),
+                        Avx512BW.MultiplyAddAdjacent(Avx512BW.MultiplyAddAdjacent(q23, a23), sc23)));
+            }
+
+            // -32 bias correction in lanes 0-7 only; every lane is summed at the end.
+            Vector256<int> q8sclsub = Avx2.ShiftLeftLogical(Avx2.MultiplyAddAdjacent(q8sums, scales16), 5);
+            sumi = Avx512F.Subtract(sumi, Vector512.Create(q8sclsub, Vector256<int>.Zero));
+
+            acc = Simd.UseFma
+                ? Avx512F.FusedMultiplyAdd(Avx512F.ConvertToVector512Single(sumi), Vector512.Create(d), acc)
+                : Avx512F.Add(acc, Avx512F.Multiply(Avx512F.ConvertToVector512Single(sumi), Vector512.Create(d)));
+        }
+
+        return VecDotQ4K.HorizontalSum(acc.GetLower() + acc.GetUpper());
+    }
+
+    /// <summary>vpermw indices expanding sub-block scales s0..s3 to 8 s16 lanes each.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector512<short> PermIdx(int s0, int s1, int s2, int s3) =>
+        Vector512.Create(
+            Vector256.Create(Vector128.Create((short)s0), Vector128.Create((short)s1)),
+            Vector256.Create(Vector128.Create((short)s2), Vector128.Create((short)s3)));
+
+    /// <summary>
     /// Decode each Q6_K superblock once and dot it against four Q8_K rows.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
@@ -478,6 +556,97 @@ public static unsafe class Q6K
         dst[1] = VecDotQ4K.HorizontalSum(acc1);
         dst[2] = VecDotQ4K.HorizontalSum(acc2);
         dst[3] = VecDotQ4K.HorizontalSum(acc3);
+    }
+
+    /// <summary><see cref="DotAvx512"/> against four Q8_K rows sharing one weight decode.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void DotAvx512x4(BlockQ6K* x, BlockQ8K* y0, BlockQ8K* y1, BlockQ8K* y2, BlockQ8K* y3, int n, float* dst)
+    {
+        int nb = n / Qk.SuperBlock;
+        Vector256<byte> m3 = Vector256.Create((byte)3);
+        Vector256<byte> m12 = Vector256.Create((byte)12);
+        Vector256<byte> m48 = Vector256.Create((byte)48);
+        Vector256<byte> mC0 = Vector256.Create((byte)0xC0);
+        Vector512<byte> m15 = Vector512.Create((byte)15);
+        Vector512<float> acc0 = Vector512<float>.Zero;
+        Vector512<float> acc1 = Vector512<float>.Zero;
+        Vector512<float> acc2 = Vector512<float>.Zero;
+        Vector512<float> acc3 = Vector512<float>.Zero;
+
+        for (int i = 0; i < nb; i++)
+        {
+            float xd = HalfBits.ToSingle(x[i].D);
+            byte* q4 = x[i].Ql;
+            byte* qh = x[i].Qh;
+            Vector256<short> scales16 = Avx2.ConvertToVector256Int16(Avx.LoadVector128(x[i].Scales));
+            Vector512<short> scv = Vector512.Create(scales16, scales16);
+            Vector512<int> sum0 = Vector512<int>.Zero;
+            Vector512<int> sum1 = Vector512<int>.Zero;
+            Vector512<int> sum2 = Vector512<int>.Zero;
+            Vector512<int> sum3 = Vector512<int>.Zero;
+
+            for (int j = 0; j < Qk.SuperBlock / 128; j++)
+            {
+                Vector512<byte> q4bits = Avx512F.LoadVector512(q4);
+                q4 += 64;
+                Vector256<byte> q4bitsH = Avx.LoadVector256(qh);
+                qh += 32;
+
+                Vector256<byte> q4h0 = Avx2.ShiftLeftLogical(Avx2.And(q4bitsH, m3).AsUInt16(), 4).AsByte();
+                Vector256<byte> q4h1 = Avx2.ShiftLeftLogical(Avx2.And(q4bitsH, m12).AsUInt16(), 2).AsByte();
+                Vector256<byte> q4h2 = Avx2.And(q4bitsH, m48);
+                Vector256<byte> q4h3 = Avx2.ShiftRightLogical(Avx2.And(q4bitsH, mC0).AsUInt16(), 2).AsByte();
+
+                Vector512<byte> q01 = Avx512BW.Or(Avx512BW.And(q4bits, m15), Vector512.Create(q4h0, q4h1));
+                Vector512<byte> q23 = Avx512BW.Or(
+                    Avx512BW.And(Avx512BW.ShiftRightLogical(q4bits.AsUInt16(), 4).AsByte(), m15),
+                    Vector512.Create(q4h2, q4h3));
+
+                Vector512<short> sc01 = Avx512BW.PermuteVar32x16(scv, PermIdx(8 * j + 0, 8 * j + 1, 8 * j + 2, 8 * j + 3));
+                Vector512<short> sc23 = Avx512BW.PermuteVar32x16(scv, PermIdx(8 * j + 4, 8 * j + 5, 8 * j + 6, 8 * j + 7));
+
+                AccumulateQ6Lane512(ref sum0, q01, q23, y0[i].Qs + j * 128, sc01, sc23);
+                AccumulateQ6Lane512(ref sum1, q01, q23, y1[i].Qs + j * 128, sc01, sc23);
+                AccumulateQ6Lane512(ref sum2, q01, q23, y2[i].Qs + j * 128, sc01, sc23);
+                AccumulateQ6Lane512(ref sum3, q01, q23, y3[i].Qs + j * 128, sc01, sc23);
+            }
+
+            sum0 = Avx512F.Subtract(sum0, Vector512.Create(Avx2.ShiftLeftLogical(Avx2.MultiplyAddAdjacent(Avx.LoadVector256((short*)y0[i].Bsums), scales16), 5), Vector256<int>.Zero));
+            sum1 = Avx512F.Subtract(sum1, Vector512.Create(Avx2.ShiftLeftLogical(Avx2.MultiplyAddAdjacent(Avx.LoadVector256((short*)y1[i].Bsums), scales16), 5), Vector256<int>.Zero));
+            sum2 = Avx512F.Subtract(sum2, Vector512.Create(Avx2.ShiftLeftLogical(Avx2.MultiplyAddAdjacent(Avx.LoadVector256((short*)y2[i].Bsums), scales16), 5), Vector256<int>.Zero));
+            sum3 = Avx512F.Subtract(sum3, Vector512.Create(Avx2.ShiftLeftLogical(Avx2.MultiplyAddAdjacent(Avx.LoadVector256((short*)y3[i].Bsums), scales16), 5), Vector256<int>.Zero));
+            acc0 = MaddScale512(acc0, xd * y0[i].D, sum0);
+            acc1 = MaddScale512(acc1, xd * y1[i].D, sum1);
+            acc2 = MaddScale512(acc2, xd * y2[i].D, sum2);
+            acc3 = MaddScale512(acc3, xd * y3[i].D, sum3);
+        }
+
+        dst[0] = VecDotQ4K.HorizontalSum(acc0.GetLower() + acc0.GetUpper());
+        dst[1] = VecDotQ4K.HorizontalSum(acc1.GetLower() + acc1.GetUpper());
+        dst[2] = VecDotQ4K.HorizontalSum(acc2.GetLower() + acc2.GetUpper());
+        dst[3] = VecDotQ4K.HorizontalSum(acc3.GetLower() + acc3.GetUpper());
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void AccumulateQ6Lane512(
+        ref Vector512<int> sum,
+        Vector512<byte> q01,
+        Vector512<byte> q23,
+        sbyte* q8,
+        Vector512<short> sc01,
+        Vector512<short> sc23)
+    {
+        Vector512<int> i01 = Avx512BW.MultiplyAddAdjacent(Avx512BW.MultiplyAddAdjacent(q01, Avx512F.LoadVector512(q8)), sc01);
+        Vector512<int> i23 = Avx512BW.MultiplyAddAdjacent(Avx512BW.MultiplyAddAdjacent(q23, Avx512F.LoadVector512(q8 + 64)), sc23);
+        sum = Avx512F.Add(sum, Avx512F.Add(i01, i23));
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector512<float> MaddScale512(Vector512<float> acc, float d, Vector512<int> sumi)
+    {
+        Vector512<float> dv = Vector512.Create(d);
+        Vector512<float> v = Avx512F.ConvertToVector512Single(sumi);
+        return Simd.UseFma ? Avx512F.FusedMultiplyAdd(dv, v, acc) : Avx512F.Add(acc, Avx512F.Multiply(dv, v));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -645,7 +814,10 @@ public static unsafe class Q6K
                 BlockQ8K* y3 = y + (t + 3) * nb;
                 for (int row = begin; row < end; row++)
                 {
-                    DotAvx2x4(weights + row * nb, y0, y1, y2, y3, nIn, tmp);
+                    if (Simd.UseAvx512)
+                        DotAvx512x4(weights + row * nb, y0, y1, y2, y3, nIn, tmp);
+                    else
+                        DotAvx2x4(weights + row * nb, y0, y1, y2, y3, nIn, tmp);
                     output[(t + 0) * nOut + row] = tmp[0];
                     output[(t + 1) * nOut + row] = tmp[1];
                     output[(t + 2) * nOut + row] = tmp[2];
