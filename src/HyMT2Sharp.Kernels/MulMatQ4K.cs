@@ -1,3 +1,4 @@
+using System.Threading;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -37,7 +38,7 @@ public static unsafe class MulMatQ4K
             return;
         }
 
-        if (packed == null || !Simd.UseAvx2)
+        if (packed == null || !Simd.UsePanels)
         {
             GemmRows(rows, input, output, nIn, nOut, tokens, pool, scratch);
             return;
@@ -138,12 +139,16 @@ public static unsafe class MulMatQ4K
     {
         int nb = nIn / Qk.SuperBlock;
         int quantGroups = tokens / 4;
+        int quantCursor = 0;
         void QuantBody(int worker, int workers)
         {
-            int begin = quantGroups * worker / workers;
-            int end = quantGroups * (worker + 1) / workers;
-            for (int g = begin; g < end; g++)
+            while (true)
+            {
+                int g = Interlocked.Increment(ref quantCursor) - 1;
+                if (g >= quantGroups)
+                    break;
                 QuantizeQ8Kx4.Quantize4x8(input + g * 4 * nIn, q8 + g * nb, nIn);
+            }
         }
 
         if (pool == null)
@@ -175,22 +180,27 @@ public static unsafe class MulMatQ4K
 
         int nb = nIn / Qk.SuperBlock;
         int quantGroups = tokens / 4;
+        int quantCursor = 0;
+        int gemmCursor = 0;
         int gemmGroups = (nOut & ~7) / 8;
         int jobs = Math.Max(quantGroups, Math.Max(1, gemmGroups));
         pool.For(jobs, (int worker, int workers) =>
         {
-            int q0 = quantGroups * worker / workers;
-            int q1 = quantGroups * (worker + 1) / workers;
-            for (int g = q0; g < q1; g++)
+            while (true)
+            {
+                int g = Interlocked.Increment(ref quantCursor) - 1;
+                if (g >= quantGroups)
+                    break;
                 QuantizeQ8Kx4.Quantize4x8(input + g * 4 * nIn, q8 + g * nb, nIn);
+            }
             pool.Barrier();
-            if (gemmGroups == 0)
-                return;
-            int g0 = gemmGroups * worker / workers;
-            int g1 = gemmGroups * (worker + 1) / workers;
-            if (g0 >= g1)
-                return;
-            GemmQ4K.Gemm8x8(nIn, dst + g0 * 8, nOut, packed + g0 * nb, q8, tokens, (g1 - g0) * 8, meta == null ? null : meta + g0 * nb);
+            while (true)
+            {
+                int g = Interlocked.Increment(ref gemmCursor) - 1;
+                if (g >= gemmGroups)
+                    break;
+                GemmQ4K.Gemm8x8(nIn, dst + g * 8, nOut, packed + g * nb, q8, tokens, 8, meta == null ? null : meta + g * nb);
+            }
         });
     }
 
@@ -198,16 +208,19 @@ public static unsafe class MulMatQ4K
     {
         int packedCols = nOut & ~7;
         int nb = nIn / Qk.SuperBlock;
+        int gemmCursor = 0;
         void Body(int worker, int workers)
         {
             int groups = packedCols / 8;
             if (groups == 0)
                 return;
-            int begin = groups * worker / workers;
-            int end = groups * (worker + 1) / workers;
-            if (begin >= end)
-                return;
-            GemmQ4K.Gemm8x8(nIn, dst + begin * 8, nOut, packed + begin * nb, q8, tokens, (end - begin) * 8, meta == null ? null : meta + begin * nb);
+            while (true)
+            {
+                int g = Interlocked.Increment(ref gemmCursor) - 1;
+                if (g >= groups)
+                    break;
+                GemmQ4K.Gemm8x8(nIn, dst + g * 8, nOut, packed + g * nb, q8, tokens, 8, meta == null ? null : meta + g * nb);
+            }
         }
 
         if (pool == null)

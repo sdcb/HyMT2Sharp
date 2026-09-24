@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 
 namespace Sdcb.HyMT2Sharp.Kernels;
@@ -21,6 +22,8 @@ public static unsafe class GemmQ8_0
             GemmVnni(n, dst, ldc, weights, activations, rows, cols);
         else if (Simd.UseAvx2)
             GemmAvx2(n, dst, ldc, weights, activations, rows, cols);
+        else if (Simd.UseDp)
+            GemmNeon(n, dst, ldc, weights, activations, rows, cols);
         else
             GemmScalar(n, dst, ldc, weights, activations, rows, cols);
     }
@@ -66,6 +69,98 @@ public static unsafe class GemmQ8_0
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     public static void GemmVnni(int n, float* dst, int ldc, BlockQ8_0x8* weights, BlockQ8_0x4* activations, int rows, int cols) =>
         GemmTiles(n, dst, ldc, weights, activations, rows, cols, vnni: true);
+
+    /// <summary>SDOT variant: one activation dword broadcasts across 8 columns.</summary>
+    private static void GemmNeon(int n, float* dst, int ldc, BlockQ8_0x8* weights, BlockQ8_0x4* activations, int rows, int cols)
+    {
+        int nb = n / Qk.Q8_0Block;
+        int tileGroups = Math.Max(1, GemmQ4K.ColTileBytes / (nb * Qk.Q8_0x8Size));
+        int groups = cols / 8;
+        for (int g0 = 0; g0 < groups; g0 += tileGroups)
+        {
+            int g1 = Math.Min(groups, g0 + tileGroups);
+            GemmTileNeon(n, dst + g0 * 8, ldc, weights + g0 * nb, activations, rows, (g1 - g0) * 8);
+        }
+    }
+
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void GemmTileNeon(int n, float* dst, int ldc, BlockQ8_0x8* weights, BlockQ8_0x4* activations, int rows, int cols)
+    {
+        int nb = n / Qk.Q8_0Block;
+        for (int y = 0; y < rows / 4; y++)
+        {
+            BlockQ8_0x4* aPtr = activations + y * nb;
+            for (int x = 0; x < cols / 8; x++)
+            {
+                BlockQ8_0x8* bPtr = weights + x * nb;
+                Vector128<float> acc0L = Vector128<float>.Zero;
+                Vector128<float> acc0H = Vector128<float>.Zero;
+                Vector128<float> acc1L = Vector128<float>.Zero;
+                Vector128<float> acc1H = Vector128<float>.Zero;
+                Vector128<float> acc2L = Vector128<float>.Zero;
+                Vector128<float> acc2H = Vector128<float>.Zero;
+                Vector128<float> acc3L = Vector128<float>.Zero;
+                Vector128<float> acc3H = Vector128<float>.Zero;
+                for (int b = 0; b < nb; b++)
+                {
+                    BlockQ8_0x4* ab = aPtr + b;
+                    BlockQ8_0x8* wb = bPtr + b;
+                    Vector128<int> j0L = Vector128<int>.Zero;
+                    Vector128<int> j0H = Vector128<int>.Zero;
+                    Vector128<int> j1L = Vector128<int>.Zero;
+                    Vector128<int> j1H = Vector128<int>.Zero;
+                    Vector128<int> j2L = Vector128<int>.Zero;
+                    Vector128<int> j2H = Vector128<int>.Zero;
+                    Vector128<int> j3L = Vector128<int>.Zero;
+                    Vector128<int> j3H = Vector128<int>.Zero;
+                    sbyte* q = (sbyte*)wb->Qs;
+                    sbyte* qs = ab->Qs;
+                    for (int step = 0; step < 8; step++)
+                    {
+                        Vector128<sbyte> w0 = Neon.Load16(q + step * 32);
+                        Vector128<sbyte> w1 = Neon.Load16(q + step * 32 + 16);
+                        Vector128<sbyte> a0 = Neon.Dup4(qs + step * 4);
+                        j0L = Neon.Sdot(j0L, w0, a0);
+                        j0H = Neon.Sdot(j0H, w1, a0);
+                        a0 = Neon.Dup4(qs + 32 + step * 4);
+                        j1L = Neon.Sdot(j1L, w0, a0);
+                        j1H = Neon.Sdot(j1H, w1, a0);
+                        a0 = Neon.Dup4(qs + 64 + step * 4);
+                        j2L = Neon.Sdot(j2L, w0, a0);
+                        j2H = Neon.Sdot(j2H, w1, a0);
+                        a0 = Neon.Dup4(qs + 96 + step * 4);
+                        j3L = Neon.Sdot(j3L, w0, a0);
+                        j3H = Neon.Sdot(j3H, w1, a0);
+                    }
+
+                    Vector128<float> colL = Unsafe.ReadUnaligned<Vector128<float>>(wb->D);
+                    Vector128<float> colH = Unsafe.ReadUnaligned<Vector128<float>>(wb->D + 4);
+                    acc0L = AdvSimd.FusedMultiplyAdd(acc0L, AdvSimd.ConvertToSingle(j0L), AdvSimd.Multiply(colL, Vector128.Create(ab->D[0])));
+                    acc0H = AdvSimd.FusedMultiplyAdd(acc0H, AdvSimd.ConvertToSingle(j0H), AdvSimd.Multiply(colH, Vector128.Create(ab->D[0])));
+                    acc1L = AdvSimd.FusedMultiplyAdd(acc1L, AdvSimd.ConvertToSingle(j1L), AdvSimd.Multiply(colL, Vector128.Create(ab->D[1])));
+                    acc1H = AdvSimd.FusedMultiplyAdd(acc1H, AdvSimd.ConvertToSingle(j1H), AdvSimd.Multiply(colH, Vector128.Create(ab->D[1])));
+                    acc2L = AdvSimd.FusedMultiplyAdd(acc2L, AdvSimd.ConvertToSingle(j2L), AdvSimd.Multiply(colL, Vector128.Create(ab->D[2])));
+                    acc2H = AdvSimd.FusedMultiplyAdd(acc2H, AdvSimd.ConvertToSingle(j2H), AdvSimd.Multiply(colH, Vector128.Create(ab->D[2])));
+                    acc3L = AdvSimd.FusedMultiplyAdd(acc3L, AdvSimd.ConvertToSingle(j3L), AdvSimd.Multiply(colL, Vector128.Create(ab->D[3])));
+                    acc3H = AdvSimd.FusedMultiplyAdd(acc3H, AdvSimd.ConvertToSingle(j3H), AdvSimd.Multiply(colH, Vector128.Create(ab->D[3])));
+                }
+
+                float* row = dst + y * 4 * ldc + x * 8;
+                Unsafe.WriteUnaligned(row, acc0L);
+                Unsafe.WriteUnaligned(row + 4, acc0H);
+                row += ldc;
+                Unsafe.WriteUnaligned(row, acc1L);
+                Unsafe.WriteUnaligned(row + 4, acc1H);
+                row += ldc;
+                Unsafe.WriteUnaligned(row, acc2L);
+                Unsafe.WriteUnaligned(row + 4, acc2H);
+                row += ldc;
+                Unsafe.WriteUnaligned(row, acc3L);
+                Unsafe.WriteUnaligned(row + 4, acc3H);
+            }
+        }
+    }
 
     /// <summary>
     /// Eight columns × four K. <paramref name="w"/> is signed int8 bit patterns,

@@ -90,6 +90,12 @@ public static unsafe class RepackQ4K
     /// </summary>
     public static void BuildMeta(BlockQ4K* src, BlockQ4Kx8Meta* dst, int nIn, int nOut)
     {
+        if (Simd.UseDp && !Simd.UseAvx2)
+        {
+            BuildMetaNeon(src, dst, nIn, nOut);
+            return;
+        }
+
         int nb = nIn / Qk.SuperBlock;
         int groups = nOut / 8;
         // vphaddw(cols0123, cols4567) lane order.
@@ -123,6 +129,40 @@ public static unsafe class RepackQ4K
                             target[i] = sc[order[i]];
                         for (int j = 0; j < 8; j++)
                             mins[j * 2 + half] = mn[j];
+                    }
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Natural-column variant of <see cref="BuildMeta"/> for the SDOT kernel:
+    /// <c>Scales[s * 8 + c]</c> holds sub-block s scales and <c>Scales[64 + s * 8 + c]</c>
+    /// its mins, so the kernel reads each with a single 16-byte load.
+    /// </summary>
+    private static void BuildMetaNeon(BlockQ4K* src, BlockQ4Kx8Meta* dst, int nIn, int nOut)
+    {
+        int nb = nIn / Qk.SuperBlock;
+        int groups = nOut / 8;
+        for (int g = 0; g < groups; g++)
+        {
+            for (int b = 0; b < nb; b++)
+            {
+                BlockQ4Kx8Meta* meta = dst + g * nb + b;
+                for (int j = 0; j < 8; j++)
+                {
+                    BlockQ4K* block = src + (g * 8 + j) * nb + b;
+                    meta->D[j] = HalfBits.ToSingle(block->D);
+                    meta->Dmin[j] = HalfBits.ToSingle(block->Dmin);
+                }
+
+                for (int s = 0; s < 8; s++)
+                {
+                    for (int j = 0; j < 8; j++)
+                    {
+                        ScaleMin(s, (src + (g * 8 + j) * nb + b)->Scales, out byte d, out byte m);
+                        meta->Scales[s * 8 + j] = d;
+                        meta->Scales[64 + s * 8 + j] = m;
                     }
                 }
             }

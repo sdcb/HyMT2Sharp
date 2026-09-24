@@ -1,3 +1,4 @@
+using System.Threading;
 using System.Runtime.Intrinsics.X86;
 
 namespace Sdcb.HyMT2Sharp.Kernels;
@@ -27,7 +28,7 @@ public static unsafe class MulMatSTQ
     public static void GemvPrequant(BlockSTQ1_0x8* packed, BlockSTQ1_0* rows, BlockQ8K* x,
         float* output, int nIn, int nOut, CpuThreadPool? pool)
     {
-        if (packed == null || !Simd.UseAvx2)
+        if (packed == null || !Simd.UsePanels)
         {
             GemvPrequant(rows, x, output, nIn, nOut, pool);
             return;
@@ -35,16 +36,24 @@ public static unsafe class MulMatSTQ
         int groups = nOut / 8;
         int tail = nOut - groups * 8;
         int nb = nIn / STQ1_0.BlockLength;
+        int gCursor = 0;
+        int tCursor = 0;
         void Run(int worker, int workers)
         {
-            int begin = groups * worker / workers;
-            int end = groups * (worker + 1) / workers;
-            for (int g = begin; g < end; g++)
+            while (true)
+            {
+                int g = Interlocked.Increment(ref gCursor) - 1;
+                if (g >= groups)
+                    break;
                 STQPanel.Gemv(packed + (long)g * nb, x, output + g * 8, nIn);
-            int tb = groups * 8 + tail * worker / workers;
-            int te = groups * 8 + tail * (worker + 1) / workers;
-            for (int r = tb; r < te; r++)
-                output[r] = STQ1_0.Dot(rows + (long)r * nb, x, nIn);
+            }
+            while (true)
+            {
+                int r = Interlocked.Increment(ref tCursor) - 1;
+                if (r >= tail)
+                    break;
+                output[groups * 8 + r] = STQ1_0.Dot(rows + (long)(groups * 8 + r) * nb, x, nIn);
+            }
         }
         if (pool == null) Run(0, 1); else pool.For(Math.Max(groups, tail), Run);
     }
@@ -52,12 +61,12 @@ public static unsafe class MulMatSTQ
     public static void Gemm(BlockSTQ1_0x8* packed, BlockSTQ1_0* rows, float* input, float* output,
         int nIn, int nOut, int tokens, CpuThreadPool? pool, ScratchArena scratch)
     {
-        if (packed != null && Simd.UseAvx2 && tokens == 1)
+        if (packed != null && Simd.UsePanels && tokens == 1)
         {
             Gemv(packed, rows, input, output, nIn, nOut, pool, scratch);
             return;
         }
-        if (packed == null || !Simd.UseAvx2 || (tokens & 3) != 0 || (nOut & 7) != 0)
+        if (packed == null || !Simd.UsePanels || (tokens & 3) != 0 || (nOut & 7) != 0)
         {
             Gemm(rows, input, output, nIn, nOut, tokens, pool, scratch);
             return;
@@ -129,8 +138,8 @@ public static unsafe class MulMatSTQ
     private static void RunQuantized(float* input, float* up, BlockQ8Kx4* q8, int nIn, int tokens,
         CpuThreadPool? pool, STQPanelWeight w0, STQPanelWeight w1, STQPanelWeight w2)
     {
-        if (!Simd.UseAvx2)
-            throw new PlatformNotSupportedException("STQ panels require AVX2.");
+        if (!Simd.UsePanels)
+            throw new PlatformNotSupportedException("STQ panels require AVX2 or AdvSimd+SDOT.");
         if (nIn <= 0 || nIn % STQ1_0.BlockLength != 0 || tokens <= 0 || (tokens & 3) != 0)
             throw new ArgumentException("STQ panels require a positive multiple of 256 inputs and four tokens.");
         ValidatePanel(w0);
@@ -139,13 +148,16 @@ public static unsafe class MulMatSTQ
 
         int nb = nIn / STQ1_0.BlockLength;
         int quantGroups = tokens / 4;
+        int quantCursor = 0;
+        int c0 = 0, c1 = 0, c2 = 0;
         int count = Math.Max(quantGroups, Math.Max(w0.NOut / 8, Math.Max(w1.NOut / 8, w2.NOut / 8)));
         void Run(int worker, int workers)
         {
-            int begin = quantGroups * worker / workers;
-            int end = quantGroups * (worker + 1) / workers;
-            for (int g = begin; g < end; g++)
+            while (true)
             {
+                int g = Interlocked.Increment(ref quantCursor) - 1;
+                if (g >= quantGroups)
+                    break;
                 if (up == null)
                     QuantizeQ8Kx4.Quantize4x8(input + (long)g * 4 * nIn, q8 + (long)g * nb, nIn);
                 else
@@ -153,9 +165,9 @@ public static unsafe class MulMatSTQ
             }
             if (workers > 1)
                 pool!.Barrier();
-            RunRange(w0, q8, nIn, tokens, worker, workers);
-            RunRange(w1, q8, nIn, tokens, worker, workers);
-            RunRange(w2, q8, nIn, tokens, worker, workers);
+            RunRange(w0, q8, nIn, tokens, ref c0);
+            RunRange(w1, q8, nIn, tokens, ref c1);
+            RunRange(w2, q8, nIn, tokens, ref c2);
         }
 
         if (pool == null)
@@ -170,15 +182,19 @@ public static unsafe class MulMatSTQ
             throw new ArgumentException("STQ panels require valid buffers and an output count divisible by eight.");
     }
 
-    private static void RunRange(STQPanelWeight w, BlockQ8Kx4* q8, int nIn, int tokens, int worker, int workers)
+    /// <summary>Workers claim column groups until the weight is exhausted (dynamic, not static).</summary>
+    private static void RunRange(STQPanelWeight w, BlockQ8Kx4* q8, int nIn, int tokens, ref int cursor)
     {
         if (w.NOut == 0)
             return;
         int nb = nIn / STQ1_0.BlockLength;
         int groups = w.NOut / 8;
-        int begin = groups * worker / workers;
-        int end = groups * (worker + 1) / workers;
-        if (begin < end)
-            STQPanel.Gemm(w.Packed + (long)begin * nb, q8, w.Dst + begin * 8, nIn, w.NOut, tokens, end - begin);
+        while (true)
+        {
+            int g = Interlocked.Increment(ref cursor) - 1;
+            if (g >= groups)
+                break;
+            STQPanel.Gemm(w.Packed + (long)g * nb, q8, w.Dst + g * 8, nIn, w.NOut, tokens, 1);
+        }
     }
 }

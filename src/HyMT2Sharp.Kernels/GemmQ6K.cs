@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 
 namespace Sdcb.HyMT2Sharp.Kernels;
@@ -12,6 +13,13 @@ namespace Sdcb.HyMT2Sharp.Kernels;
 /// </summary>
 public static unsafe class GemmQ6K
 {
+    /// <summary>
+    /// Packed-panel GEMM for the active dispatch tier. <paramref name="weights"/> must be
+    /// produced by the matching repacker: <see cref="RepackQ6K.RowsNeon"/> when
+    /// <see cref="Simd.UseDp"/> (ARM64, signed NEON layout) or <see cref="RepackQ6K.Rows"/>
+    /// otherwise (canonical layout). Feeding a canonical <c>Rows</c> panel on ARM64 reads
+    /// unsigned codes as signed and yields wrong results.
+    /// </summary>
     public static void Gemm8x8(int n, float* dst, int ldc, BlockQ6Kx8* weights, BlockQ8Kx4* activations, int rows, int cols)
     {
         if ((rows & 3) != 0)
@@ -20,6 +28,8 @@ public static unsafe class GemmQ6K
             throw new ArgumentException("cols must be a multiple of 8.", nameof(cols));
         if (Simd.UseAvx2)
             GemmAvx2(n, dst, ldc, weights, activations, rows, cols);
+        else if (Simd.UseDp)
+            GemmNeon(n, dst, ldc, weights, activations, rows, cols);
         else
             GemmScalar(n, dst, ldc, weights, activations, rows, cols);
     }
@@ -187,6 +197,130 @@ public static unsafe class GemmQ6K
         Vector256<int> dots = AvxVnni.MultiplyWideningAndAdd(Vector256<int>.Zero, wa, Avx2.BroadcastScalarToVector256(a).AsSByte());
         dots = AvxVnni.MultiplyWideningAndAdd(dots, wb, Avx2.BroadcastScalarToVector256(a + 1).AsSByte());
         return Avx2.MultiplyLow(dots, EvenScales(scv));
+    }
+
+    /// <summary>
+    /// SDOT variant for <see cref="RepackQ6K.RowsNeon"/> panels (signed weights, natural
+    /// scale order). Sixteen <c>sdot</c> per (row, 16-value group); the −32 offset is
+    /// already folded into the weight bytes, so no bsum correction runs at all.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void GemmNeon(int n, float* dst, int ldc, BlockQ6Kx8* weights, BlockQ8Kx4* activations, int rows, int cols)
+    {
+        int nb = n / Qk.SuperBlock;
+        int tileGroups = Math.Max(1, 2 * GemmQ4K.ColTileBytes / (nb * Qk.Q6Kx8Size));
+        int groups = cols / 8;
+        for (int g0 = 0; g0 < groups; g0 += tileGroups)
+        {
+            int g1 = Math.Min(groups, g0 + tileGroups);
+            GemmNeonTile(n, dst + g0 * 8, ldc, weights + g0 * nb, activations, rows, (g1 - g0) * 8);
+        }
+    }
+
+    [SkipLocalsInit]
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void GemmNeonTile(int n, float* dst, int ldc, BlockQ6Kx8* weights, BlockQ8Kx4* activations, int rows, int cols)
+    {
+        int nb = n / Qk.SuperBlock;
+        for (int y = 0; y < rows / 4; y++)
+        {
+            BlockQ8Kx4* aPtr = activations + y * nb;
+            for (int x = 0; x < cols / 8; x++)
+            {
+                BlockQ6Kx8* bPtr = weights + x * nb;
+                Vector128<float> acc0L = Vector128<float>.Zero;
+                Vector128<float> acc0H = Vector128<float>.Zero;
+                Vector128<float> acc1L = Vector128<float>.Zero;
+                Vector128<float> acc1H = Vector128<float>.Zero;
+                Vector128<float> acc2L = Vector128<float>.Zero;
+                Vector128<float> acc2H = Vector128<float>.Zero;
+                Vector128<float> acc3L = Vector128<float>.Zero;
+                Vector128<float> acc3H = Vector128<float>.Zero;
+
+                for (int b = 0; b < nb; b++)
+                {
+                    Vector128<int> j0L = Vector128<int>.Zero;
+                    Vector128<int> j0H = Vector128<int>.Zero;
+                    Vector128<int> j1L = Vector128<int>.Zero;
+                    Vector128<int> j1H = Vector128<int>.Zero;
+                    Vector128<int> j2L = Vector128<int>.Zero;
+                    Vector128<int> j2H = Vector128<int>.Zero;
+                    Vector128<int> j3L = Vector128<int>.Zero;
+                    Vector128<int> j3H = Vector128<int>.Zero;
+                    sbyte* q = (sbyte*)bPtr[b].Qs;
+                    sbyte* a = aPtr[b].Qs;
+                    short* sc = bPtr[b].Scales;
+                    Vector128<float> dL = Unsafe.ReadUnaligned<Vector128<float>>(bPtr[b].D);
+                    Vector128<float> dH = Unsafe.ReadUnaligned<Vector128<float>>(bPtr[b].D + 4);
+                    Vector128<float> ad = Unsafe.ReadUnaligned<Vector128<float>>(aPtr[b].D);
+                    for (int i = 0; i < Qk.SuperBlock / 16; i++)
+                    {
+                        Vector128<short> scv = Unsafe.ReadUnaligned<Vector128<short>>(sc + i * 8);
+                        Vector128<int> scL = AdvSimd.SignExtendWideningLower(scv.GetLower());
+                        Vector128<int> scH = AdvSimd.SignExtendWideningLower(scv.GetUpper());
+                        Vector128<sbyte> w00 = Neon.Load16(q);
+                        Vector128<sbyte> w01 = Neon.Load16(q + 16);
+                        Vector128<sbyte> w10 = Neon.Load16(q + 32);
+                        Vector128<sbyte> w11 = Neon.Load16(q + 48);
+                        Vector128<sbyte> w20 = Neon.Load16(q + 64);
+                        Vector128<sbyte> w21 = Neon.Load16(q + 80);
+                        Vector128<sbyte> w30 = Neon.Load16(q + 96);
+                        Vector128<sbyte> w31 = Neon.Load16(q + 112);
+                        sbyte* ar = a + i * 64;
+                        AccumulateQ6Neon(ref j0L, ref j0H, w00, w01, w10, w11, w20, w21, w30, w31, ar, scL, scH);
+                        AccumulateQ6Neon(ref j1L, ref j1H, w00, w01, w10, w11, w20, w21, w30, w31, ar + 8, scL, scH);
+                        AccumulateQ6Neon(ref j2L, ref j2H, w00, w01, w10, w11, w20, w21, w30, w31, ar + 16, scL, scH);
+                        AccumulateQ6Neon(ref j3L, ref j3H, w00, w01, w10, w11, w20, w21, w30, w31, ar + 24, scL, scH);
+                        q += 128;
+                    }
+
+                    acc0L = AdvSimd.FusedMultiplyAdd(acc0L, AdvSimd.ConvertToSingle(j0L), AdvSimd.Multiply(dL, Vector128.Create(ad.GetElement(0))));
+                    acc0H = AdvSimd.FusedMultiplyAdd(acc0H, AdvSimd.ConvertToSingle(j0H), AdvSimd.Multiply(dH, Vector128.Create(ad.GetElement(0))));
+                    acc1L = AdvSimd.FusedMultiplyAdd(acc1L, AdvSimd.ConvertToSingle(j1L), AdvSimd.Multiply(dL, Vector128.Create(ad.GetElement(1))));
+                    acc1H = AdvSimd.FusedMultiplyAdd(acc1H, AdvSimd.ConvertToSingle(j1H), AdvSimd.Multiply(dH, Vector128.Create(ad.GetElement(1))));
+                    acc2L = AdvSimd.FusedMultiplyAdd(acc2L, AdvSimd.ConvertToSingle(j2L), AdvSimd.Multiply(dL, Vector128.Create(ad.GetElement(2))));
+                    acc2H = AdvSimd.FusedMultiplyAdd(acc2H, AdvSimd.ConvertToSingle(j2H), AdvSimd.Multiply(dH, Vector128.Create(ad.GetElement(2))));
+                    acc3L = AdvSimd.FusedMultiplyAdd(acc3L, AdvSimd.ConvertToSingle(j3L), AdvSimd.Multiply(dL, Vector128.Create(ad.GetElement(3))));
+                    acc3H = AdvSimd.FusedMultiplyAdd(acc3H, AdvSimd.ConvertToSingle(j3H), AdvSimd.Multiply(dH, Vector128.Create(ad.GetElement(3))));
+                }
+
+                float* row = dst + y * 4 * ldc + x * 8;
+                Unsafe.WriteUnaligned(row, acc0L);
+                Unsafe.WriteUnaligned(row + 4, acc0H);
+                row += ldc;
+                Unsafe.WriteUnaligned(row, acc1L);
+                Unsafe.WriteUnaligned(row + 4, acc1H);
+                row += ldc;
+                Unsafe.WriteUnaligned(row, acc2L);
+                Unsafe.WriteUnaligned(row + 4, acc2H);
+                row += ldc;
+                Unsafe.WriteUnaligned(row, acc3L);
+                Unsafe.WriteUnaligned(row + 4, acc3H);
+            }
+        }
+    }
+
+    /// <summary>16 K values × 8 columns for one activation row: 8 <c>sdot</c>, 2 widening muls.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void AccumulateQ6Neon(ref Vector128<int> jL, ref Vector128<int> jH,
+        Vector128<sbyte> w00, Vector128<sbyte> w01, Vector128<sbyte> w10, Vector128<sbyte> w11,
+        Vector128<sbyte> w20, Vector128<sbyte> w21, Vector128<sbyte> w30, Vector128<sbyte> w31,
+        sbyte* ar, Vector128<int> scL, Vector128<int> scH)
+    {
+        Vector128<sbyte> a0 = Neon.Dup4(ar);
+        Vector128<sbyte> a1 = Neon.Dup4(ar + 4);
+        Vector128<sbyte> a2 = Neon.Dup4(ar + 32);
+        Vector128<sbyte> a3 = Neon.Dup4(ar + 36);
+        Vector128<int> dL = Neon.Sdot(Vector128<int>.Zero, w00, a0);
+        dL = Neon.Sdot(dL, w10, a1);
+        dL = Neon.Sdot(dL, w20, a2);
+        dL = Neon.Sdot(dL, w30, a3);
+        Vector128<int> dH = Neon.Sdot(Vector128<int>.Zero, w01, a0);
+        dH = Neon.Sdot(dH, w11, a1);
+        dH = Neon.Sdot(dH, w21, a2);
+        dH = Neon.Sdot(dH, w31, a3);
+        jL = AdvSimd.Add(jL, AdvSimd.Multiply(dL, scL));
+        jH = AdvSimd.Add(jH, AdvSimd.Multiply(dH, scH));
     }
 
     /// <summary>

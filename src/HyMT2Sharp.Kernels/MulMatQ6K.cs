@@ -1,3 +1,4 @@
+using System.Threading;
 using System.Runtime.InteropServices;
 
 namespace Sdcb.HyMT2Sharp.Kernels;
@@ -14,7 +15,7 @@ public static unsafe class MulMatQ6K
             Q6K.Gemm(rows, input, output, nIn, nOut, tokens, pool, scratch);
             return;
         }
-        if (packed == null || !Simd.UseAvx2)
+        if (packed == null || !Simd.UsePanels)
         {
             int nbv = nIn / Qk.SuperBlock;
             VecGemmF.Gemm((byte*)rows, nbv * sizeof(BlockQ6K), sizeof(BlockQ6K), Qk.SuperBlock,
@@ -63,12 +64,16 @@ public static unsafe class MulMatQ6K
                 NativeMemory.Clear(paddedIn + tokens * nIn, (nuint)((long)(paddedTokens - tokens) * nIn * sizeof(float)));
 
             int quantGroups = paddedTokens / 4;
+            int quantCursor = 0;
             void QuantBody(int worker, int workers)
             {
-                int begin = quantGroups * worker / workers;
-                int end = quantGroups * (worker + 1) / workers;
-                for (int g = begin; g < end; g++)
+                while (true)
+                {
+                    int g = Interlocked.Increment(ref quantCursor) - 1;
+                    if (g >= quantGroups)
+                        break;
                     QuantizeQ8Kx4.Quantize4x8(paddedIn + g * 4 * nIn, q8 + g * nb, nIn);
+                }
             }
 
             if (pool == null)
@@ -76,15 +81,19 @@ public static unsafe class MulMatQ6K
             else
                 pool.For(quantGroups, QuantBody);
 
+            int gemmCursor = 0;
             void Body(int worker, int workers)
             {
                 int groups = packedCols / 8;
                 if (groups == 0)
                     return;
-                int begin = groups * worker / workers;
-                int end = groups * (worker + 1) / workers;
-                for (int g = begin; g < end; g++)
+                while (true)
+                {
+                    int g = Interlocked.Increment(ref gemmCursor) - 1;
+                    if (g >= groups)
+                        break;
                     GemmQ6K.Gemm8x8(nIn, dst + g * 8, nOut, packed + g * nb, q8, paddedTokens, 8);
+                }
             }
 
             if (pool == null)

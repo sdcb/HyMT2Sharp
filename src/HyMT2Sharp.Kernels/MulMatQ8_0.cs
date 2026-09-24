@@ -1,3 +1,4 @@
+using System.Threading;
 using System.Runtime.InteropServices;
 
 namespace Sdcb.HyMT2Sharp.Kernels;
@@ -49,7 +50,7 @@ public static unsafe class MulMatQ8_0
             return;
         }
 
-        if (packed == null || !Simd.UseAvx2)
+        if (packed == null || !Simd.UsePanels)
         {
             Q8_0.Gemm(rows, input, output, nIn, nOut, tokens, pool, scratch);
             return;
@@ -151,27 +152,32 @@ public static unsafe class MulMatQ8_0
     {
         int nb = nIn / Qk.Q8_0Block;
         int quantGroups = tokens / 4;
+        int quantCursor = 0;
+        int c0 = 0, c1 = 0, c2 = 0;
         if (pool == null)
         {
             for (int g = 0; g < quantGroups; g++)
                 Q8_0.Quantize4(input + g * 4 * nIn, q8 + g * nb, nIn);
-            GemmRange(w0, q8, nIn, tokens, 0, 1, nb);
-            GemmRange(w1, q8, nIn, tokens, 0, 1, nb);
-            GemmRange(w2, q8, nIn, tokens, 0, 1, nb);
+            GemmRange(w0, q8, nIn, tokens, ref c0, nb);
+            GemmRange(w1, q8, nIn, tokens, ref c1, nb);
+            GemmRange(w2, q8, nIn, tokens, ref c2, nb);
             return;
         }
 
         int jobs = Math.Max(quantGroups, Math.Max(1, Math.Max(w0.NOut / 8, Math.Max(w1.NOut / 8, w2.NOut / 8))));
         pool.For(jobs, (int worker, int workers) =>
         {
-            int g0 = quantGroups * worker / workers;
-            int g1 = quantGroups * (worker + 1) / workers;
-            for (int g = g0; g < g1; g++)
+            while (true)
+            {
+                int g = Interlocked.Increment(ref quantCursor) - 1;
+                if (g >= quantGroups)
+                    break;
                 Q8_0.Quantize4(input + g * 4 * nIn, q8 + g * nb, nIn);
+            }
             pool.Barrier();
-            GemmRange(w0, q8, nIn, tokens, worker, workers, nb);
-            GemmRange(w1, q8, nIn, tokens, worker, workers, nb);
-            GemmRange(w2, q8, nIn, tokens, worker, workers, nb);
+            GemmRange(w0, q8, nIn, tokens, ref c0, nb);
+            GemmRange(w1, q8, nIn, tokens, ref c1, nb);
+            GemmRange(w2, q8, nIn, tokens, ref c2, nb);
         });
     }
 
@@ -179,35 +185,43 @@ public static unsafe class MulMatQ8_0
     {
         int nb = nIn / Qk.Q8_0Block;
         int quantGroups = tokens / 4;
+        int quantCursor = 0;
+        int c0 = 0;
         if (pool == null)
         {
             for (int g = 0; g < quantGroups; g++)
                 Q8_0.Quantize4Silu(gate + g * 4 * nIn, up + g * 4 * nIn, q8 + g * nb, nIn);
-            GemmRange(w, q8, nIn, tokens, 0, 1, nb);
+            GemmRange(w, q8, nIn, tokens, ref c0, nb);
             return;
         }
 
         int jobs = Math.Max(quantGroups, Math.Max(1, w.NOut / 8));
         pool.For(jobs, (int worker, int workers) =>
         {
-            int g0 = quantGroups * worker / workers;
-            int g1 = quantGroups * (worker + 1) / workers;
-            for (int g = g0; g < g1; g++)
+            while (true)
+            {
+                int g = Interlocked.Increment(ref quantCursor) - 1;
+                if (g >= quantGroups)
+                    break;
                 Q8_0.Quantize4Silu(gate + g * 4 * nIn, up + g * 4 * nIn, q8 + g * nb, nIn);
+            }
             pool.Barrier();
-            GemmRange(w, q8, nIn, tokens, worker, workers, nb);
+            GemmRange(w, q8, nIn, tokens, ref c0, nb);
         });
     }
 
-    private static void GemmRange(Q8Panel w, BlockQ8_0x4* q8, int nIn, int tokens, int worker, int workers, int nb)
+    /// <summary>Workers claim column groups until the weight is exhausted (dynamic, not static).</summary>
+    private static void GemmRange(Q8Panel w, BlockQ8_0x4* q8, int nIn, int tokens, ref int cursor, int nb)
     {
         int groups = w.NOut / 8;
         if (groups == 0 || w.Packed == null)
             return;
-        int begin = groups * worker / workers;
-        int end = groups * (worker + 1) / workers;
-        if (begin >= end)
-            return;
-        GemmQ8_0.Gemm8x8(nIn, w.Dst + begin * 8, w.NOut, w.Packed + begin * nb, q8, tokens, (end - begin) * 8);
+        while (true)
+        {
+            int g = Interlocked.Increment(ref cursor) - 1;
+            if (g >= groups)
+                break;
+            GemmQ8_0.Gemm8x8(nIn, w.Dst + g * 8, w.NOut, w.Packed + g * nb, q8, tokens, 8);
+        }
     }
 }

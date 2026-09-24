@@ -18,6 +18,8 @@ public static unsafe partial class GemmQ4K
             throw new ArgumentException("cols must be a multiple of 8.", nameof(cols));
         if (Simd.UseAvx2 && meta != null)
             GemmAvx2(n, dst, ldc, weights, activations, rows, cols, meta);
+        else if (Simd.UseDp && meta != null)
+            GemmNeon(n, dst, ldc, weights, activations, rows, cols, meta);
         else
             GemmScalar(n, dst, ldc, weights, activations, rows, cols);
     }

@@ -1,6 +1,7 @@
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 
 namespace Sdcb.HyMT2Sharp.Kernels;
@@ -101,7 +102,7 @@ public static unsafe class STQ1_0
     }
 
     public static float Dot(BlockSTQ1_0* x, BlockQ8K* y, int n) =>
-        Simd.UseAvx2 ? DotAvx2(x, y, n) : DotVec(x, y, n);
+        Simd.UseAvx2 ? DotAvx2(x, y, n) : Simd.UseDp ? DotNeon(x, y, n) : DotVec(x, y, n);
 
     /// <summary>
     /// Portable fallback: vector codebook gather via <see cref="Vector128.Shuffle"/>
@@ -160,6 +161,52 @@ public static unsafe class STQ1_0
             sum += HalfBits.ToSingle(x[b].D) * y[b].D * (encoded - actSum);
         }
 
+        return sum;
+    }
+
+    /// <summary>
+    /// NEON/SDOT version of <see cref="DotAvx2"/>: zip-interleaved nibbles feed
+    /// a native tbl codebook lookup, then one sdot per lane plane.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotNeon(BlockSTQ1_0* x, BlockQ8K* y, int n)
+    {
+        if (n <= 0 || n % BlockLength != 0)
+            throw new ArgumentException("STQ1_0 rows must contain a positive multiple of 256 values.", nameof(n));
+
+        float sum = 0;
+        for (int b = 0; b < n / BlockLength; b++)
+        {
+            Vector128<int> acc = Vector128<int>.Zero;
+            for (int chunk = 0; chunk < 4; chunk++)
+            {
+                byte* qs = x[b].Qs + chunk * 8;
+                byte* signs = x[b].Sign + chunk * 2;
+                sbyte* act = y[b].Qs + chunk * 64;
+
+                // Eight bytes hold sixteen 4-bit slots; zip lo/hi nibbles into
+                // one slot per byte for tbl.
+                Vector128<byte> qbytes = Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(qs)).AsByte();
+                Vector128<byte> lo = AdvSimd.And(qbytes, NibbleMask);
+                Vector128<byte> hi = AdvSimd.And(AdvSimd.ShiftRightLogical(qbytes.AsUInt16(), 4).AsByte(), NibbleMask);
+                Vector128<byte> slots = AdvSimd.Arm64.ZipLow(lo, hi);
+
+                Vector128<byte> signMask = Vector128.Create(
+                    SignMaskLut[signs[0]].AsUInt64().ToScalar(),
+                    SignMaskLut[signs[1]].AsUInt64().ToScalar()).AsByte();
+
+                Vector128<byte> qp = AdvSimd.BitwiseSelect(signMask,
+                    AdvSimd.Arm64.VectorTableLookup(CodebookHi, slots),
+                    AdvSimd.Arm64.VectorTableLookup(CodebookLo, slots));
+
+                acc = Neon.Sdot(acc, AdvSimd.And(qp, LaneMask).AsSByte(), Neon.Load16(act));
+                acc = Neon.Sdot(acc, AdvSimd.And(AdvSimd.ShiftRightLogical(qp.AsUInt16(), 2).AsByte(), LaneMask).AsSByte(), Neon.Load16(act + 16));
+                acc = Neon.Sdot(acc, AdvSimd.And(AdvSimd.ShiftRightLogical(qp.AsUInt16(), 4).AsByte(), LaneMask).AsSByte(), Neon.Load16(act + 32));
+                acc = Neon.Sdot(acc, AdvSimd.And(AdvSimd.ShiftRightLogical(qp.AsUInt16(), 6).AsByte(), LaneMask).AsSByte(), Neon.Load16(act + 48));
+            }
+
+            sum += HalfBits.ToSingle(x[b].D) * y[b].D * (Neon.Reduce(acc) - Neon.BsumAll(y + b));
+        }
         return sum;
     }
 
