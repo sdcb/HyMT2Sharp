@@ -14,6 +14,15 @@ public static class KvCacheAlign
     }
 
     /// <summary>
+    /// Whether the first <paramref name="length"/> cached tokens are identical
+    /// to the prompt's — the validity condition for KV beyond a restored
+    /// block region (KV at position j is only valid under token history
+    /// [0..j]).
+    /// </summary>
+    public static bool PrefixMatches(ReadOnlySpan<int> cached, ReadOnlySpan<int> prompt, int length)
+        => length <= cached.Length && cached[..length].SequenceEqual(prompt[..length]);
+
+    /// <summary>
     /// Reuse the longest matching prefix. If the prompt is already fully cached,
     /// keep all but the last token and replay it so logits can be refreshed.
     /// </summary>

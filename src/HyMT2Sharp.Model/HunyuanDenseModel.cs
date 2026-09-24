@@ -218,6 +218,11 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         if (hit == 0)
             return;
         int n = hit * bt;
+        // KV at positions >= n was computed under the warm cache's old
+        // prefix — reusable only when that prefix is token-identical to
+        // this prompt's, else matching tail tokens would reuse stale KV.
+        bool tailValid = KvCacheAlign.PrefixMatches(
+            CollectionsMarshal.AsSpan(_cacheTokens), promptIds, n);
         EnsureCache(n);
         for (int i = 0; i < hit; i++)
             store.Restore(hits![i], _cacheK, _cacheV, i);
@@ -226,6 +231,8 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         promptIds[..n].CopyTo(CollectionsMarshal.AsSpan(_cacheTokens));
         if (_cacheLen < n)
             _cacheLen = n;
+        else if (!tailValid && _cacheLen > n)
+            TruncateCache(n);
     }
 
     public float[] Forward(int[] tokens)

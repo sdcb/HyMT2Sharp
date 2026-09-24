@@ -15,13 +15,15 @@ int maxTokens = GetInt(args, 256, "--max-tokens");
 // prefixes survive across unrelated requests.
 int kvBlockMb = GetInt(args, 1024, "--kv-block-mb");
 int kvBlockTokens = GetInt(args, 64, "--kv-block-tokens");
+if (kvBlockMb <= 0)
+    throw new ArgumentException($"--kv-block-mb must be positive, got {kvBlockMb}");
 if (kvBlockTokens <= 0)
     throw new ArgumentException($"--kv-block-tokens must be positive, got {kvBlockTokens}");
 KvCacheConfig kvCache = GetArg(args, "--kv-cache")?.ToLowerInvariant() switch
 {
     null or "none" => KvCacheConfig.None,
     "memory" => KvCacheConfig.Memory,
-    "blocks" => KvCacheConfig.BlockPolicy(kvBlockMb << 20, kvBlockTokens),
+    "blocks" => KvCacheConfig.BlockPolicy((long)kvBlockMb << 20, kvBlockTokens),
     string other => throw new ArgumentException($"--kv-cache must be none|memory|blocks, got {other}"),
 };
 string urls = GetArg(args, "--urls")
