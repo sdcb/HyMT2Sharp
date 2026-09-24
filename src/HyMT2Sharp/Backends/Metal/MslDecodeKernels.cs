@@ -99,8 +99,10 @@ kernel void rope_neox(
     constant int& ropeDim [[buffer(2)]],
     constant int& pos [[buffer(3)]],
     constant float& base [[buffer(4)]],
+    constant int& n [[buffer(5)]],
     uint gid [[thread_position_in_grid]])
 {
+    if ((int)gid >= n) return;
     int hd = ropeDim >> 1;
     int h = (int)gid / hd;
     int i = (int)gid % hd;

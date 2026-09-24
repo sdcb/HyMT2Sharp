@@ -25,6 +25,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private int _kvStride;
     private IntPtr _embd, _outNorm;
     private IntPtr _h, _n1, _n2, _q, _k, _v, _ao, _attnOut, _gate, _up, _down, _normed, _logitsBuf, _tok;
+    // DecodeStep returns this shared buffer — callers must consume it before the next call.
     private float[] _logitsHost = null!;
     private int _vocab;
     private readonly bool _timing = Environment.GetEnvironmentVariable("HYMT_METAL_TIMING") == "1";
@@ -140,14 +141,19 @@ public sealed unsafe class MetalBackend : IComputeBackend
             throw new NotSupportedException($"Metal KV capacity {_kvCap} exceeded at {kvLen} (M2 flat cap)");
         float scale = 1f / MathF.Sqrt(dim);
 
-        using AutoReleasePool pool = AutoReleasePool.Create();
         _sw.Restart();
         *(int*)Contents(_tok) = tokenId;
         MtlDevice.DidModifyRange(_tok, 0, 4);
 
-        var cc = CmdCtx.Begin(_dev.Queue);
+        var cc = CmdCtx.Begin(_dev.Queue);  // owns the autorelease pool for this step
         // embed: h = dequant(embd[token])
-        cc.SetPso(_wtype["token_embd.weight"] == GgmlTensorType.Q6_K ? _psoEmbedQ6 : _psoEmbedQ4);
+        cc.SetPso(_wtype["token_embd.weight"] switch
+        {
+            GgmlTensorType.Q4_K => _psoEmbedQ4,
+            GgmlTensorType.Q6_K => _psoEmbedQ6,
+            GgmlTensorType t => throw new NotSupportedException(
+                $"embed token_embd.weight: {t} not supported on Metal backend — use --backend cpu"),
+        });
         cc.SetBuffer(_embd, 0, 0); cc.SetBuffer(_tok, 0, 1); cc.SetBuffer(_h, 0, 2);
         cc.SetInt(3, hidden);
         cc.Dispatch((nuint)((hidden + 255) / 256), 1, 1, 256, 1, 1);
@@ -216,12 +222,18 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private void Gemv(CmdCtx c, string name, IntPtr x, IntPtr y, int inDim, int outDim)
     {
         IntPtr w = W(name);
-        bool q6 = _wtype[name] == GgmlTensorType.Q6_K;
+        IntPtr pso = _wtype[name] switch
+        {
+            GgmlTensorType.Q4_K => _psoGemv,
+            GgmlTensorType.Q6_K => _psoGemvQ6,
+            GgmlTensorType t => throw new NotSupportedException(
+                $"gemv {name}: {t} not supported on Metal backend — use --backend cpu"),
+        };
         // fast4 kernels stage scales in threadgroup sf[]:
         // q4k -> in_dim <= 6144 (sf[4*192] groups of 32), q6k -> sf[4*384] groups of 16.
         if (inDim > 6144)
             throw new NotSupportedException($"gemv {name}: in_dim {inDim} exceeds fast4 limit 6144");
-        c.SetPso(q6 ? _psoGemvQ6 : _psoGemv);
+        c.SetPso(pso);
         c.SetBuffer(w, 0, 0); c.SetBuffer(x, 0, 1); c.SetBuffer(y, 0, 2);
         c.SetInt(3, inDim); c.SetInt(4, outDim);
         c.Dispatch((nuint)((outDim + 3) / 4), 1, 1, 256, 1, 1);
@@ -241,6 +253,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
         c.SetPso(_psoRope);
         c.SetBuffer(x, 0, 0);
         c.SetInt(1, headDim); c.SetInt(2, _cfg.RopeDim); c.SetInt(3, pos); c.SetFloat(4, _cfg.RopeBase);
+        c.SetInt(5, heads * half);
         c.Dispatch((nuint)((heads * half + 255) / 256), 1, 1, 256, 1, 1);
     }
 

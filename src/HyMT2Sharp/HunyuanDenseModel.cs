@@ -22,6 +22,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     private nuint _scratchUsed;
     private readonly List<int> _cacheTokens = [];
     private int _cacheLen;
+    private int _cpuKvLen;  // front positions with valid CPU KV; decode appends KV on-device only
     private int _cacheCap;
     private readonly KvBlockStore? _blockStore;
     private readonly IComputeBackend? _backend;
@@ -169,6 +170,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         if (length > _cacheLen)
             throw new ArgumentOutOfRangeException(nameof(length), length, $"Cannot extend cache from {_cacheLen}.");
         _cacheLen = length;
+        _cpuKvLen = Math.Min(_cpuKvLen, length);
         if (_cacheTokens.Count > length)
             _cacheTokens.RemoveRange(length, _cacheTokens.Count - length);
     }
@@ -233,6 +235,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         for (int i = 0; i < hit; i++)
             store.Restore(hits![i], _cacheK, _cacheV, i);
         _kvDirtyFrom = 0;  // device KV must be re-uploaded from CPU state
+        _cpuKvLen = Math.Max(_cpuKvLen, n);  // restored prefix is valid CPU KV
         while (_cacheTokens.Count < n)
             _cacheTokens.Add(0);
         promptIds[..n].CopyTo(CollectionsMarshal.AsSpan(_cacheTokens));
@@ -273,6 +276,11 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
             _cacheTokens.AddRange(tokens);
             return devLogits;
         }
+        if (start > _cpuKvLen)
+            throw new InvalidOperationException(
+                $"CPU KV gap: forward at start={start} but only {_cpuKvLen} positions have " +
+                "CPU-side KV (device decode appended the rest on-GPU). Rebuild the cache " +
+                "from a valid prefix (ResetCache/TruncateCache) before prefilling.");
 
         Embed(tokens, h);
         nuint layerMark = _scratchUsed;
@@ -312,6 +320,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
             _kvDirtyFrom = int.MaxValue;
         }
 
+        _cpuKvLen = start + seq;
         _cacheLen += seq;
         _cacheTokens.AddRange(tokens);
         Debug.Assert(_cacheTokens.Count == _cacheLen);
