@@ -289,15 +289,56 @@ public sealed class CpuThreadPool : IDisposable
 
     public static int PreferPCoreCount() => CpuTopology.PreferPCoreCount;
 
+    /// <summary>
+    /// <c>HYMT2SHARP_CPU_MASK</c> escape hatch for hosts where the topology
+    /// probe reads wrong (crippled sysfs in VMs/containers, hybrid parts
+    /// without cpu_core). Accepts a hex mask (<c>0xff</c>) or a cpu list
+    /// (<c>0-3,5,8</c>); unparseable values are ignored like any pin failure.
+    /// </summary>
+    private static readonly IReadOnlyList<int>? PinTargetsOverride = ParsePinTargetsOverride();
+
+    private static IReadOnlyList<int>? ParsePinTargetsOverride()
+    {
+        string? env = Environment.GetEnvironmentVariable("HYMT2SHARP_CPU_MASK");
+        if (string.IsNullOrWhiteSpace(env))
+            return null;
+        try
+        {
+            env = env.Trim();
+            if (env.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+            {
+                List<int> ids = [];
+                for (int i = 2; i < env.Length; i++)
+                {
+                    int nibble = Convert.ToInt32(env[i].ToString(), 16);
+                    for (int b = 0; b < 4; b++)
+                    {
+                        if (((nibble >> b) & 1) != 0)
+                            ids.Add((env.Length - 1 - i) * 4 + b);
+                    }
+                }
+                return ids.Count > 0 ? ids : null;
+            }
+
+            int[] parsed = CpuTopology.ParseCpuList(env);
+            return parsed.Length > 0 ? parsed : null;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private void TryPinToPCore(int index)
     {
         try
         {
-            IReadOnlyList<int> targets = ThreadCount <= CpuTopology.PCoreLeaders.Count
-                ? CpuTopology.PCoreLeaders
-                : ThreadCount <= CpuTopology.PhysicalLeaders.Count
-                    ? CpuTopology.PhysicalLeaders
-                    : CpuTopology.PhysicalLogicalIds;
+            IReadOnlyList<int> targets = PinTargetsOverride
+                ?? (ThreadCount <= CpuTopology.PCoreLeaders.Count
+                    ? CpuTopology.PCoreLeaders
+                    : ThreadCount <= CpuTopology.PhysicalLeaders.Count
+                        ? CpuTopology.PhysicalLeaders
+                        : CpuTopology.PhysicalLogicalIds);
             if (targets.Count == 0)
                 return;
 
