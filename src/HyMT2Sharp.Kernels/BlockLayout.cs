@@ -133,6 +133,22 @@ public unsafe struct BlockQ4Kx8Meta
     public fixed short Scales[4 * 48];
 }
 
+/// <summary>
+/// Portable K-quant GEMV activation for one superblock, built once per call from
+/// <see cref="BlockQ8K"/> (<see cref="Q8K.ToVecAct"/>). For each 32-value group g,
+/// <see cref="A"/>[32g + 16p + m] = Qs[32g + 2m + p]: even then odd positions as i16.
+/// A u16 lane m of packed weights covers values 2m and 2m+1 of a group, so it meets
+/// the even and odd arrays at the same index with no cross-lane shuffles.
+/// <see cref="Bs"/>[g] is the sum of the 32 activations of group g.
+/// </summary>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+public unsafe struct BlockQ8KAct
+{
+    public float D;
+    public fixed int Bs[8];
+    public fixed short A[Qk.SuperBlock];
+}
+
 [StructLayout(LayoutKind.Sequential, Pack = 1)]
 public unsafe struct BlockQ8Kx4
 {
@@ -199,7 +215,22 @@ public unsafe struct BlockQ6Kx8
 
 public static class HalfBits
 {
-    public static float ToSingle(ushort bits) => (float)BitConverter.UInt16BitsToHalf(bits);
+    private const float TwoPow112 = 5.192296858534828e33f;
+
+    /// <summary>
+    /// Exact fp16 → fp32 without the out-of-line <see cref="Half"/> call: shifting the
+    /// magnitude into fp32 position and scaling by 2^112 rebiases normals and subnormals
+    /// alike. Inf/NaN (never present in GGUF scales) take the BCL path.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static float ToSingle(ushort bits)
+    {
+        uint mag = bits & 0x7FFFu;
+        if (mag >= 0x7C00u)
+            return (float)BitConverter.UInt16BitsToHalf(bits);
+        float f = BitConverter.UInt32BitsToSingle(mag << 13) * TwoPow112;
+        return BitConverter.UInt32BitsToSingle(BitConverter.SingleToUInt32Bits(f) | ((uint)(bits & 0x8000) << 16));
+    }
 
     public static ushort FromSingle(float value) => BitConverter.HalfToUInt16Bits((Half)value);
 

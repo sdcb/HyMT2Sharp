@@ -93,6 +93,10 @@ public sealed unsafe partial class HunyuanDenseModel
         {
             Q6K.GemvPrequantMulti(y, hidden, _pool, wq.Q6, q, qDim, wk.Q6, k, kDim, wv.Q6, v, kDim);
         }
+        else if (IsKQuant(wq) && IsKQuant(wk) && IsKQuant(wv))
+        {
+            KQuantGemv.Multi(y, hidden, _pool, KTarget(wq, q, qDim), KTarget(wk, k, kDim), KTarget(wv, v, kDim));
+        }
         else
         {
             GemvPrequant(wq, y, q, hidden, qDim);
@@ -131,6 +135,10 @@ public sealed unsafe partial class HunyuanDenseModel
         if (wg.Type == GgmlTensorType.Q6_K && wu.Type == GgmlTensorType.Q6_K)
         {
             Q6K.GemvPrequantMulti(y, hidden, _pool, wg.Q6, gate, ffn, wu.Q6, up, ffn);
+        }
+        else if (IsKQuant(wg) && IsKQuant(wu))
+        {
+            KQuantGemv.Multi(y, hidden, _pool, KTarget(wg, gate, ffn), KTarget(wu, up, ffn));
         }
         else
         {
@@ -177,6 +185,11 @@ public sealed unsafe partial class HunyuanDenseModel
                 throw new NotSupportedException($"{name} type {w.Type} is not a decode GEMV weight.");
         }
     }
+
+    private static bool IsKQuant(Weight w) => w.Type is GgmlTensorType.Q4_K or GgmlTensorType.Q6_K;
+
+    private static KGemvTarget KTarget(Weight w, float* dst, int rows) =>
+        w.Type == GgmlTensorType.Q6_K ? new KGemvTarget(null, w.Q6, dst, rows) : new KGemvTarget(w.Q4, null, dst, rows);
 
     private void GemvPrequant(Weight w, BlockQ8K* x, float* y, int nIn, int nOut)
     {

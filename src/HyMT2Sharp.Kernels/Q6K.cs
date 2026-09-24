@@ -7,6 +7,32 @@ namespace Sdcb.HyMT2Sharp.Kernels;
 
 public static unsafe class Q6K
 {
+    /// <summary>One superblock → 256 floats: vector decode to int8, then widen × d·scale per 16.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void DequantizeBlockVec(BlockQ6K* x, float* y)
+    {
+        if (Vector<sbyte>.Count > 32)
+        {
+            DequantizeRow(x, y, Qk.SuperBlock);
+            return;
+        }
+
+        sbyte* a = stackalloc sbyte[Qk.SuperBlock];
+        DecodeBlockVec(x, a);
+        float d = HalfBits.ToSingle(x->D);
+        int n = Vector<int>.Count;
+        for (int i = 0; i < Qk.SuperBlock; i += Vector<sbyte>.Count)
+        {
+            Vector.Widen(VecI8.LoadS8(a + i), out Vector<short> lo, out Vector<short> hi);
+            Vector.Widen(lo, out Vector<int> v0, out Vector<int> v1);
+            Vector.Widen(hi, out Vector<int> v2, out Vector<int> v3);
+            VecF.Store(y + i, Vector.ConvertToSingle(v0) * new Vector<float>(d * x->Scales[i / 16]));
+            VecF.Store(y + i + n, Vector.ConvertToSingle(v1) * new Vector<float>(d * x->Scales[(i + n) / 16]));
+            VecF.Store(y + i + 2 * n, Vector.ConvertToSingle(v2) * new Vector<float>(d * x->Scales[(i + 2 * n) / 16]));
+            VecF.Store(y + i + 3 * n, Vector.ConvertToSingle(v3) * new Vector<float>(d * x->Scales[(i + 3 * n) / 16]));
+        }
+    }
+
     public static void DequantizeRow(BlockQ6K* x, float* y, int k)
     {
         int nb = k / Qk.SuperBlock;
@@ -42,31 +68,85 @@ public static unsafe class Q6K
     public static float Dot(BlockQ6K* x, BlockQ8K* y, int n)
         => Simd.UseAvx2 ? DotAvx2(x, y, n) : DotVec(x, y, n);
 
-    /// <summary>Portable widening fallback; vectorized decode then per-16 scaled dots.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    /// <summary>Portable single-row entry: builds the <see cref="BlockQ8KAct"/> view, then <see cref="DotAct"/>.</summary>
     public static float DotVec(BlockQ6K* x, BlockQ8K* y, int n)
     {
+        if (!VecI8.PairLayoutSupported)
+            return DotScalar(x, y, n);
         int nb = n / Qk.SuperBlock;
-        sbyte* aux = stackalloc sbyte[Qk.SuperBlock];
-        float sumf = 0;
-        for (int i = 0; i < nb; i++)
+        BlockQ8KAct* act = stackalloc BlockQ8KAct[nb];
+        Q8K.ToVecAct(y, act, nb);
+        return DotAct(x, act, nb);
+    }
+
+    /// <summary>
+    /// Portable Q6_K row dot on the even/odd <see cref="BlockQ8KAct"/> layout. Ql/Qh load as
+    /// u16 lanes; each lane yields the even and odd 6-bit values of all four 32-value groups
+    /// with and/shift/or only. (q−32)·a pairs stay within i16, fold to i32 in-lane and take
+    /// their 16-value scale from a lane mask, so the only horizontal sum is per row.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotAct(BlockQ6K* x, BlockQ8KAct* a, int nb)
+    {
+        int U = Vector<ushort>.Count;
+        Vector<ushort> m4 = new(0x000F);
+        Vector<ushort> m30 = new(0x0030);
+        Vector<ushort> m3 = new(0x0003);
+        Vector<short> bias = new(32);
+        // i32 lane k of the u16 chunk starting at lane m covers group values 2m+4k..2m+4k+3.
+        Vector<int> idx4 = Vector<int>.Indices * 4;
+        Vector<int> sixteen = new(16);
+        Vector<int> mask0 = Vector.LessThan(idx4, sixteen);
+        Vector<int> mask1 = Vector.LessThan(idx4 + new Vector<int>(2 * U), sixteen);
+        Vector<float> acc = Vector<float>.Zero;
+        for (int i = 0; i < nb; i++, x++, a++)
         {
-            DecodeBlockVec(x + i, aux);
-            int acc = 0;
-            sbyte* a = aux;
-            sbyte* q8 = y[i].Qs;
-            for (int j = 0; j < Qk.SuperBlock / 32; j++)
+            Vector<int> sumi = Vector<int>.Zero;
+            for (int j = 0; j < 2; j++)
             {
-                VecI8.Dot16x2(a, q8, out int s0, out int s1);
-                acc += x[i].Scales[2 * j] * s0 + x[i].Scales[2 * j + 1] * s1;
-                a += 32;
-                q8 += 32;
+                byte* ql = x->Ql + 64 * j;
+                byte* qh = x->Qh + 32 * j;
+                sbyte* sc = x->Scales + 8 * j;
+                short* A = a->A + 128 * j;
+                Vector<int> s0 = new(sc[0]), s1 = new(sc[1]), s2 = new(sc[2]), s3 = new(sc[3]);
+                Vector<int> s4 = new(sc[4]), s5 = new(sc[5]), s6 = new(sc[6]), s7 = new(sc[7]);
+                for (int m = 0; m < 16; m += U)
+                {
+                    Vector<int> mask = m == 0 ? mask0 : mask1;
+                    Vector<ushort> va = Unsafe.ReadUnaligned<Vector<ushort>>(ql + 2 * m);
+                    Vector<ushort> vb = Unsafe.ReadUnaligned<Vector<ushort>>(ql + 32 + 2 * m);
+                    Vector<ushort> h = Unsafe.ReadUnaligned<Vector<ushort>>(qh + 2 * m);
+
+                    Vector<ushort> ev = (va & m4) | ((h & m3) << 4);
+                    Vector<ushort> od = ((va >> 8) & m4) | ((h >> 4) & m30);
+                    sumi += Group(ev, od, A + m, bias) * Vector.ConditionalSelect(mask, s0, s1);
+
+                    ev = (vb & m4) | ((h << 2) & m30);
+                    od = ((vb >> 8) & m4) | ((h >> 6) & m30);
+                    sumi += Group(ev, od, A + 32 + m, bias) * Vector.ConditionalSelect(mask, s2, s3);
+
+                    ev = ((va >> 4) & m4) | (h & m30);
+                    od = (va >> 12) | ((h >> 8) & m30);
+                    sumi += Group(ev, od, A + 64 + m, bias) * Vector.ConditionalSelect(mask, s4, s5);
+
+                    ev = ((vb >> 4) & m4) | ((h >> 2) & m30);
+                    od = (vb >> 12) | ((h >> 10) & m30);
+                    sumi += Group(ev, od, A + 96 + m, bias) * Vector.ConditionalSelect(mask, s6, s7);
+                }
             }
 
-            sumf += HalfBits.ToSingle(x[i].D) * y[i].D * acc;
+            acc = Vector.MultiplyAddEstimate(Vector.ConvertToSingle(sumi), new Vector<float>(HalfBits.ToSingle(x->D) * a->D), acc);
         }
 
-        return sumf;
+        return Vector.Sum(acc);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector<int> Group(Vector<ushort> ev, Vector<ushort> od, short* A, Vector<short> bias)
+    {
+        Vector<short> p = (Vector.AsVectorInt16(ev) - bias) * VecI8.LoadS16(A)
+            + (Vector.AsVectorInt16(od) - bias) * VecI8.LoadS16(A + 16);
+        return VecI8.Fold(p);
     }
 
     /// <summary>Decode one Q6_K superblock to signed values (-32..31) like <see cref="DotScalar"/>.</summary>
@@ -490,29 +570,14 @@ public static unsafe class Q6K
     }
 
     public static void GemvPrequant(BlockQ6K* weights, BlockQ8K* y, float* output, int nIn, int nOut, CpuThreadPool? pool)
-    {
-        int nb = nIn / Qk.SuperBlock;
-        int next = 0;
-        void Body(int worker, int workers)
-        {
-            // Dynamic chunks: a worker on a slow memory patch takes fewer rows
-            // instead of gating the whole GEMV (same trick as ggml mul_mat).
-            // ~16 claims per worker keeps each claim a long contiguous stream.
-            int chunk = Math.Max(8, nOut / (workers * 16));
-            int begin;
-            while ((begin = Interlocked.Add(ref next, chunk) - chunk) < nOut)
-            {
-                int end = Math.Min(begin + chunk, nOut);
-                for (int row = begin; row < end; row++)
-                    output[row] = Dot(weights + row * nb, y, nIn);
-            }
-        }
+        => GemvPrequantMulti(y, nIn, pool, weights, output, nOut, null, null, 0);
 
-        if (pool == null)
-            Body(0, 1);
-        else
-            pool.For(nOut, Body);
-    }
+    /// <summary>Portable GEMV uses the <see cref="BlockQ8KAct"/> view; null means the AVX2/scalar Dot.</summary>
+    private static bool UseVecAct => !Simd.UseAvx2 && VecI8.PairLayoutSupported;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float Row(BlockQ6K* w, BlockQ8K* y, BlockQ8KAct* act, int nIn, int nb)
+        => act != null ? DotAct(w, act, nb) : Dot(w, y, nIn);
 
     /// <summary>
     /// One parallel region over several weights sharing the same Q8_K activation:
@@ -523,6 +588,15 @@ public static unsafe class Q6K
         int nb = nIn / Qk.SuperBlock;
         int total = n0 + n1 + n2;
         int next = 0;
+        NativeBuffer? actOwned = UseVecAct && nb > 64 ? new NativeBuffer((nuint)(nb * sizeof(BlockQ8KAct))) : null;
+        BlockQ8KAct* actStack = stackalloc BlockQ8KAct[UseVecAct && actOwned == null ? nb : 0];
+        BlockQ8KAct* act = actOwned != null ? (BlockQ8KAct*)actOwned.Pointer : UseVecAct ? actStack : null;
+        if (act != null)
+            Q8K.ToVecAct(y, act, nb);
+
+        // Dynamic chunks: a worker on a slow memory patch takes fewer rows
+        // instead of gating the whole GEMV (same trick as ggml mul_mat).
+        // ~16 claims per worker keeps each claim a long contiguous stream.
         void Body(int worker, int workers)
         {
             int chunk = Math.Max(8, total / (workers * 16));
@@ -533,21 +607,28 @@ public static unsafe class Q6K
                 int r0 = Math.Clamp(begin, 0, n0);
                 int r1 = Math.Clamp(end, 0, n0);
                 for (int row = r0; row < r1; row++)
-                    d0[row] = Dot(w0 + row * nb, y, nIn);
+                    d0[row] = Row(w0 + row * nb, y, act, nIn, nb);
                 r0 = Math.Clamp(begin - n0, 0, n1);
                 r1 = Math.Clamp(end - n0, 0, n1);
                 for (int row = r0; row < r1; row++)
-                    d1[row] = Dot(w1 + row * nb, y, nIn);
+                    d1[row] = Row(w1 + row * nb, y, act, nIn, nb);
                 r0 = Math.Clamp(begin - n0 - n1, 0, n2);
                 r1 = Math.Clamp(end - n0 - n1, 0, n2);
                 for (int row = r0; row < r1; row++)
-                    d2[row] = Dot(w2 + row * nb, y, nIn);
+                    d2[row] = Row(w2 + row * nb, y, act, nIn, nb);
             }
         }
 
-        if (pool == null || total == 0)
-            Body(0, 1);
-        else
-            pool.For(total, Body);
+        try
+        {
+            if (pool == null || total == 0)
+                Body(0, 1);
+            else
+                pool.For(total, Body);
+        }
+        finally
+        {
+            actOwned?.Dispose();
+        }
     }
 }

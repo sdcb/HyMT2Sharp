@@ -111,5 +111,5 @@ public static unsafe class MulMatQ6K
     }
 
     private static void DequantBlock(byte* p, float* dst) =>
-        Q6K.DequantizeRow((BlockQ6K*)p, dst, Qk.SuperBlock);
+        Q6K.DequantizeBlockVec((BlockQ6K*)p, dst);
 }

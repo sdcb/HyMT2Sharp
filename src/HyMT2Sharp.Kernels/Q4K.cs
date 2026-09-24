@@ -1,3 +1,4 @@
+using System.Numerics;
 using System.Runtime.CompilerServices;
 
 namespace Sdcb.HyMT2Sharp.Kernels;
@@ -57,6 +58,50 @@ public static unsafe class Q4K
                 iscale += 2;
             }
         }
+    }
+
+    /// <summary>One superblock → 256 floats via <see cref="Vector{T}"/> nibble widening.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static void DequantizeBlockVec(BlockQ4K* x, float* y)
+    {
+        if (Vector<byte>.Count > 32)
+        {
+            DequantizeRow(x, y, Qk.SuperBlock);
+            return;
+        }
+
+        uint* utmp = stackalloc uint[4];
+        UnpackScales(x->Scales, utmp);
+        byte* sc = (byte*)utmp;
+        byte* mn = (byte*)(utmp + 2);
+        float d = HalfBits.ToSingle(x->D);
+        float dmin = HalfBits.ToSingle(x->Dmin);
+        byte* q = x->Qs;
+        Vector<byte> m4 = new(0x0F);
+        for (int j = 0; j < 4; j++, q += 32, y += 64)
+        {
+            Vector<float> a0 = new(d * sc[2 * j]), b0 = new(dmin * mn[2 * j]);
+            Vector<float> a1 = new(d * sc[2 * j + 1]), b1 = new(dmin * mn[2 * j + 1]);
+            for (int l = 0; l < 32; l += Vector<byte>.Count)
+            {
+                Vector<byte> pk = VecI8.LoadU8(q + l);
+                StoreNibbles(pk & m4, a0, b0, y + l);
+                StoreNibbles(pk >> 4, a1, b1, y + 32 + l);
+            }
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void StoreNibbles(Vector<byte> v, Vector<float> a, Vector<float> b, float* y)
+    {
+        int n = Vector<int>.Count;
+        Vector.Widen(v, out Vector<ushort> lo, out Vector<ushort> hi);
+        Vector.Widen(lo, out Vector<uint> u0, out Vector<uint> u1);
+        Vector.Widen(hi, out Vector<uint> u2, out Vector<uint> u3);
+        VecF.Store(y, Vector.MultiplyAddEstimate(Vector.ConvertToSingle(Vector.AsVectorInt32(u0)), a, -b));
+        VecF.Store(y + n, Vector.MultiplyAddEstimate(Vector.ConvertToSingle(Vector.AsVectorInt32(u1)), a, -b));
+        VecF.Store(y + 2 * n, Vector.MultiplyAddEstimate(Vector.ConvertToSingle(Vector.AsVectorInt32(u2)), a, -b));
+        VecF.Store(y + 3 * n, Vector.MultiplyAddEstimate(Vector.ConvertToSingle(Vector.AsVectorInt32(u3)), a, -b));
     }
 
     /// <summary>

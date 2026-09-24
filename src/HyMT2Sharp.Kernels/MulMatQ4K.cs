@@ -27,21 +27,7 @@ public static unsafe class MulMatQ4K
     }
 
     public static void GemvPrequant(BlockQ4K* weights, BlockQ8K* y, float* output, int nIn, int nOut, CpuThreadPool? pool = null)
-    {
-        int nb = nIn / Qk.SuperBlock;
-        void Body(int worker, int workers)
-        {
-            int begin = nOut * worker / workers;
-            int end = nOut * (worker + 1) / workers;
-            for (int row = begin; row < end; row++)
-                output[row] = VecDotQ4K.Dot(weights + row * nb, y, nIn);
-        }
-
-        if (pool == null)
-            Body(0, 1);
-        else
-            pool.For(nOut, Body);
-    }
+        => KQuantGemv.Multi(y, nIn, pool, new KGemvTarget(weights, null, output, nOut), default);
 
     public static void Gemm(BlockQ4Kx8* packed, BlockQ4K* rows, float* input, float* output, int nIn, int nOut, int tokens, CpuThreadPool? pool = null, ScratchArena? scratch = null, BlockQ4Kx8Meta* meta = null)
     {
@@ -146,7 +132,7 @@ public static unsafe class MulMatQ4K
     }
 
     private static void DequantBlock(byte* p, float* dst) =>
-        Q4K.DequantizeRow((BlockQ4K*)p, dst, Qk.SuperBlock);
+        Q4K.DequantizeBlockVec((BlockQ4K*)p, dst);
 
     public static void QuantizeAligned(float* input, BlockQ8Kx4* q8, int nIn, int tokens, CpuThreadPool? pool)
     {

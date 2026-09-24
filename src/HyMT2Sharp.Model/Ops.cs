@@ -403,6 +403,26 @@ public static unsafe class Ops
                         }
                     }
                 }
+                else if (!Simd.UseAvx && headDim % Vector<float>.Count == 0)
+                {
+                    for (; qt + 1 < qLen; qt += 2)
+                    {
+                        float* q0 = q + qt * qDim + h * headDim;
+                        float* q1 = q0 + qDim;
+                        float* row0 = scores + (h * qLen + qt) * kvLen;
+                        float* row1 = row0 + kvLen;
+                        int allowed = Math.Min(kvLen, startPos + qt + 2);
+                        int kt = 0;
+                        for (; kt + 3 < allowed; kt += 4)
+                            Dot2x4Vec(q0, q1, kBase + kt * kvStride, kvStride, headDim, row0 + kt, row1 + kt, scale);
+                        for (; kt < allowed; kt++)
+                        {
+                            float* kh = kBase + kt * kvStride;
+                            row0[kt] = DotF32(q0, kh, headDim) * scale;
+                            row1[kt] = DotF32(q1, kh, headDim) * scale;
+                        }
+                    }
+                }
 
                 for (; qt < qLen; qt++)
                 {
@@ -489,6 +509,11 @@ public static unsafe class Ops
                     for (; d + 63 < headDim; d += 64)
                         Axpy64(row, vBase + d, kvStride, allowed, outH + d);
                 }
+                else if (!Simd.UseAvx)
+                {
+                    for (; d + 8 * Vector<float>.Count <= headDim; d += 8 * Vector<float>.Count)
+                        AxpyRegVec(row, vBase + d, kvStride, allowed, outH + d);
+                }
 
                 if (d < headDim)
                 {
@@ -541,6 +566,11 @@ public static unsafe class Ops
                         // 64 output dims live in 8 accumulators; V streams through once per half.
                         for (; d + 63 < headDim; d += 64)
                             Axpy64(row, vBase + d, kvStride, allowed, outH + d);
+                    }
+                    else if (!Simd.UseAvx)
+                    {
+                        for (; d + 8 * Vector<float>.Count <= headDim; d += 8 * Vector<float>.Count)
+                            AxpyRegVec(row, vBase + d, kvStride, allowed, outH + d);
                     }
 
                     if (d < headDim)
@@ -598,12 +628,12 @@ public static unsafe class Ops
             Vector<float> v1 = Vector<float>.Zero;
             for (; i + 2 * Vector<float>.Count <= n; i += 2 * Vector<float>.Count)
             {
-                v0 += VecF.Load(a + i) * VecF.Load(b + i);
-                v1 += VecF.Load(a + i + Vector<float>.Count) * VecF.Load(b + i + Vector<float>.Count);
+                v0 = Vector.MultiplyAddEstimate(VecF.Load(a + i), VecF.Load(b + i), v0);
+                v1 = Vector.MultiplyAddEstimate(VecF.Load(a + i + Vector<float>.Count), VecF.Load(b + i + Vector<float>.Count), v1);
             }
 
             for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
-                v0 += VecF.Load(a + i) * VecF.Load(b + i);
+                v0 = Vector.MultiplyAddEstimate(VecF.Load(a + i), VecF.Load(b + i), v0);
 
             sum = Vector.Sum(v0 + v1);
         }
@@ -749,6 +779,74 @@ public static unsafe class Ops
         dst[3] = s3 * scale;
     }
 
+    /// <summary>Portable <see cref="Dot2x4"/>: two q rows share each K load; n is a multiple of Vector&lt;float&gt;.Count.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Dot2x4Vec(float* q0, float* q1, float* k, int kvStride, int n, float* dst0, float* dst1, float scale)
+    {
+        float* k1 = k + kvStride;
+        float* k2 = k1 + kvStride;
+        float* k3 = k2 + kvStride;
+        Vector<float> a00 = Vector<float>.Zero, a01 = Vector<float>.Zero, a02 = Vector<float>.Zero, a03 = Vector<float>.Zero;
+        Vector<float> a10 = Vector<float>.Zero, a11 = Vector<float>.Zero, a12 = Vector<float>.Zero, a13 = Vector<float>.Zero;
+        for (int i = 0; i < n; i += Vector<float>.Count)
+        {
+            Vector<float> v0 = VecF.Load(k + i);
+            Vector<float> v1 = VecF.Load(k1 + i);
+            Vector<float> v2 = VecF.Load(k2 + i);
+            Vector<float> v3 = VecF.Load(k3 + i);
+            Vector<float> x0 = VecF.Load(q0 + i);
+            a00 = Vector.MultiplyAddEstimate(x0, v0, a00);
+            a01 = Vector.MultiplyAddEstimate(x0, v1, a01);
+            a02 = Vector.MultiplyAddEstimate(x0, v2, a02);
+            a03 = Vector.MultiplyAddEstimate(x0, v3, a03);
+            Vector<float> x1 = VecF.Load(q1 + i);
+            a10 = Vector.MultiplyAddEstimate(x1, v0, a10);
+            a11 = Vector.MultiplyAddEstimate(x1, v1, a11);
+            a12 = Vector.MultiplyAddEstimate(x1, v2, a12);
+            a13 = Vector.MultiplyAddEstimate(x1, v3, a13);
+        }
+
+        dst0[0] = Vector.Sum(a00) * scale;
+        dst0[1] = Vector.Sum(a01) * scale;
+        dst0[2] = Vector.Sum(a02) * scale;
+        dst0[3] = Vector.Sum(a03) * scale;
+        dst1[0] = Vector.Sum(a10) * scale;
+        dst1[1] = Vector.Sum(a11) * scale;
+        dst1[2] = Vector.Sum(a12) * scale;
+        dst1[3] = Vector.Sum(a13) * scale;
+    }
+
+    /// <summary>Portable <see cref="Axpy64"/>: dst[0..8V) = Σ_kt w[kt] · v[kt][0..8V), accumulators in registers.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void AxpyRegVec(float* w, float* v, int kvStride, int count, float* dst)
+    {
+        int V = Vector<float>.Count;
+        Vector<float> a0 = Vector<float>.Zero, a1 = Vector<float>.Zero, a2 = Vector<float>.Zero, a3 = Vector<float>.Zero;
+        Vector<float> a4 = Vector<float>.Zero, a5 = Vector<float>.Zero, a6 = Vector<float>.Zero, a7 = Vector<float>.Zero;
+        for (int kt = 0; kt < count; kt++)
+        {
+            Vector<float> wv = new(w[kt]);
+            float* row = v + kt * kvStride;
+            a0 = Vector.MultiplyAddEstimate(wv, VecF.Load(row), a0);
+            a1 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + V), a1);
+            a2 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 2 * V), a2);
+            a3 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 3 * V), a3);
+            a4 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 4 * V), a4);
+            a5 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 5 * V), a5);
+            a6 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 6 * V), a6);
+            a7 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 7 * V), a7);
+        }
+
+        VecF.Store(dst, a0);
+        VecF.Store(dst + V, a1);
+        VecF.Store(dst + 2 * V, a2);
+        VecF.Store(dst + 3 * V, a3);
+        VecF.Store(dst + 4 * V, a4);
+        VecF.Store(dst + 5 * V, a5);
+        VecF.Store(dst + 6 * V, a6);
+        VecF.Store(dst + 7 * V, a7);
+    }
+
     /// <summary>Portable counterpart of <see cref="DotF32x4"/> using <see cref="Vector{T}"/>.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
     private static void DotF32x4Vec(float* q, float* k0, float* k1, float* k2, float* k3, int n, float* dst, float scale)
@@ -761,10 +859,10 @@ public static unsafe class Ops
         for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
         {
             Vector<float> qv = VecF.Load(q + i);
-            acc0 += qv * VecF.Load(k0 + i);
-            acc1 += qv * VecF.Load(k1 + i);
-            acc2 += qv * VecF.Load(k2 + i);
-            acc3 += qv * VecF.Load(k3 + i);
+            acc0 = Vector.MultiplyAddEstimate(qv, VecF.Load(k0 + i), acc0);
+            acc1 = Vector.MultiplyAddEstimate(qv, VecF.Load(k1 + i), acc1);
+            acc2 = Vector.MultiplyAddEstimate(qv, VecF.Load(k2 + i), acc2);
+            acc3 = Vector.MultiplyAddEstimate(qv, VecF.Load(k3 + i), acc3);
         }
 
         float s0 = Vector.Sum(acc0);
@@ -819,7 +917,7 @@ public static unsafe class Ops
         {
             Vector<float> av = new Vector<float>(a);
             for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
-                VecF.Store(y + i, av * VecF.Load(x + i) + VecF.Load(y + i));
+                VecF.Store(y + i, Vector.MultiplyAddEstimate(av, VecF.Load(x + i), VecF.Load(y + i)));
         }
 
         for (; i < n; i++)

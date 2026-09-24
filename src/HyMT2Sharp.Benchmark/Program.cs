@@ -30,6 +30,12 @@ if (args.Contains("--micro-q4"))
     return;
 }
 
+if (args.Contains("--micro-vec-q4"))
+{
+    MicroVecQ4(Args.GetInt(args, "--micro-in", 2048), Args.GetInt(args, "--micro-out", 6144), Args.GetInt(args, "--micro-tokens", 512), Args.GetInt(args, "--micro-reps", 5), threads);
+    return;
+}
+
 if (args.Contains("--micro-q8"))
 {
     if (args.Contains("--micro-model"))
@@ -221,6 +227,41 @@ static unsafe void MicroQ4(int nIn, int nOut, int tokens, int reps)
     double macs = (double)nIn * nOut * tokens * reps;
     double maddubs = macs / 32;
     Console.WriteLine($"micro-q4 in={nIn} out={nOut} tokens={tokens} weights={(nOut / 8) * nb * Qk.Q4Kx8Size / 1024}KB act={(tokens / 4) * nb * Qk.Q8Kx4Size / 1024}KB  {sw.Elapsed.TotalMilliseconds:F1} ms  {macs / sw.Elapsed.TotalSeconds / 1e9:F1} GMAC/s  {maddubs / sw.Elapsed.TotalSeconds / 1e9:F2} G-maddubs/s (peak ~9 at 4.5GHz)");
+}
+
+static unsafe void MicroVecQ4(int nIn, int nOut, int tokens, int reps, int threads)
+{
+    int nb = nIn / Qk.SuperBlock;
+    using CpuThreadPool pool = new(threads);
+    using NativeBuffer q4 = new((nuint)((long)nOut * nb * Qk.Q4KSize));
+    using NativeBuffer dst = new((nuint)((long)tokens * nOut * sizeof(float)));
+    using NativeBuffer src = new((nuint)((long)tokens * nIn * sizeof(float)));
+    using ScratchArena scratch = new();
+    float* input = (float*)src.Pointer;
+    for (long i = 0; i < (long)tokens * nIn; i++)
+        input[i] = MathF.Sin(i * 0.37f);
+    BlockQ4K* rows = (BlockQ4K*)q4.Pointer;
+    for (int r = 0; r < nOut; r++)
+        Q4K.PackSimple(input + (r % tokens) * nIn, rows + r * nb, nIn);
+
+    Console.WriteLine($"micro-vec-q4 in={nIn} out={nOut} tokens={tokens} threads={threads} V={System.Numerics.Vector<float>.Count} portable={Simd.ForcePortable}");
+    MulMatQ4K.Gemm(null, rows, input, (float*)dst.Pointer, nIn, nOut, tokens, pool, scratch);
+    Stopwatch sw = Stopwatch.StartNew();
+    for (int i = 0; i < reps; i++)
+        MulMatQ4K.Gemm(null, rows, input, (float*)dst.Pointer, nIn, nOut, tokens, pool, scratch);
+    sw.Stop();
+    double flops = 2.0 * nIn * nOut * tokens * reps;
+    Console.WriteLine($"  gemm  {sw.Elapsed.TotalMilliseconds / reps:F2} ms/call  {flops / sw.Elapsed.TotalSeconds / 1e9:F1} GFLOP/s");
+
+    int gemvReps = reps * 200;
+    for (int i = 0; i < 50; i++)
+        MulMatQ4K.Gemv(rows, input, (float*)dst.Pointer, nIn, nOut, pool, scratch);
+    sw.Restart();
+    for (int i = 0; i < gemvReps; i++)
+        MulMatQ4K.Gemv(rows, input, (float*)dst.Pointer, nIn, nOut, pool, scratch);
+    sw.Stop();
+    double bytes = (double)nOut * nb * Qk.Q4KSize * gemvReps;
+    Console.WriteLine($"  gemv  {sw.Elapsed.TotalMilliseconds * 1000 / gemvReps:F1} us/call  {bytes / sw.Elapsed.TotalSeconds / 1e9:F1} GB/s");
 }
 
 static unsafe void MicroQ8(int nIn, int nOut, int reps, int threads)

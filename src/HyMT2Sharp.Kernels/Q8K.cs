@@ -135,4 +135,24 @@ public static unsafe class Q8K
     }
 
     public static int RowBytes(int k) => (k / Qk.SuperBlock) * Qk.Q8KSize;
+
+    /// <summary>Builds the even/odd i16 <see cref="BlockQ8KAct"/> view used by the portable GEMV kernels.</summary>
+    public static void ToVecAct(BlockQ8K* y, BlockQ8KAct* a, int nb)
+    {
+        for (int i = 0; i < nb; i++)
+        {
+            a[i].D = y[i].D;
+            for (int g = 0; g < 8; g++)
+            {
+                a[i].Bs[g] = y[i].Bsums[2 * g] + y[i].Bsums[2 * g + 1];
+                sbyte* src = y[i].Qs + 32 * g;
+                short* dst = a[i].A + 32 * g;
+                for (int m = 0; m < 16; m++)
+                {
+                    dst[m] = src[2 * m];
+                    dst[16 + m] = src[2 * m + 1];
+                }
+            }
+        }
+    }
 }

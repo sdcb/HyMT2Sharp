@@ -14,38 +14,77 @@ public static unsafe class VecDotQ4K
         return DotVec(x, y, n);
     }
 
-    /// <summary>Portable widening fallback; same structure as <see cref="DotScalar"/>.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    /// <summary>Portable single-row entry: builds the <see cref="BlockQ8KAct"/> view, then <see cref="DotAct"/>.</summary>
     public static float DotVec(BlockQ4K* x, BlockQ8K* y, int n)
     {
+        if (!VecI8.PairLayoutSupported)
+            return DotScalar(x, y, n);
         int nb = n / Qk.SuperBlock;
-        uint* utmp = stackalloc uint[4];
-        float sumf = 0;
-        for (int i = 0; i < nb; i++)
+        BlockQ8KAct* act = stackalloc BlockQ8KAct[nb];
+        Q8K.ToVecAct(y, act, nb);
+        return DotAct(x, act, nb);
+    }
+
+    /// <summary>
+    /// Portable Q4_K row dot. Packed bytes load as u16 lanes, so the four nibbles of a
+    /// lane come out with and/shift and are already i16 — no byte widening. Pairwise i16
+    /// products (≤ 2·15·128) fold to i32 with in-lane shifts (lane order is irrelevant for
+    /// a sum), get scaled in-vector, and reduce horizontally once per row.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotAct(BlockQ4K* x, BlockQ8KAct* a, int nb)
+    {
+        const uint kmask1 = 0x3f3f3f3f;
+        const uint kmask2 = 0x0f0f0f0f;
+        const uint kmask3 = 0x03030303;
+        int U = Vector<ushort>.Count;
+        Vector<ushort> m4 = new(0x000F);
+        Vector<float> acc = Vector<float>.Zero;
+        float minAcc = 0;
+        for (int i = 0; i < nb; i++, x++, a++)
         {
-            Q4K.UnpackScales(x[i].Scales, utmp);
-            byte* scales = (byte*)utmp;
-            byte* mins = (byte*)(utmp + 2);
+            uint u0 = Unsafe.ReadUnaligned<uint>(x->Scales);
+            uint u1 = Unsafe.ReadUnaligned<uint>(x->Scales + 4);
+            uint u2 = Unsafe.ReadUnaligned<uint>(x->Scales + 8);
+            uint sc03 = u0 & kmask1;
+            uint sc47 = (u2 & kmask2) | (((u0 >> 6) & kmask3) << 4);
+            uint mn03 = u1 & kmask1;
+            uint mn47 = ((u2 >> 4) & kmask2) | (((u1 >> 6) & kmask3) << 4);
 
-            int sumi = 0;
-            for (int j = 0; j < Qk.SuperBlock / 16; j++)
-                sumi += y[i].Bsums[j] * mins[j / 2];
+            int* bs = a->Bs;
+            int mins = (int)(mn03 & 0xFF) * bs[0] + (int)((mn03 >> 8) & 0xFF) * bs[1]
+                + (int)((mn03 >> 16) & 0xFF) * bs[2] + (int)(mn03 >> 24) * bs[3]
+                + (int)(mn47 & 0xFF) * bs[4] + (int)((mn47 >> 8) & 0xFF) * bs[5]
+                + (int)((mn47 >> 16) & 0xFF) * bs[6] + (int)(mn47 >> 24) * bs[7];
 
-            byte* q4 = x[i].Qs;
-            sbyte* q8 = y[i].Qs;
-            int acc = 0;
-            for (int j = 0; j < Qk.SuperBlock / 64; j++)
+            Vector<int> sumi = Vector<int>.Zero;
+            byte* q = x->Qs;
+            short* A = a->A;
+            for (int j = 0; j < 4; j++, q += 32, A += 64)
             {
-                VecI8.DotNibblesI8(q4 + j * 32, q8 + j * 64, q8 + j * 64 + 32, out int lo, out int hi);
-                acc += scales[2 * j] * lo + scales[2 * j + 1] * hi;
+                uint scw = j < 2 ? sc03 : sc47;
+                int sh = (j & 1) * 16;
+                Vector<int> sl = new((int)((scw >> sh) & 0xFF));
+                Vector<int> shv = new((int)((scw >> (sh + 8)) & 0xFF));
+                for (int m = 0; m < 16; m += U)
+                {
+                    Vector<ushort> v = Unsafe.ReadUnaligned<Vector<ushort>>(q + 2 * m);
+                    Vector<short> n0 = Vector.AsVectorInt16(v & m4);
+                    Vector<short> n1 = Vector.AsVectorInt16((v >> 4) & m4);
+                    Vector<short> n2 = Vector.AsVectorInt16((v >> 8) & m4);
+                    Vector<short> n3 = Vector.AsVectorInt16(v >> 12);
+                    Vector<short> pl = n0 * VecI8.LoadS16(A + m) + n2 * VecI8.LoadS16(A + 16 + m);
+                    Vector<short> ph = n1 * VecI8.LoadS16(A + 32 + m) + n3 * VecI8.LoadS16(A + 48 + m);
+                    sumi += VecI8.Fold(pl) * sl + VecI8.Fold(ph) * shv;
+                }
             }
 
-            float d = HalfBits.ToSingle(x[i].D) * y[i].D;
-            float dmin = HalfBits.ToSingle(x[i].Dmin) * y[i].D;
-            sumf += d * acc - dmin * sumi;
+            float yd = a->D;
+            acc = Vector.MultiplyAddEstimate(Vector.ConvertToSingle(sumi), new Vector<float>(HalfBits.ToSingle(x->D) * yd), acc);
+            minAcc += HalfBits.ToSingle(x->Dmin) * yd * mins;
         }
 
-        return sumf;
+        return Vector.Sum(acc) - minAcc;
     }
 
     public static float DotScalar(BlockQ4K* x, BlockQ8K* y, int n)

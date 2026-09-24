@@ -19,6 +19,23 @@ public static unsafe class VecI8
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static Vector<byte> LoadU8(byte* p) => Unsafe.ReadUnaligned<Vector<byte>>(p);
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector<short> LoadS16(short* p) => Unsafe.ReadUnaligned<Vector<short>>(p);
+
+    /// <summary>
+    /// The <see cref="BlockQ8KAct"/> kernels walk 16 u16 lanes per 32-value group, so
+    /// they need Vector&lt;ushort&gt; of at most 16 lanes (128/256-bit Vector&lt;T&gt;).
+    /// </summary>
+    public static bool PairLayoutSupported => Vector<ushort>.Count <= 16;
+
+    /// <summary>Pairwise i16 → i32 sum via in-lane shifts; lane order is irrelevant for a dot.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public static Vector<int> Fold(Vector<short> p)
+    {
+        Vector<int> v = Vector.AsVectorInt32(p);
+        return Vector.ShiftRightArithmetic(Vector.ShiftLeft(v, 16), 16) + Vector.ShiftRightArithmetic(v, 16);
+    }
+
     /// <summary>acc += Σ w[k]·a[k]; each i16 pair stays in range under the ±127 activation bound.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public static void AccDotI8(Vector<sbyte> w, Vector<sbyte> a, ref Vector<int> acc)

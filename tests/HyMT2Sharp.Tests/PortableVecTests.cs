@@ -415,6 +415,197 @@ public sealed class PortableVecTests
         }
     }
 
+    [Fact]
+    public void HalfBits_ToSingle_MatchesBclForEveryBitPattern()
+    {
+        for (int bits = 0; bits <= ushort.MaxValue; bits++)
+        {
+            float expected = (float)BitConverter.UInt16BitsToHalf((ushort)bits);
+            float actual = HalfBits.ToSingle((ushort)bits);
+            Assert.True(BitConverter.SingleToUInt32Bits(expected) == BitConverter.SingleToUInt32Bits(actual) || (float.IsNaN(expected) && float.IsNaN(actual)),
+                $"0x{bits:X4}: {actual} vs {expected}");
+        }
+    }
+
+    [Fact]
+    public unsafe void Q4K_DequantizeBlockVec_MatchesScalar()
+    {
+        const int nb = 3;
+        using NativeBuffer w = new((nuint)(nb * sizeof(BlockQ4K)));
+        using NativeBuffer a = new((nuint)(nb * Qk.SuperBlock * sizeof(float)));
+        using NativeBuffer b = new((nuint)(Qk.SuperBlock * sizeof(float)));
+        FillQ4K((BlockQ4K*)w.Pointer, nb, 120);
+        Q4K.DequantizeRow((BlockQ4K*)w.Pointer, (float*)a.Pointer, nb * Qk.SuperBlock);
+        for (int i = 0; i < nb; i++)
+        {
+            Q4K.DequantizeBlockVec((BlockQ4K*)w.Pointer + i, (float*)b.Pointer);
+            for (int j = 0; j < Qk.SuperBlock; j++)
+            {
+                float e = ((float*)a.Pointer)[i * Qk.SuperBlock + j];
+                float g = ((float*)b.Pointer)[j];
+                Assert.True(MathF.Abs(e - g) <= 1e-6f * MathF.Max(1f, MathF.Abs(e)), $"block {i} [{j}] {g} vs {e}");
+            }
+        }
+    }
+
+    [Fact]
+    public unsafe void Q6K_DequantizeBlockVec_MatchesScalar()
+    {
+        const int nb = 3;
+        using NativeBuffer w = new((nuint)(nb * sizeof(BlockQ6K)));
+        using NativeBuffer a = new((nuint)(nb * Qk.SuperBlock * sizeof(float)));
+        using NativeBuffer b = new((nuint)(Qk.SuperBlock * sizeof(float)));
+        FillQ6K((BlockQ6K*)w.Pointer, nb, 121);
+        Q6K.DequantizeRow((BlockQ6K*)w.Pointer, (float*)a.Pointer, nb * Qk.SuperBlock);
+        for (int i = 0; i < nb; i++)
+        {
+            Q6K.DequantizeBlockVec((BlockQ6K*)w.Pointer + i, (float*)b.Pointer);
+            for (int j = 0; j < Qk.SuperBlock; j++)
+                Assert.Equal(((float*)a.Pointer)[i * Qk.SuperBlock + j], ((float*)b.Pointer)[j]);
+        }
+    }
+
+    /// <summary>Extreme activations (±127, and the −128 the i16 bound must still tolerate) and max nibbles/6-bit codes.</summary>
+    [Fact]
+    public unsafe void DotAct_ExtremeValues_MatchScalar()
+    {
+        const int nb = 2;
+        const int n = nb * Qk.SuperBlock;
+        using NativeBuffer q4 = new((nuint)(nb * sizeof(BlockQ4K)));
+        using NativeBuffer q6 = new((nuint)(nb * sizeof(BlockQ6K)));
+        using NativeBuffer y = new((nuint)(nb * sizeof(BlockQ8K)));
+        BlockQ4K* w4 = (BlockQ4K*)q4.Pointer;
+        BlockQ6K* w6 = (BlockQ6K*)q6.Pointer;
+        BlockQ8K* a = (BlockQ8K*)y.Pointer;
+        for (int b = 0; b < nb; b++)
+        {
+            w4[b].D = HalfBits.FromSingle(0.5f);
+            w4[b].Dmin = HalfBits.FromSingle(0.25f);
+            w6[b].D = HalfBits.FromSingle(0.5f);
+            for (int j = 0; j < Qk.ScaleBytes; j++)
+                w4[b].Scales[j] = 0xFF;
+            for (int j = 0; j < Qk.SuperBlock / 2; j++)
+            {
+                w4[b].Qs[j] = 0xFF;
+                w6[b].Ql[j] = (byte)(b == 0 ? 0xFF : 0x00);
+            }
+            for (int j = 0; j < Qk.SuperBlock / 4; j++)
+                w6[b].Qh[j] = (byte)(b == 0 ? 0xFF : 0x00);
+            for (int j = 0; j < Qk.SuperBlock / 16; j++)
+                w6[b].Scales[j] = (sbyte)(j % 2 == 0 ? 127 : -128);
+
+            a[b].D = 0.01f;
+            int bs = 0;
+            for (int j = 0; j < Qk.SuperBlock; j++)
+            {
+                a[b].Qs[j] = (sbyte)(b == 0 ? 127 : -128);
+                bs += a[b].Qs[j];
+                if ((j & 15) == 15)
+                {
+                    a[b].Bsums[j / 16] = (short)bs;
+                    bs = 0;
+                }
+            }
+        }
+
+        float s4 = VecDotQ4K.DotScalar(w4, a, n);
+        float v4 = VecDotQ4K.DotVec(w4, a, n);
+        Assert.True(MathF.Abs(s4 - v4) <= 1e-4f * MathF.Abs(s4), $"q4 scalar {s4} vs vec {v4}");
+        float s6 = Q6K.DotScalar(w6, a, n);
+        float v6 = Q6K.DotVec(w6, a, n);
+        Assert.True(MathF.Abs(s6 - v6) <= 1e-4f * MathF.Abs(s6), $"q6 scalar {s6} vs vec {v6}");
+    }
+
+    [Fact]
+    public unsafe void KQuantGemv_MixedTargets_MatchPerRowScalar()
+    {
+        const int nIn = Qk.SuperBlock * 2;
+        const int nb = nIn / Qk.SuperBlock;
+        const int n0 = 13, n1 = 7, n2 = 21;
+        using NativeBuffer w0 = new((nuint)(n0 * nb * sizeof(BlockQ4K)));
+        using NativeBuffer w1 = new((nuint)(n1 * nb * sizeof(BlockQ4K)));
+        using NativeBuffer w2 = new((nuint)(n2 * nb * sizeof(BlockQ6K)));
+        using NativeBuffer y = new((nuint)(nb * sizeof(BlockQ8K)));
+        using NativeBuffer d = new((nuint)((n0 + n1 + n2) * sizeof(float)));
+        FillQ4K((BlockQ4K*)w0.Pointer, n0 * nb, 122);
+        FillQ4K((BlockQ4K*)w1.Pointer, n1 * nb, 123);
+        FillQ6K((BlockQ6K*)w2.Pointer, n2 * nb, 124);
+        FillQ8K((BlockQ8K*)y.Pointer, nb, 125);
+        float* d0 = (float*)d.Pointer;
+        float* d1 = d0 + n0;
+        float* d2 = d1 + n1;
+        using CpuThreadPool pool = new(4);
+        KQuantGemv.Multi((BlockQ8K*)y.Pointer, nIn, pool,
+            new KGemvTarget((BlockQ4K*)w0.Pointer, null, d0, n0),
+            new KGemvTarget((BlockQ4K*)w1.Pointer, null, d1, n1),
+            new KGemvTarget(null, (BlockQ6K*)w2.Pointer, d2, n2));
+
+        for (int r = 0; r < n0; r++)
+            AssertClose(VecDotQ4K.DotScalar((BlockQ4K*)w0.Pointer + r * nb, (BlockQ8K*)y.Pointer, nIn), d0[r], $"q {r}");
+        for (int r = 0; r < n1; r++)
+            AssertClose(VecDotQ4K.DotScalar((BlockQ4K*)w1.Pointer + r * nb, (BlockQ8K*)y.Pointer, nIn), d1[r], $"k {r}");
+        for (int r = 0; r < n2; r++)
+            AssertClose(Q6K.DotScalar((BlockQ6K*)w2.Pointer + r * nb, (BlockQ8K*)y.Pointer, nIn), d2[r], $"v {r}");
+
+        static void AssertClose(float e, float g, string what) =>
+            Assert.True(MathF.Abs(e - g) <= 1e-3f * MathF.Max(1f, MathF.Abs(e)), $"{what}: {g} vs {e}");
+    }
+
+    /// <summary>
+    /// Ragged shapes for the packed outer-product GEMM: token count not a multiple of the
+    /// 6-token tile, rows not a multiple of the 2V-row panel, worker ranges with a partial panel group.
+    /// </summary>
+    [Theory]
+    [InlineData(2, 1)]
+    [InlineData(13, 37)]
+    [InlineData(64, 100)]
+    public unsafe void Q4K_RowGemm_RaggedShapes_MatchDequantDot(int tokens, int nOut)
+    {
+        const int nIn = Qk.SuperBlock * 2;
+        const int nb = nIn / Qk.SuperBlock;
+        float[] a = RandomRow(tokens * nIn, 126);
+        using NativeBuffer q4 = new((nuint)((long)nOut * nb * Qk.Q4KSize));
+        using NativeBuffer got = new((nuint)((long)tokens * nOut * sizeof(float)));
+        using NativeBuffer dw = new((nuint)(nOut * nIn * sizeof(float)));
+        FillQ4K((BlockQ4K*)q4.Pointer, nOut * nb, 127);
+        BlockQ4K* rows = (BlockQ4K*)q4.Pointer;
+        float* dwp = (float*)dw.Pointer;
+        for (int r = 0; r < nOut; r++)
+            Q4K.DequantizeRow(rows + r * nb, dwp + r * nIn, nIn);
+        using CpuThreadPool pool = new(3);
+        fixed (float* ap = a)
+        {
+            // tokens > 1 with packed == null takes the portable VecGemmF path on every host.
+            MulMatQ4K.Gemm(null, rows, ap, (float*)got.Pointer, nIn, nOut, tokens, pool);
+            for (int t = 0; t < tokens; t++)
+            {
+                for (int r = 0; r < nOut; r++)
+                {
+                    double expected = 0;
+                    for (int i = 0; i < nIn; i++)
+                        expected += dwp[r * nIn + i] * ap[t * nIn + i];
+                    float g = ((float*)got.Pointer)[t * nOut + r];
+                    Assert.True(Math.Abs(expected - g) < 1e-3 * Math.Max(1, Math.Abs(expected)), $"t={t} r={r} exp={expected} got={g}");
+                }
+            }
+        }
+    }
+
+    private static unsafe void FillQ6K(BlockQ6K* w, int nb, int seed)
+    {
+        Random r = new(seed);
+        for (int b = 0; b < nb; b++)
+        {
+            w[b].D = HalfBits.FromSingle(0.01f + (b % 7) * 0.001f);
+            for (int j = 0; j < Qk.SuperBlock / 2; j++)
+                w[b].Ql[j] = (byte)r.Next(256);
+            for (int j = 0; j < Qk.SuperBlock / 4; j++)
+                w[b].Qh[j] = (byte)r.Next(256);
+            for (int j = 0; j < Qk.SuperBlock / 16; j++)
+                w[b].Scales[j] = (sbyte)r.Next(-128, 128);
+        }
+    }
+
     private static unsafe void FillQ4K(BlockQ4K* w, int nb, int seed)
     {
         Random r = new(seed);

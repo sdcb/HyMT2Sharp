@@ -66,17 +66,20 @@ Prefill 领先 llama.cpp 约 1.7–2.9 倍；decode 同量级、慢约 7–16%�
 
 运行时分发顺序是 AVX-VNNI → AVX2 → `Vector<T>` portable。portable 档面向 ARM64/NEON 与不支持 AVX2 的 x64，在本机可用 `HYMT2SHARP_FORCE_PORTABLE=1` 强制启用做验证。此时 `Vector<float>.Count=8`（256-bit lowering）；ARM64 上同一份代码 Count=4（128-bit NEON lowering），prefill 数字会相应更低，decode 依旧以带宽墙为主。
 
-| 量化           | portable prefill 512 | portable decode 128 | AVX2 对照（第 2 节） |
-| -------------- | -------------------: | ------------------: | -------------------: |
-| Q1.25 / STQ1_0 |            86.74 tok/s |           17.14 tok/s |      564.66 / 47.75 |
-| Q2_0C          |            92.69 tok/s |           26.02 tok/s |      488.95 / 47.53 |
-| Q4_K_M         |            89.56 tok/s |           17.82 tok/s |      423.99 / 26.55 |
-| Q6_K           |            85.06 tok/s |           20.78 tok/s |      403.25 / 22.96 |
-| Q8_0           |            87.15 tok/s |           17.16 tok/s |      319.81 / 16.60 |
+| 量化           | portable prefill 512 | portable decode 128 | 上一版 portable | AVX2 对照（第 2 节） |
+| -------------- | -------------------: | ------------------: | --------------: | -------------------: |
+| Q1.25 / STQ1_0 |          221.41 tok/s |          16.18 tok/s |   86.74 / 17.14 |      564.66 / 47.75 |
+| Q2_0C          |          211.10 tok/s |          25.55 tok/s |   92.69 / 26.02 |      488.95 / 47.53 |
+| Q4_K_M         |          225.24 tok/s |          27.00 tok/s |   89.56 / 17.82 |      423.99 / 26.55 |
+| Q6_K           |          211.33 tok/s |          22.13 tok/s |   85.06 / 20.78 |      403.25 / 22.96 |
+| Q8_0           |          231.04 tok/s |          16.85 tok/s |   87.15 / 17.16 |      319.81 / 16.60 |
 
-- Portable prefill 不走 packed panel，而是行分块 float GEMM：权重建行只反量化一次（`DequantizeRow`），8 行 tile 共享激活向量读，`Vector<float>` FMA 累加。各量化格式 prefill 因此收敛到同一水平（~85–93 tok/s），瓶颈是反量化+FMA 的算力而非内存格式。
-- Portable decode 用各格式的 `DotVec`（`Vector<T>` widen-mul-add），吞吐约为 AVX2 的 35–70%：Q2/Q4/Q6/Q8 差距小（点积结构规则），STQ 差距最大（ternary 码本查询需要 shuffle，portable 只能逐 chunk `Vector128.Shuffle`）。
-- 不设 portable 档时标量地板约为 prefill 4 / decode 2.5 tok/s（Q4_K_M，128/16 窗口实测），即 portable 相对纯标量约 20×/7×。
+- Portable prefill 走 `VecGemmF`：BLIS 式外积微内核。每个 256 宽 strip 把 2V 行（AVX2 16 行，NEON 8 行）反量化（`DequantizeBlockVec`）并转置成 `[k][2V]` panel，激活按 6 token 打包成 `[k][6]`，6×2V 个累加器整条 strip 驻留寄存器，`Vector.MultiplyAddEstimate` 生成 FMA；两个 panel 共享一次 x tile 读。单核约 84% FP32 FMA 峰值，8 线程约 800 GFLOP/s。各量化 prefill 仍收敛到同一水平（~210–230 tok/s），因为瓶颈是 float FMA 本身；再往上要走 int8 点积（ARM64 的 SDOT），`Vector<T>` 表达不了。
+- Portable decode：Q4_K/Q6_K 用 `DotAct`。每次 GEMV 先把 Q8_K 激活重排成奇偶分离的 i16（`BlockQ8KAct`），权重按 u16 lane 读入，用 and/shift 直接拆出 i16 的 nibble/6-bit 值，不做跨 lane 加宽；i16 乘积对用 lane 内移位折叠成 i32，在向量里乘 scale，每行只做一次横向求和。Q4_K_M 的 decode 已追平 AVX2，两者都卡在内存带宽上。QKV 和 gate/up 在 `KQuantGemv.Multi` 里合并成一次并行分发并动态切块（支持 Q4/Q6 混合），AVX2 档同样受益。STQ/Q2/Q8 的 decode 仍是原来的 `DotVec`。
+- Attention portable 路径补齐了 `Dot2x4Vec`（两行 q 共享 K 读）和 `AxpyRegVec`（输出驻留寄存器），prefill 的 QK/AV 耗时与 AVX2 相当。
+- 同一时段 A/B（与上一提交相同负载，Q4_K_M）：portable 65–77 → 216–218 tok/s prefill，15.7–16.0 → 26.7–27.8 tok/s decode；AVX2 prefill 持平，decode 25.8–26.5 → 28.3–28.5 tok/s（合并的混合 GEMV）。
+- `DOTNET_EnableAVX=0`（128-bit `Vector<T>`，与 NEON 同宽且无 FMA）的测试和端到端输出也已验证。
+- 不设 portable 档时标量地板约为 prefill 4 / decode 2.5 tok/s（Q4_K_M，128/16 窗口实测）。
 
 ## 6. 带宽与读数注意
 
@@ -108,4 +111,4 @@ dotnet run --project src/HyMT2Sharp.Benchmark -c Release -- `
   --model "D:\_\model\Hy-MT2-1.8B-Q4_K_M.gguf" --bench-prefill 512 --bench-decode 128 --threads 8
 ```
 
-其余量化换 `--model` 路径即可。`--micro-q8` 输出 packed GEMV 与只读带宽微基准；`--profile` 输出逐 op 分项耗时。
+其余量化换 `--model` 路径即可。`--micro-q8` 输出 packed GEMV 与只读带宽微基准；`--micro-vec-q4`（可配 `--micro-in/--micro-out/--micro-tokens/--threads`）输出 portable 档 Q4_K prefill GEMM 的 GFLOP/s 与 decode GEMV 的 GB/s；`--profile` 输出逐 op 分项耗时。
