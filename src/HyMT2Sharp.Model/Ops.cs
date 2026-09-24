@@ -863,7 +863,8 @@ public static unsafe class Ops
         Vector<float> a00 = Vector<float>.Zero, a01 = Vector<float>.Zero, a02 = Vector<float>.Zero, a03 = Vector<float>.Zero;
         Vector<float> a10 = Vector<float>.Zero, a11 = Vector<float>.Zero, a12 = Vector<float>.Zero, a13 = Vector<float>.Zero;
         int V = Vector<float>.Count;
-        for (int i = 0; i + 2 * V <= n; i += 2 * V)
+        int i = 0;
+        for (; i + 2 * V <= n; i += 2 * V)
         {
             (Vector<float> k0l, Vector<float> k0h) = LoadBf16x2(k + i);
             (Vector<float> k1l, Vector<float> k1h) = LoadBf16x2(k1 + i);
@@ -891,14 +892,30 @@ public static unsafe class Ops
             a13 = Vector.MultiplyAddEstimate(y1, k3h, a13);
         }
 
-        dst0[0] = Vector.Sum(a00) * scale;
-        dst0[1] = Vector.Sum(a01) * scale;
-        dst0[2] = Vector.Sum(a02) * scale;
-        dst0[3] = Vector.Sum(a03) * scale;
-        dst1[0] = Vector.Sum(a10) * scale;
-        dst1[1] = Vector.Sum(a11) * scale;
-        dst1[2] = Vector.Sum(a12) * scale;
-        dst1[3] = Vector.Sum(a13) * scale;
+        float s00 = Vector.Sum(a00), s01 = Vector.Sum(a01), s02 = Vector.Sum(a02), s03 = Vector.Sum(a03);
+        float s10 = Vector.Sum(a10), s11 = Vector.Sum(a11), s12 = Vector.Sum(a12), s13 = Vector.Sum(a13);
+        for (; i < n; i++)
+        {
+            float x = q0[i];
+            s00 += x * Bf16ToF32(k[i]);
+            s01 += x * Bf16ToF32(k1[i]);
+            s02 += x * Bf16ToF32(k2[i]);
+            s03 += x * Bf16ToF32(k3[i]);
+            x = q1[i];
+            s10 += x * Bf16ToF32(k[i]);
+            s11 += x * Bf16ToF32(k1[i]);
+            s12 += x * Bf16ToF32(k2[i]);
+            s13 += x * Bf16ToF32(k3[i]);
+        }
+
+        dst0[0] = s00 * scale;
+        dst0[1] = s01 * scale;
+        dst0[2] = s02 * scale;
+        dst0[3] = s03 * scale;
+        dst1[0] = s10 * scale;
+        dst1[1] = s11 * scale;
+        dst1[2] = s12 * scale;
+        dst1[3] = s13 * scale;
     }
 
     /// <summary>bf16-cache counterpart of the old fp32 64-dim axpy (AVX2): 64 output dims, 8 accumulators.</summary>

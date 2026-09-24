@@ -496,15 +496,19 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         return buf;
     }
 
-    // Reserve one scratch buffer big enough for h plus a whole layer's bumps.
-    // Called only while _scratchUsed == 0, so the old buffer holds no live
-    // pointers and can be released instead of retained in _buffers.
+    // Reserve one scratch buffer big enough for h plus a whole layer's bumps
+    // plus the trailing normed tensor. Called only while _scratchUsed == 0,
+    // so the old buffer holds no live pointers and can be released instead of
+    // retained in _buffers.
     private void EnsureScratch(int seq, int kvLen)
     {
-        long floats = (long)seq * (3L * Config.HiddenSize
-            + (long)Config.NumHeads * Config.HeadDim
+        // Per layer: n1/attn/n2/down (4·hidden) + q/ao (2·qDim) + k/v (2·kDim)
+        // + scores (heads·kvLen) + gate/up (2·ffn); plus h and normed (2·hidden).
+        long floats = (long)seq * (6L * Config.HiddenSize
+            + 2L * Config.NumHeads * Config.HeadDim
             + 2L * Config.NumKvHeads * Config.HeadDim
-            + 2L * Config.NumHeads * kvLen);
+            + (long)Config.NumHeads * kvLen
+            + 2L * Config.FfnSize);
         nuint need = (nuint)(floats * sizeof(float) + (1 << 20));
         if (_scratch != null && _scratch.Bytes >= need) return;
         if (_scratch != null)
