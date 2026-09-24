@@ -75,7 +75,6 @@ public sealed class Sampler
 
     public int Sample(Span<float> logits)
     {
-        int n = logits.Length;
         int token;
 
         ApplyPenalty(logits);
@@ -115,12 +114,16 @@ public sealed class Sampler
 
         ApplyTopPMinP(logits, ref sum);
 
-        // multinomial: cumulative-prob walk, no sort needed
+        // multinomial: cumulative-prob walk, no sort needed. Zero-prob
+        // entries must be skipped so an r of exactly 0 can't select them.
         float r = _rng.NextSingle() * sum;
         float acc = 0;
         for (int i = 0; i < n; i++)
         {
-            acc += logits[i];
+            float p = logits[i];
+            if (p <= 0f)
+                continue;
+            acc += p;
             if (acc >= r)
                 return i;
         }

@@ -110,7 +110,7 @@ public sealed class ChatCompletionService : IDisposable
 
         PromptAlignment align = _model.AlignPrompt(promptIds);
         Sampler sampler = new(request.ResolveSampling());
-        sampler.FeedHistory(align.Suffix);
+        sampler.FeedHistory(promptIds);
         Stopwatch timer = Stopwatch.StartNew();
         float[] logits = _model.Forward(align.Suffix);
         double promptMs = timer.Elapsed.TotalMilliseconds;
