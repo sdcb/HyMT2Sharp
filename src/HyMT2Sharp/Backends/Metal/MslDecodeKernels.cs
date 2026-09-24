@@ -625,7 +625,7 @@ kernel void attn_scores(
     int kvh = h * kvHeads / heads;
     int kvHere = posBase + t + 1;
     if (kvHere > kvLen) kvHere = kvLen;
-    threadgroup float qs[128];
+    threadgroup float qs[128];  // host guards headDim <= 128
     for (int i = tid; i < headDim; i += 128)
         qs[i] = q[(ulong)t * heads * headDim + h * headDim + i];
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -712,10 +712,12 @@ kernel void kv_append_multi(
     constant int& posBase [[buffer(6)]],
     device const int* tab [[buffer(7)]],
     constant int& lg [[buffer(8)]],
+    constant int& nRows [[buffer(9)]],
     uint gid [[thread_position_in_grid]])
 {
     int t = (int)gid / kDim;
     int e = (int)gid % kDim;
+    if (t >= nRows) return;
     uint prow = kv_row(tab, (uint)(posBase + t), (uint)lg);
     kDst[prow * kvStride + e] = f32_to_bf16(kSrc[gid]);
     vDst[prow * kvStride + e] = f32_to_bf16(vSrc[gid]);

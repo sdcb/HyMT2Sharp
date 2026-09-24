@@ -91,6 +91,9 @@ public sealed unsafe class MetalBackend : IComputeBackend
         _psoEmbedRowsQ6 = NewPso(lib2, "q6k_embed_rows");
         _psoRopeMulti = NewPso(lib2, "rope_neox_multi");
         _psoKvAppendMulti = NewPso(lib2, "kv_append_multi");
+        if (cfg.HeadDim > 128)
+            throw new NotSupportedException(
+                $"attn_scores/attn_combine stage q in threadgroup float[128] — headDim {cfg.HeadDim} unsupported");
         _psoAttnScores = NewPso(lib2, "attn_scores");
         _psoAttnCombine = NewPso(lib2, "attn_combine");
         _psoKvCopy = NewPso(lib2, "kv_copy_block");
@@ -164,14 +167,19 @@ public sealed unsafe class MetalBackend : IComputeBackend
             throw new NotSupportedException($"Metal KV capacity {_kvCap} exceeded at {pos + len}");
         EnsureWrittenRange(pos, len);
         int rowBytes = _kvStride * sizeof(ushort);
+        long loRow = long.MaxValue, hiRow = 0;
         for (int j = pos; j < pos + len; j++)
         {
-            nuint off = (nuint)(_tab[j >> BlkShift] * BlkTok + (j & (BlkTok - 1))) * (nuint)rowBytes;
+            long prow = (long)_tab[j >> BlkShift] * BlkTok + (j & (BlkTok - 1));
+            loRow = Math.Min(loRow, prow); hiRow = Math.Max(hiRow, prow);
+            nuint off = (nuint)prow * (nuint)rowBytes;
             Buffer.MemoryCopy(k + j * _kvStride, (byte*)Contents(_kvK[layer]) + off, rowBytes, rowBytes);
             Buffer.MemoryCopy(v + j * _kvStride, (byte*)Contents(_kvV[layer]) + off, rowBytes, rowBytes);
         }
-        MtlDevice.DidModifyRange(_kvK[layer], 0, (nuint)(_kvCap * rowBytes));
-        MtlDevice.DidModifyRange(_kvV[layer], 0, (nuint)(_kvCap * rowBytes));
+        nuint dirtyOff = (nuint)loRow * (nuint)rowBytes;
+        nuint dirtyLen = (nuint)(hiRow - loRow + 1) * (nuint)rowBytes;
+        MtlDevice.DidModifyRange(_kvK[layer], dirtyOff, dirtyLen);
+        MtlDevice.DidModifyRange(_kvV[layer], dirtyOff, dirtyLen);
     }
 
     public bool SupportsBlockStore => true;
@@ -222,9 +230,11 @@ public sealed unsafe class MetalBackend : IComputeBackend
         _freePhys.Push(phys);
     }
 
-    // Free phys only if no table slot references it anymore.
+    // Free phys only if no table slot references it anymore and no store
+    // entry pins it.
     private void ReleaseOrFree(int phys)
     {
+        if (phys < 0 || _physToHash.ContainsKey(phys)) return;
         for (int i = 0; i < _maxBlk; i++) if (_tab[i] == phys) return;
         _freePhys.Push(phys);
     }
@@ -323,7 +333,10 @@ public sealed unsafe class MetalBackend : IComputeBackend
             h = KvBlockStore.ChainHash(h, toks);
             if (!_store.TryGetValue(h, out DevBlk? e) || !e.Toks.AsSpan().SequenceEqual(toks))
                 break;
+            int old = _tab[i];
             _tab[i] = e.Phys;
+            if (old != e.Phys)
+                ReleaseOrFree(old);
             hit++;
         }
         if (Environment.GetEnvironmentVariable("HYMT_METAL_DEBUG") == "1")
@@ -432,8 +445,8 @@ public sealed unsafe class MetalBackend : IComputeBackend
 
     // seq > 1 forward: same layer sequence as decode but GEMM instead of GEMV,
     // multi-token rope/KV-append variants, and attention dispatched per position
-    // (kvLen = start + t + 1). Per-call scratch buffers are autoreleased MTLBuffers —
-    // they live until the pool drains in Finish(), after waitUntilCompleted.
+    // (kvLen = start + t + 1). Per-call scratch buffers are +1 MTLBuffers —
+    // they must be released by hand after waitUntilCompleted.
     private float[] PrefillStep(ReadOnlySpan<int> tokens, int start)
     {
         ModelConfig c = _cfg;
@@ -484,7 +497,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
             cc.SetBuffer(kb, 0, 0); cc.SetBuffer(vb, 0, 1);
             cc.SetBuffer(_kvK[l], 0, 2); cc.SetBuffer(_kvV[l], 0, 3);
             cc.SetInt(4, kDim); cc.SetInt(5, _kvStride); cc.SetInt(6, start);
-            cc.SetBuffer(_kvTab, 0, 7); cc.SetInt(8, BlkShift);
+            cc.SetBuffer(_kvTab, 0, 7); cc.SetInt(8, BlkShift); cc.SetInt(9, T);
             cc.Dispatch((nuint)((T * kDim + 255) / 256), 1, 1, 256, 1, 1);
             if (Environment.GetEnvironmentVariable("HYMT_METAL_SLOWATTN") == "1")
             {
@@ -536,6 +549,10 @@ public sealed unsafe class MetalBackend : IComputeBackend
         cc.EndEnc();
         cc.Commit();
         cc.Wait();
+        // GPU is done with the scratch; newBuffer* returned +1 objects.
+        foreach (IntPtr b in new[]
+            { toks, h, n1, n2, q, kb, vb, ao, attnOut, gate, up, down, normed, scores })
+            ObjC.Release(b);
         cc.Drain();
 
         Marshal.Copy((IntPtr)Contents(_logitsBuf), _logitsHost, 0, _vocab);
