@@ -8,7 +8,7 @@ using Sdcb.HyMT2Sharp.Model;
 
 string modelPath = Args.Get(args, "--model")
     ?? @"D:\_\model\Hy-MT2-1.8B-Q4_K_M.gguf";
-int threads = Args.GetInt(args, "--threads", CpuThreadPool.PreferPCoreCount());
+int threads = Args.GetInt(args, "--threads", 0);
 int benchPrefill = Args.GetInt(args, "--bench-prefill", 0);
 int benchDecode = Args.GetInt(args, "--bench-decode", 0);
 int colTileKb = Args.GetInt(args, "--col-tile-kb", 0);
