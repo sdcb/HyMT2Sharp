@@ -44,9 +44,12 @@ public static class MetalGemvMicro
                 Marshal.Copy(w, 0, ObjC.Send0(wb, ObjC.Sel("contents")), w.Length);
                 Marshal.Copy(x, 0, ObjC.Send0(xb, ObjC.Sel("contents")), x.Length);
             }
+            MtlDevice.DidModifyRange(wb, 0, (nuint)w.Length);
+            MtlDevice.DidModifyRange(xb, 0, (nuint)(inDim * 4));
             foreach (var (pso, name, colsPerTg) in kernels)
             {
                 if (pso == 0) continue;
+                CheckKernelLimit(name, inDim);
                 var c = CmdCtx.Begin(dev.Queue);
                 c.SetPso(pso); c.SetBuffer(wb, 0, 0); c.SetBuffer(xb, 0, 1); c.SetBuffer(yb, 0, 2);
                 c.SetInt(3, inDim); c.SetInt(4, outDim);
@@ -89,6 +92,8 @@ public static class MetalGemvMicro
                 var xp = (float*)ObjC.Send0(bufs[i].X, ObjC.Sel("contents"));
                 for (int j = 0; j < inDim; j++) xp[j] = 0.001f * j;
             }
+            MtlDevice.DidModifyRange(bufs[i].W, 0, (nuint)wb2);
+            MtlDevice.DidModifyRange(bufs[i].X, 0, (nuint)(inDim * 4));
         }
         Console.WriteLine($"weights/token = {totalBytes / 1e9:F3} GB");
 
@@ -103,6 +108,7 @@ public static class MetalGemvMicro
                 foreach (var b in bufs)
                 {
                     c.SetPso(pso);
+                    CheckKernelLimit(name, b.InDim);
                     c.SetBuffer(b.W, 0, 0); c.SetBuffer(b.X, 0, 1); c.SetBuffer(b.Y, 0, 2);
                     c.SetInt(3, b.InDim); c.SetInt(4, b.OutDim);
                     c.Dispatch((nuint)((b.OutDim + colsPerTg - 1) / colsPerTg), 1, 1, 256, 1, 1);
@@ -118,6 +124,14 @@ public static class MetalGemvMicro
             encMs /= 10; gpuMs /= 10;
             Console.WriteLine($"{name}: enc={encMs:F2}ms gpu={gpuMs:F2}ms total={encMs + gpuMs:F2}ms -> {totalBytes / gpuMs / 1e6:F0} GB/s, ~{1000 / (encMs + gpuMs):F0} tok/s");
         }
+    }
+
+    // q4k_gemv_fast/fast4 stage their per-group scales in threadgroup sf[176]/sf[4*176] —
+    // any tensor with in_dim > 5632 would overflow threadgroup memory. Guard on the host side.
+    private static void CheckKernelLimit(string name, int inDim)
+    {
+        if ((name is "fast" or "fast4") && inDim > 176 * 32)
+            throw new NotSupportedException($"{name} kernel supports in_dim <= {176 * 32} (sf[176] groups/row), got {inDim}");
     }
 
     private static float DequantQ4K(byte[] blk, int off, int i)

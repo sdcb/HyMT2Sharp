@@ -52,7 +52,8 @@ Cli / Server / Benchmark ──→ Sdcb.HyMT2Sharp(单 dll)
 - `NSAutoreleasePool`:每次 encode 批外层包 `alloc/init` … `release`,防 autoreleased 对象累积
 
 **对象所有权硬规则(Cocoa 内存约定,写错即 UAF/泄漏)**:
-- `alloc`/`init`/`newXxx`/`copy`/`mutableCopy` 家族(`newCommandQueue`、`newBufferWithBytes`、`newLibraryWithSource`、`newComputePipelineState`、`MTLCreateSystemDefaultDevice` 等)→ **返回已持有对象(+1)**,封装类 `Dispose` 时必须 `release`
+- `alloc`/`init`/`newXxx`/`copy`/`mutableCopy` 家族(`newCommandQueue`、`newBufferWithBytes`、`newLibraryWithSource`、`newComputePipelineState` 等)→ **返回已持有对象(+1)**,封装类 `Dispose` 时必须 `release`
+- **C 函数返回 `id`(`MTLCreateSystemDefaultDevice` 等)→ autoreleased**(不属于 `new*` selector 家族,ARC 默认 autoreleased);需跨 pool 持有的先 `retain`、`Dispose` 时 `release`——拿不准时一律 retain,多 retain 一个 app 级单例无害
 - 其余方法(`commandBuffer`、`computeCommandEncoder`、属性式访问器)→ **autoreleased**,只能在当前 pool 生命周期内使用;需跨 pool 持有的先 `retain`、`Dispose` 时 `release`
 - 诊断:`newLibraryWithSource` 的 `NSError` 立即接 `localizedDescription` 转成托管异常——MSL 编译错误不接就是黑盒;`BOOL` 返回值注意 arm64 为 1 字节 marshal(`[MarshalAs(UnmanagedType.Bool)]` 或按 byte 收)
 

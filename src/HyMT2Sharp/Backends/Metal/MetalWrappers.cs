@@ -2,15 +2,19 @@ using System.Runtime.InteropServices;
 
 namespace Sdcb.HyMT2Sharp.Backends.Metal;
 
-// Thin Metal wrappers over ObjC msgSend. All created objects are +1-owned → Dispose releases.
+// Thin Metal wrappers over ObjC msgSend. +1-owned objects are released on Dispose.
+// TODO(M2): MtlDevice/Queue/library/PSO/buffers are intentionally never released in this
+// spike — wire Dispose into the real backend's lifetime management.
 public sealed class MtlDevice
 {
     public readonly IntPtr H;
-    public readonly IntPtr Queue;
+    public readonly IntPtr Queue;   // +1 via newCommandQueue — TODO(M2): release in Dispose
     private MtlDevice(IntPtr h) { H = h; Queue = ObjC.Send0(h, ObjC.Sel("newCommandQueue")); }
     public static MtlDevice Create()
     {
-        IntPtr d = ObjC.CreateSystemDefaultDevice();
+        // MTLCreateSystemDefaultDevice is a C function returning id — autoreleased by ARC
+        // default, not +1. Retain so the device survives pool drains.
+        IntPtr d = ObjC.Retain(ObjC.CreateSystemDefaultDevice());
         if (d == 0) throw new InvalidOperationException("no Metal device");
         return new MtlDevice(d);
     }
@@ -29,19 +33,7 @@ public sealed class MtlDevice
         unsafe { lib = ObjC.Send3P(H, ObjC.Sel("newLibraryWithSource:options:error:"), src, IntPtr.Zero, (IntPtr)(&err)); }
         ObjC.Release(src);
         if (lib == 0)
-        {
-            string msg = "unknown";
-            if (err != 0)
-            {
-                IntPtr desc = ObjC.Send0(err, ObjC.Sel("localizedDescription"));
-                if (desc != 0)
-                {
-                    IntPtr cstr = ObjC.Send0(desc, ObjC.Sel("UTF8String"));
-                    if (cstr != 0) msg = Marshal.PtrToStringUTF8(cstr) ?? msg;
-                }
-            }
-            throw new InvalidOperationException($"MSL compile failed: {msg}");
-        }
+            throw new InvalidOperationException($"MSL compile failed: {ErrorMessage(err)}");
         return lib;
     }
 
@@ -49,10 +41,23 @@ public sealed class MtlDevice
     {
         IntPtr err = IntPtr.Zero;
         IntPtr pso;
-        unsafe { pso = ObjC.Send2P1N(H, ObjC.Sel("newComputePipelineStateWithFunction:error:"), fn, (IntPtr)(&err), 0); }
-        if (pso == 0) throw new InvalidOperationException($"PSO failed (err={err})");
+        unsafe { pso = ObjC.Send2P(H, ObjC.Sel("newComputePipelineStateWithFunction:error:"), fn, (IntPtr)(&err)); }
+        if (pso == 0) throw new InvalidOperationException($"PSO failed: {ErrorMessage(err)}");
         return pso;
     }
+
+    private static string ErrorMessage(IntPtr err)
+    {
+        if (err == 0) return "unknown";
+        IntPtr desc = ObjC.Send0(err, ObjC.Sel("localizedDescription"));
+        if (desc == 0) return "unknown";
+        IntPtr cstr = ObjC.Send0(desc, ObjC.Sel("UTF8String"));
+        return cstr == 0 ? "unknown" : Marshal.PtrToStringUTF8(cstr) ?? "unknown";
+    }
+
+    // Required after CPU writes into a StorageModeShared buffer so the GPU sees them.
+    public static void DidModifyRange(IntPtr buf, nuint offset, nuint length) =>
+        ObjC.SendV1Range(buf, ObjC.Sel("didModifyRange:"), new ObjC.NSRange(offset, length));
 
     public IntPtr NewFunction(IntPtr lib, string name)
     {

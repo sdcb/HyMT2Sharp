@@ -23,6 +23,9 @@ public static unsafe partial class ObjC
     public static partial IntPtr Send1P(IntPtr recv, IntPtr sel, IntPtr a);
 
     [LibraryImport(LibObjC, EntryPoint = "objc_msgSend")]
+    public static partial IntPtr Send2P(IntPtr recv, IntPtr sel, IntPtr a, IntPtr b);
+
+    [LibraryImport(LibObjC, EntryPoint = "objc_msgSend")]
     public static partial IntPtr Send1P1N(IntPtr recv, IntPtr sel, IntPtr a, nuint b);
 
     [LibraryImport(LibObjC, EntryPoint = "objc_msgSend")]
@@ -39,6 +42,10 @@ public static unsafe partial class ObjC
     [LibraryImport(LibObjC, EntryPoint = "objc_msgSend")]
     public static partial void SendV2Size(IntPtr recv, IntPtr sel, MTLSize a, MTLSize b);
 
+    // didModifyRange: — NSRange by value (16B, two registers on arm64)
+    [LibraryImport(LibObjC, EntryPoint = "objc_msgSend")]
+    public static partial void SendV1Range(IntPtr recv, IntPtr sel, NSRange range);
+
     [LibraryImport(LibObjC, EntryPoint = "objc_msgSend")]
     public static partial byte SendBool(IntPtr recv, IntPtr sel);
 
@@ -47,6 +54,9 @@ public static unsafe partial class ObjC
 
     [StructLayout(LayoutKind.Sequential)]
     public struct MTLSize { public nuint X, Y, Z; public MTLSize(nuint x, nuint y, nuint z) { X = x; Y = y; Z = z; } }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct NSRange { public nuint Location, Length; public NSRange(nuint location, nuint length) { Location = location; Length = length; } }
 
     public static IntPtr GetClass(string name)
     {
@@ -74,7 +84,7 @@ public static unsafe partial class ObjC
     public static IntPtr Retain(IntPtr obj) => Send0(obj, Sel("retain"));
 }
 
-// NSAutoreleasePool: alloc/init owned; Dispose drains autoreleased then releases.
+// NSAutoreleasePool: alloc/init owned; Dispose drains (drain releases the pool itself).
 public readonly struct AutoReleasePool : IDisposable
 {
     private readonly IntPtr _pool;
