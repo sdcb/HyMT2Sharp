@@ -267,11 +267,12 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         EnsureScratch(seq, start + seq);
         int hidden = Config.HiddenSize;
         float* h = (float*)Bump((nuint)((long)seq * hidden * sizeof(float)));
-        if (_backend is not null && seq == 1)
+        if (_backend is not null && (seq == 1 || _backend.SupportsPrefill))
         {
-            // Decode on device: KV is appended on-GPU, CPU caches only hold
-            // prefill positions (a subsequent prefill re-uploads its range).
-            float[] devLogits = _backend.DecodeStep(tokens[0], start);
+            // Forward on device: KV is appended on-GPU, CPU caches only hold
+            // CPU-prefill positions (a subsequent CPU prefill re-uploads its
+            // range; a backend with SupportsPrefill handles seq>1 itself).
+            float[] devLogits = _backend.ForwardStep(tokens, start);
             _cacheLen += seq;
             _cacheTokens.AddRange(tokens);
             return devLogits;
