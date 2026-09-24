@@ -599,7 +599,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
         };
         if (inDim % granule != 0)
             throw new NotSupportedException($"gemv/gemm {name}: in_dim {inDim} not a multiple of {t} granule {granule}");
-        return t switch
+        IntPtr pso = t switch
         {
             GgmlTensorType.Q4_K => p.q4,
             GgmlTensorType.Q6_K => p.q6,
@@ -609,6 +609,11 @@ public sealed unsafe class MetalBackend : IComputeBackend
             _ => throw new NotSupportedException(
                 $"gemv/gemm {name}: {t} not supported on Metal backend — use --backend cpu"),
         };
+        // A nil PSO would make setComputePipelineState: a silent no-op; fail fast instead.
+        if (pso == IntPtr.Zero)
+            throw new NotSupportedException(
+                $"gemv/gemm {name}: {t} not supported on Metal backend — use --backend cpu");
+        return pso;
     }
 
     private void Gemv(CmdCtx c, string name, IntPtr x, IntPtr y, int inDim, int outDim)
@@ -617,10 +622,11 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private void Gemv(CmdCtx c, string name, IntPtr x, nuint xOff, IntPtr y, nuint yOff, int inDim, int outDim)
     {
         IntPtr w = W(name);
-        // fast4 kernels stage scales in threadgroup sf[]:
+        // fast4 K-quant kernels stage scales in threadgroup sf[]:
         // q4k -> in_dim <= 6144 (sf[4*192] groups of 32), q6k -> sf[4*384] groups of 16.
-        if (inDim > 6144)
-            throw new NotSupportedException($"gemv {name}: in_dim {inDim} exceeds fast4 limit 6144");
+        // q8_0/q2c/stq read weights per-block without that table — the bound doesn't apply.
+        if (inDim > 6144 && _wtype[name] is GgmlTensorType.Q4_K or GgmlTensorType.Q6_K)
+            throw new NotSupportedException($"gemv {name}: in_dim {inDim} exceeds fast4 K-quant staging limit 6144");
         c.SetPso(PsoFor(name, inDim, (_psoGemv, _psoGemvQ6, _psoGemvQ8, _psoGemvQ2, _psoGemvStq)));
         c.SetBuffer(w, 0, 0); c.SetBuffer(x, xOff, 1); c.SetBuffer(y, yOff, 2);
         c.SetInt(3, inDim); c.SetInt(4, outDim);
@@ -631,8 +637,9 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private void Gemm(CmdCtx c, string name, IntPtr x, IntPtr y, int inDim, int outDim, int T)
     {
         IntPtr w = W(name);
-        if (inDim > 6144)
-            throw new NotSupportedException($"gemm {name}: in_dim {inDim} exceeds fast4 limit 6144");
+        // Same sf[] staging bound as gemv — only the K-quant kernels use it.
+        if (inDim > 6144 && _wtype[name] is GgmlTensorType.Q4_K or GgmlTensorType.Q6_K)
+            throw new NotSupportedException($"gemm {name}: in_dim {inDim} exceeds fast4 K-quant staging limit 6144");
         c.SetPso(PsoFor(name, inDim, (_psoGemm, _psoGemmQ6, _psoGemmQ8, _psoGemmQ2, _psoGemmStq)));
         c.SetBuffer(w, 0, 0); c.SetBuffer(x, 0, 1); c.SetBuffer(y, 0, 2);
         c.SetInt(3, inDim); c.SetInt(4, outDim); c.SetInt(5, T);
