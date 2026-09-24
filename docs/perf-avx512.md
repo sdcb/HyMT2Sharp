@@ -1,6 +1,6 @@
 # HyMT2Sharp 性能：AVX-512 档 x86-64 实测
 
-测量日期：2026-09-24。主角是 **HyMT2Sharp** 新增的 **AVX-512 档**（本 PR），与强制退回 AVX2/AVX-VNNI 的基线（`DOTNET_EnableAVX512=0`）同窗口 A/B 对比。本页统一 **prefill 512 / decode 64、8 线程**，不计模型加载与 warmup。
+测量日期：2026-09-24。主角是 **HyMT2Sharp** 新增的 **AVX-512 档**（本 PR），与强制退回 AVX2/AVX-VNNI 的基线（`DOTNET_EnableAVX512=0`）同窗口 A/B 对比。本页统一 **prefill 512 / decode 64、`--threads 0`（自动线程校准 + 绑核）**，不计模型加载与 warmup。
 
 与其他文档的关系：[perf.md](perf.md) 是 5800X 上的 x64 数据，[perf-devin-m4.md](perf-devin-m4.md) 是 ARM64 侧。本页是 AVX-512 x86-64 服务器的对应实测。
 
@@ -11,45 +11,37 @@
 | CPU        | Intel Xeon Platinum 8559C（Emerald Rapids），8 vCPU                      |
 | ISA        | AVX-512 F/BW/VL/CD/DQ/VNNI/VBMI/VBMI2 全部可用                          |
 | OS         | Ubuntu 24.04 x86_64，Release 构建，`net10.0`，.NET SDK 10               |
-| 线程       | 8                                                                      |
-| 负载       | 共享宿主机有背景负载（load ~18-20/8 vCPU），数字摆动 ±10-30%；A/B 交替、取 best-of-N |
-
-| 量化   | 文件                            |     大小 |
-| ------ | ------------------------------- | -------: |
-| STQ1_0 | `Hy-MT2-1.8B-1.25Bit.gguf`      | 441 MiB  |
-| Q2_0C  | `Hy-MT2-1.8B-2Bit.gguf`         | 573 MiB  |
-| Q4_K_M | `Hy-MT2-1.8B-Q4_K_M.gguf`       | 1.05 GiB |
-| Q6_K   | `Hy-MT2-1.8B-Q6_K.gguf`         | 1.37 GiB |
-| Q8_0   | `Hy-MT2-1.8B-Q8_0.gguf`         | 1.77 GiB |
+| 线程       | `--threads 0`（自动校准 + sched_setaffinity 绑核，main 最新线程策略）  |
+| 负载       | 共享宿主机有背景负载，数字摆动 ±10-30%；A/B 交替、取 best-of-N         |
 
 ## 2. 主表：AVX-512 vs AVX2/VNNI 基线（同机同窗口，8 线程）
 
-分发链 `UseAvx512 → UseAvxVnni → UseAvx2 → UseDp → Vector<float>`；基线用 `DOTNET_EnableAVX512=0` 关掉 AVX-512 得到（`DOTNET_EnableAVX512F` 在 .NET 10 上无效，见 §4）。每组数据取两轮 best-of。
+分发链 `UseAvx512 → UseAvxVnni → UseAvx2 → UseDp → Vector<float>`；基线用 `DOTNET_EnableAVX512=0` 关掉 AVX-512 得到（`DOTNET_EnableAVX512F` 在 .NET 10 上无效，见 §4）。每组数据取两轮 best-of。本表用 `--threads 0`（自动线程校准 + CPU 绑核）——比固定 `--threads 8` 快很多（Q4_K_M decode 21-27 vs 1.8 tok/s），是该箱的正确配置。
 
 ### prefill 512（tok/s）
 
 | 量化   | AVX2/VNNI 基线 | AVX-512 | Δ       |
 | ------ | -------------: | ------: | ------: |
-| STQ1_0 |         170.71 |  193.90 | **+14%** |
-| Q2_0C  |         186.02 |  204.10 | **+10%** |
-| Q4_K_M |         161.21 |  177.62 | **+10%** |
-| Q6_K   |         175.90 |  175.90 |    0%¹  |
-| Q8_0   |         175.73 |  184.25 |   +5%²  |
+| STQ1_0 |         472.29 |  591.40 | **+25%** |
+| Q2_0C  |         482.54 |  626.34 | **+30%** |
+| Q4_K_M |         421.70 |  502.77 | **+19%** |
+| Q6_K   |         445.25 |  448.68 |    +1%¹ |
+| Q8_0   |         528.55 |  559.45 |   +6%²  |
 
 ¹ Q6_K 的 512 GEMM 实测退回（见 §4），prefill 走与基线相同的 AVX2 内核。
-² 两侧同为 VNNI-256 GEMM（见 §4），+5% 属测量噪声。
+² 两侧同为 VNNI-256 GEMM（见 §4），差异属测量噪声。
 
 ### decode 64（tok/s）
 
 | 量化   | AVX2/VNNI 基线 | AVX-512 | Δ      |
 | ------ | -------------: | ------: | -----: |
-| STQ1_0 |           1.16 |    1.15 |  持平 |
-| Q2_0C  |           1.17 |    1.17 |  持平 |
-| Q4_K_M |           1.73 |    1.82 |  持平 |
-| Q6_K   |           1.84 |    1.87 |  持平 |
-| Q8_0   |           1.81 |    1.79 |  持平 |
+| STQ1_0 |          46.24 |   47.68 |  持平 |
+| Q2_0C  |          49.25 |   50.96 |  持平 |
+| Q4_K_M |          26.26 |   26.65 |  持平 |
+| Q6_K   |          17.20 |   17.77 |  持平 |
+| Q8_0   |          29.37 |   28.83 |  持平 |
 
-decode 在本箱被宿主机 steal 严重压制（~1.1-1.9 tok/s），两侧一致；GEMV 内核本身在内存带宽上两侧等价。
+decode 两侧一致——GEMV 是内存带宽主导，512 位加宽不改变带宽需求，两侧等价。
 
 ## 3. 微基准（min-of-N，nIn=2048 nOut=6144 tokens=128，GEMM GMAC/s / ms）
 
