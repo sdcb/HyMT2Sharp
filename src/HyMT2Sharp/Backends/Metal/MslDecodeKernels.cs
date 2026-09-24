@@ -746,5 +746,373 @@ kernel void kv_copy_block(
     dstK[dto] = srcK[so];
     dstV[dto] = srcV[so];
 }
+// ===================== M5: extra quant formats =====================
+// All follow the fast4 shape: 4 output cols per threadgroup, 64 threads/col.
+
+// ---- Q8_0: 34B per 32 values (fp16 d + 32 int8). Row = (in_dim/32)*34B.
+kernel void q8_0_embed_row(
+    device const uchar* embd [[buffer(0)]],
+    device const int* tok [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant int& hidden [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if ((int)gid >= hidden) return;
+    int row = *tok;
+    const device uchar* bp = embd + (ulong)row * (hidden >> 5) * 34 + (ulong)(gid >> 5) * 34;
+    float d = float(*(const device half*)bp);
+    y[gid] = d * float(*(const device char*)(bp + 2 + (gid & 31)));
+}
+
+kernel void q8_0_embed_rows(
+    device const uchar* embd [[buffer(0)]],
+    device const int* toks [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant int& hidden [[buffer(3)]],
+    uint g [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    int row = toks[g];
+    const device uchar* r = embd + (ulong)row * (hidden >> 5) * 34;
+    for (int i = (int)tid; i < hidden; i += 256) {
+        const device uchar* bp = r + (ulong)(i >> 5) * 34;
+        y[(ulong)g * hidden + i] =
+            float(*(const device half*)bp) * float(*(const device char*)(bp + 2 + (i & 31)));
+    }
+}
+
+kernel void q8_0_gemv_fast4(
+    device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant int& in_dim [[buffer(3)]],
+    constant int& out_dim [[buffer(4)]],
+    uint g [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    int sub = (int)(tid >> 6), st = (int)(tid & 63u);
+    int bpr = in_dim >> 5;
+    int col = (int)g * 4 + sub;
+    bool valid = col < out_dim;
+    if (!valid) col = out_dim - 1;
+    const device uchar* row = w + (ulong)col * bpr * 34;
+
+    float acc = 0.0f;
+    for (int b = st; b < bpr; b += 64) {
+        const device uchar* bp = row + b * 34;
+        float d = float(*(const device half*)bp);
+        float s = 0.0f;
+        for (int k = 0; k < 8; k++) {
+            char4 q = *(const device packed_char4*)(bp + 2 + k * 4);
+            s += dot(float4(q.x, q.y, q.z, q.w),
+                     *(const device float4*)(x + b * 32 + k * 4));
+        }
+        acc += d * s;
+    }
+    threadgroup float red[256];
+    red[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 32; s > 0; s >>= 1) {
+        if (st < s) red[tid] += red[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (st == 0 && valid) y[col] = red[tid];
+}
+
+kernel void q8_0_gemm(
+    device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant int& in_dim [[buffer(3)]],
+    constant int& out_dim [[buffer(4)]],
+    constant int& T [[buffer(5)]],
+    uint2 g [[threadgroup_position_in_grid]],
+    uint2 tp [[thread_position_in_threadgroup]])
+{
+    int tid = (int)tp.x;
+    int sub = tid >> 6, st = tid & 63;
+    int bpr = in_dim >> 5;
+    int col = (int)g.x * 4 + sub;
+    bool valid = col < out_dim;
+    if (!valid) col = out_dim - 1;
+    const device uchar* row = w + (ulong)col * bpr * 34;
+
+    int t0 = (int)g.y * TILE_T;
+    int nt = min(TILE_T, T - t0);
+    float acc[TILE_T];
+    for (int t = 0; t < TILE_T; t++) acc[t] = 0.0f;
+
+    for (int b = st; b < bpr; b += 64) {
+        const device uchar* bp = row + b * 34;
+        float d = float(*(const device half*)bp);
+        float4 wv[8];
+        for (int k = 0; k < 8; k++) {
+            char4 q = *(const device packed_char4*)(bp + 2 + k * 4);
+            wv[k] = d * float4(q.x, q.y, q.z, q.w);
+        }
+        for (int t = 0; t < nt; t++) {
+            device const float* xr = x + (ulong)(t0 + t) * in_dim + b * 32;
+            acc[t] += dot(*(const device float4*)(xr),      wv[0])
+                    + dot(*(const device float4*)(xr + 4),  wv[1])
+                    + dot(*(const device float4*)(xr + 8),  wv[2])
+                    + dot(*(const device float4*)(xr + 12), wv[3])
+                    + dot(*(const device float4*)(xr + 16), wv[4])
+                    + dot(*(const device float4*)(xr + 20), wv[5])
+                    + dot(*(const device float4*)(xr + 24), wv[6])
+                    + dot(*(const device float4*)(xr + 28), wv[7]);
+        }
+    }
+    threadgroup float red[256];
+    for (int t = 0; t < nt; t++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[tid] = acc[t];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int s = 32; s > 0; s >>= 1) {
+            if (st < s) red[tid] += red[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (st == 0 && valid) y[(ulong)(t0 + t) * out_dim + col] = red[tid];
+    }
+}
+
+// ---- Q2_0C: 130B per 512 values (fp16 d + 128B quants, 4 codes/byte).
+// value = ((byte >> 2c) & 3) * 2 - 3.  Row = (in_dim/512)*130B.
+// Threads stride 64-weight sub-blocks (16 bytes) so in_dim=512 keeps 8
+// threads busy per col instead of 1.
+kernel void q2c_gemv_fast4(
+    device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant int& in_dim [[buffer(3)]],
+    constant int& out_dim [[buffer(4)]],
+    uint g [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    int sub = (int)(tid >> 6), st = (int)(tid & 63u);
+    int col = (int)g * 4 + sub;
+    bool valid = col < out_dim;
+    if (!valid) col = out_dim - 1;
+    const device uchar* row = w + (ulong)col * (in_dim >> 9) * 130;
+
+    float acc = 0.0f;
+    int nsub = in_dim >> 6;
+    for (int si = st; si < nsub; si += 64) {
+        int blk = si >> 3, sj = si & 7;
+        const device uchar* bp = row + blk * 130;
+        float d = float(*(const device half*)bp);
+        int xb = blk * 512 + sj * 64;
+        float ss = 0.0f;
+        for (int k = 0; k < 4; k++) {
+            uchar4 u = *(const device packed_uchar4*)(bp + 2 + sj * 16 + k * 4);
+            for (int bi = 0; bi < 4; bi++) {
+                int ub = u[bi];
+                float4 wv = float4(
+                    float(((ub      ) & 3) * 2 - 3), float(((ub >> 2) & 3) * 2 - 3),
+                    float(((ub >> 4) & 3) * 2 - 3),  float(((ub >> 6) & 3) * 2 - 3));
+                ss += dot(wv, *(const device float4*)(x + xb + k * 16 + bi * 4));
+            }
+        }
+        acc += d * ss;
+    }
+    threadgroup float red[256];
+    red[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 32; s > 0; s >>= 1) {
+        if (st < s) red[tid] += red[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (st == 0 && valid) y[col] = red[tid];
+}
+
+kernel void q2c_gemm(
+    device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant int& in_dim [[buffer(3)]],
+    constant int& out_dim [[buffer(4)]],
+    constant int& T [[buffer(5)]],
+    uint2 g [[threadgroup_position_in_grid]],
+    uint2 tp [[thread_position_in_threadgroup]])
+{
+    int tid = (int)tp.x;
+    int sub = tid >> 6, st = tid & 63;
+    int col = (int)g.x * 4 + sub;
+    bool valid = col < out_dim;
+    if (!valid) col = out_dim - 1;
+    const device uchar* row = w + (ulong)col * (in_dim >> 9) * 130;
+
+    int t0 = (int)g.y * TILE_T;
+    int nt = min(TILE_T, T - t0);
+    float acc[TILE_T];
+    for (int t = 0; t < TILE_T; t++) acc[t] = 0.0f;
+
+    int nsub = in_dim >> 6;
+    for (int si = st; si < nsub; si += 64) {
+        int blk = si >> 3, sj = si & 7;
+        const device uchar* bp = row + blk * 130;
+        float d = float(*(const device half*)bp);
+        int xb = blk * 512 + sj * 64;
+        for (int k = 0; k < 4; k++) {
+            uchar4 u = *(const device packed_uchar4*)(bp + 2 + sj * 16 + k * 4);
+            for (int bi = 0; bi < 4; bi++) {
+                int ub = u[bi];
+                float4 wv = d * float4(
+                    float(((ub      ) & 3) * 2 - 3), float(((ub >> 2) & 3) * 2 - 3),
+                    float(((ub >> 4) & 3) * 2 - 3),  float(((ub >> 6) & 3) * 2 - 3));
+                int xo = xb + k * 16 + bi * 4;
+                for (int t = 0; t < nt; t++)
+                    acc[t] += dot(*(const device float4*)(x + (ulong)(t0 + t) * in_dim + xo), wv);
+            }
+        }
+    }
+    threadgroup float red[256];
+    for (int t = 0; t < nt; t++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[tid] = acc[t];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int s = 32; s > 0; s >>= 1) {
+            if (st < s) red[tid] += red[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (st == 0 && valid) y[(ulong)(t0 + t) * out_dim + col] = red[tid];
+    }
+}
+
+// ---- STQ1_0: 42B per 256 values (Qs[32] = 64x 4-bit slots, Sign[8], fp16 d).
+// group g -> slot nibble + sign bit -> qpack = CB[(sign<<4)|slot] (four 2-bit
+// ternary lanes, code-1).  Weight j: chunk=j>>6, gloc=j&15, lane=(j>>4)&3.
+// Row = (in_dim/256)*42B.  Threads stride 64-weight chunks; inner loop handles
+// 4 groups at once so x reads stay vectorized (4 x float4 per 16 weights).
+constant uchar STQ_CB[32] = {
+    0xA9,0x89,0x29,0x09, 0xA6,0x86,0x26,0x06,
+    0x9A,0x92,0x1A,0x12, 0x6A,0x62,0x4A,0x42,
+    0x01,0x21,0x81,0xA1, 0x04,0x24,0x84,0xA4,
+    0x10,0x18,0x90,0x98, 0x40,0x48,0x60,0x68 };
+
+inline uint stq_qpack(uint idx) { return STQ_CB[idx & 31u]; }
+
+// Decode the four ternary lanes of group i of a chunk into wv.
+inline void stq_group(int i, uchar4 qa, uchar4 qb, uchar2 sg, thread float* wv)
+{
+    int byte_ = i < 8 ? qa[i >> 1] : qb[(i >> 1) - 4];
+    int slot = (byte_ >> ((i & 1) * 4)) & 0xF;
+    int sign = (sg[i >> 3] >> (i & 7)) & 1;
+    uint qp = stq_qpack((uint)(sign << 4) | (uint)slot);
+    wv[0] = float(int(qp       & 3u) - 1);
+    wv[1] = float(int((qp >> 2) & 3u) - 1);
+    wv[2] = float(int((qp >> 4) & 3u) - 1);
+    wv[3] = float(int((qp >> 6) & 3u) - 1);
+}
+
+kernel void stq_gemv_fast4(
+    device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant int& in_dim [[buffer(3)]],
+    constant int& out_dim [[buffer(4)]],
+    uint g [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    int sub = (int)(tid >> 6), st = (int)(tid & 63u);
+    int col = (int)g * 4 + sub;
+    bool valid = col < out_dim;
+    if (!valid) col = out_dim - 1;
+    const device uchar* row = w + (ulong)col * (in_dim >> 8) * 42;
+
+    float acc = 0.0f;
+    int nsub = in_dim >> 6;
+    for (int si = st; si < nsub; si += 64) {
+        int blk = si >> 2, c = si & 3;
+        const device uchar* bp = row + blk * 42;
+        float d = float(*(const device half*)(bp + 40));
+        uchar4 qa = *(const device packed_uchar4*)(bp + c * 8);
+        uchar4 qb = *(const device packed_uchar4*)(bp + c * 8 + 4);
+        uchar2 sg = *(const device packed_uchar2*)(bp + 32 + c * 2);
+        int xb = blk * 256 + c * 64;
+        float ss = 0.0f;
+        for (int i4 = 0; i4 < 4; i4++) {
+            float w[4][4];
+            for (int gg = 0; gg < 4; gg++) stq_group(i4 * 4 + gg, qa, qb, sg, w[gg]);
+            float4 x0 = *(const device float4*)(x + xb + i4 * 4);
+            float4 x1 = *(const device float4*)(x + xb + i4 * 4 + 16);
+            float4 x2 = *(const device float4*)(x + xb + i4 * 4 + 32);
+            float4 x3 = *(const device float4*)(x + xb + i4 * 4 + 48);
+            for (int gg = 0; gg < 4; gg++)
+                ss += w[gg][0] * x0[gg] + w[gg][1] * x1[gg]
+                    + w[gg][2] * x2[gg] + w[gg][3] * x3[gg];
+        }
+        acc += d * ss;
+    }
+    threadgroup float red[256];
+    red[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 32; s > 0; s >>= 1) {
+        if (st < s) red[tid] += red[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (st == 0 && valid) y[col] = red[tid];
+}
+
+kernel void stq_gemm(
+    device const uchar* w [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant int& in_dim [[buffer(3)]],
+    constant int& out_dim [[buffer(4)]],
+    constant int& T [[buffer(5)]],
+    uint2 g [[threadgroup_position_in_grid]],
+    uint2 tp [[thread_position_in_threadgroup]])
+{
+    int tid = (int)tp.x;
+    int sub = tid >> 6, st = tid & 63;
+    int col = (int)g.x * 4 + sub;
+    bool valid = col < out_dim;
+    if (!valid) col = out_dim - 1;
+    const device uchar* row = w + (ulong)col * (in_dim >> 8) * 42;
+
+    int t0 = (int)g.y * TILE_T;
+    int nt = min(TILE_T, T - t0);
+    float acc[TILE_T];
+    for (int t = 0; t < TILE_T; t++) acc[t] = 0.0f;
+
+    int nsub = in_dim >> 6;
+    for (int si = st; si < nsub; si += 64) {
+        int blk = si >> 2, c = si & 3;
+        const device uchar* bp = row + blk * 42;
+        float d = float(*(const device half*)(bp + 40));
+        uchar4 qa = *(const device packed_uchar4*)(bp + c * 8);
+        uchar4 qb = *(const device packed_uchar4*)(bp + c * 8 + 4);
+        uchar2 sg = *(const device packed_uchar2*)(bp + 32 + c * 2);
+        int xb = blk * 256 + c * 64;
+        for (int i4 = 0; i4 < 4; i4++) {
+            float w[4][4];
+            for (int gg = 0; gg < 4; gg++) stq_group(i4 * 4 + gg, qa, qb, sg, w[gg]);
+            for (int l = 0; l < 4; l++)
+                for (int gg = 0; gg < 4; gg++) w[gg][l] *= d;
+            for (int t = 0; t < nt; t++) {
+                device const float* xb_ = x + (ulong)(t0 + t) * in_dim + xb + i4 * 4;
+                float4 x0 = *(const device float4*)(xb_);
+                float4 x1 = *(const device float4*)(xb_ + 16);
+                float4 x2 = *(const device float4*)(xb_ + 32);
+                float4 x3 = *(const device float4*)(xb_ + 48);
+                for (int gg = 0; gg < 4; gg++)
+                    acc[t] += w[gg][0] * x0[gg] + w[gg][1] * x1[gg]
+                            + w[gg][2] * x2[gg] + w[gg][3] * x3[gg];
+            }
+        }
+    }
+    threadgroup float red[256];
+    for (int t = 0; t < nt; t++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        red[tid] = acc[t];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int s = 32; s > 0; s >>= 1) {
+            if (st < s) red[tid] += red[tid + s];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (st == 0 && valid) y[(ulong)(t0 + t) * out_dim + col] = red[tid];
+    }
+}
+
 ";
 }

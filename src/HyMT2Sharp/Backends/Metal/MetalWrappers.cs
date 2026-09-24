@@ -104,7 +104,19 @@ public struct CmdCtx : IDisposable
 
     public void EndEnc() => ObjC.Send0(Enc, ObjC.Sel("endEncoding"));
     public void Commit() => ObjC.Send0(Cmd, ObjC.Sel("commit"));
-    public void Wait() => ObjC.Send0(Cmd, ObjC.Sel("waitUntilCompleted"));
+    public void Wait()
+    {
+        ObjC.Send0(Cmd, ObjC.Sel("waitUntilCompleted"));
+        long status = ObjC.Send0(Cmd, ObjC.Sel("status")).ToInt64();
+        if (status != 4)  // MTLCommandBufferStatusCompleted
+        {
+            IntPtr err = ObjC.Send0(Cmd, ObjC.Sel("error"));
+            long code = err == IntPtr.Zero ? -1 : ObjC.Send0(err, ObjC.Sel("code")).ToInt64();
+            // A killed buffer (e.g. GPU watchdog timeout) leaves stale logits —
+            // fail fast rather than decode garbage silently.
+            throw new InvalidOperationException($"Metal command buffer failed: status={status} error={code}");
+        }
+    }
     public void Drain() => _pool.Dispose();
     public void Dispatch(nuint gx, nuint gy, nuint gz, nuint tx, nuint ty, nuint tz) =>
         ObjC.SendV2Size(Enc, ObjC.Sel("dispatchThreadgroups:threadsPerThreadgroup:"),
