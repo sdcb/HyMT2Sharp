@@ -21,7 +21,6 @@ public sealed class ChatCompletionService : IDisposable
         CreatedUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
         Console.WriteLine($"loading {ModelPath}");
-<<<<<<< HEAD
         _model = new HunyuanDenseModel(ModelPath, threads, cacheConfig);
         Console.WriteLine($"ready  threads={_model.ThreadCount}{(threads <= 0 ? $" ({_model.ThreadAutoHint})" : "")}  kv-cache={_model.CacheConfig.PolicyName}  arch={_model.Config.Architecture} layers={_model.Config.NumLayers} hidden={_model.Config.HiddenSize} heads={_model.Config.NumHeads}/{_model.Config.NumKvHeads} vocab={_model.Config.VocabSize}");
     }
