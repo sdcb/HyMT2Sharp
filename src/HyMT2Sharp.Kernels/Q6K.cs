@@ -1,6 +1,7 @@
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 
 namespace Sdcb.HyMT2Sharp.Kernels;
@@ -66,7 +67,99 @@ public static unsafe class Q6K
     }
 
     public static float Dot(BlockQ6K* x, BlockQ8K* y, int n)
-        => Simd.UseAvx2 ? DotAvx2(x, y, n) : DotVec(x, y, n);
+        => Simd.UseAvx2 ? DotAvx2(x, y, n) : Simd.UseDp ? DotNeon(x, y, n) : DotVec(x, y, n);
+
+    /// <summary>
+    /// ARM64 NEON row dot: raw (unsigned) 6-bit weights go straight into SDOT,
+    /// so each 16-value sub-group costs one instruction; per-sub scales are
+    /// applied after a pairwise-pair tree, and the -32 bias lands once per
+    /// superblock via the activation bsums correction.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotNeon(BlockQ6K* x, BlockQ8K* y, int n)
+    {
+        int nb = n / Qk.SuperBlock;
+        Vector128<byte> m15 = Vector128.Create((byte)15);
+        Vector128<byte> m3 = Vector128.Create((byte)3);
+        Vector128<byte> m48 = Vector128.Create((byte)0x30);
+        float sumf = 0;
+        for (int i = 0; i < nb; i++, x++, y++)
+        {
+            float d = y->D * HalfBits.ToSingle(x->D);
+            byte* ql = x->Ql;
+            byte* qh = x->Qh;
+            sbyte* q8 = y->Qs;
+            sbyte* sc = x->Scales;
+
+            Vector128<int> sumi = Vector128<int>.Zero;
+            for (int j = 0; j < 2; j++, ql += 64, qh += 32, q8 += 128, sc += 8)
+            {
+                Vector128<byte> ql0 = Neon.LoadU16(ql);
+                Vector128<byte> ql1 = Neon.LoadU16(ql + 32);
+                Vector128<byte> h0 = Neon.LoadU16(qh);
+                Vector128<byte> h1 = Neon.LoadU16(qh + 16);
+
+                // group k covers vals 128j+32k, i.e. scales 8j+2k and 8j+2k+1:
+                //   k0 = ql0 lo | (qh&3)<<4      k1 = ql1 lo | (qh&12)<<2
+                //   k2 = ql0 hi | (qh&48)        k3 = ql1 hi | (qh&C0)>>2
+                Vector128<byte> hi0 = AdvSimd.ShiftLeftLogical(AdvSimd.And(h0, m3), 4);
+                Vector128<byte> hi1 = AdvSimd.ShiftLeftLogical(AdvSimd.And(h1, m3), 4);
+                Vector128<byte> hi2 = AdvSimd.And(AdvSimd.ShiftLeftLogical(h0, 2), m48);
+                Vector128<byte> hi3 = AdvSimd.And(AdvSimd.ShiftLeftLogical(h1, 2), m48);
+                Vector128<byte> hi4 = AdvSimd.And(h0, m48);
+                Vector128<byte> hi5 = AdvSimd.And(h1, m48);
+                Vector128<byte> hi6 = AdvSimd.ShiftRightLogical(AdvSimd.And(h0, Vector128.Create((byte)0xC0)), 2);
+                Vector128<byte> hi7 = AdvSimd.ShiftRightLogical(AdvSimd.And(h1, Vector128.Create((byte)0xC0)), 2);
+
+                Vector128<sbyte> g0a = AdvSimd.Or(AdvSimd.And(ql0, m15), hi0).AsSByte();
+                Vector128<sbyte> g0b = AdvSimd.Or(AdvSimd.And(Neon.LoadU16(ql + 16), m15), hi1).AsSByte();
+                Vector128<sbyte> g1a = AdvSimd.Or(AdvSimd.And(Neon.LoadU16(ql + 32), m15), hi2).AsSByte();
+                Vector128<sbyte> g1b = AdvSimd.Or(AdvSimd.And(Neon.LoadU16(ql + 48), m15), hi3).AsSByte();
+                Vector128<byte> ql0h = AdvSimd.ShiftRightLogical(ql0, 4);
+                Vector128<byte> ql1h = AdvSimd.ShiftRightLogical(Neon.LoadU16(ql + 16), 4);
+                Vector128<sbyte> g2a = AdvSimd.Or(AdvSimd.And(ql0h, m15), hi4).AsSByte();
+                Vector128<sbyte> g2b = AdvSimd.Or(AdvSimd.And(ql1h, m15), hi5).AsSByte();
+                Vector128<sbyte> g3a = AdvSimd.Or(AdvSimd.And(AdvSimd.ShiftRightLogical(Neon.LoadU16(ql + 32), 4), m15), hi6).AsSByte();
+                Vector128<sbyte> g3b = AdvSimd.Or(AdvSimd.And(AdvSimd.ShiftRightLogical(Neon.LoadU16(ql + 48), 4), m15), hi7).AsSByte();
+
+                Vector128<int> d0 = Neon.Sdot(Vector128<int>.Zero, g0a, Neon.Load16(q8));
+                Vector128<int> d1 = Neon.Sdot(Vector128<int>.Zero, g0b, Neon.Load16(q8 + 16));
+                Vector128<int> d2 = Neon.Sdot(Vector128<int>.Zero, g1a, Neon.Load16(q8 + 32));
+                Vector128<int> d3 = Neon.Sdot(Vector128<int>.Zero, g1b, Neon.Load16(q8 + 48));
+                Vector128<int> d4 = Neon.Sdot(Vector128<int>.Zero, g2a, Neon.Load16(q8 + 64));
+                Vector128<int> d5 = Neon.Sdot(Vector128<int>.Zero, g2b, Neon.Load16(q8 + 80));
+                Vector128<int> d6 = Neon.Sdot(Vector128<int>.Zero, g3a, Neon.Load16(q8 + 96));
+                Vector128<int> d7 = Neon.Sdot(Vector128<int>.Zero, g3b, Neon.Load16(q8 + 112));
+
+                // PairAdd(a,b)=[a01,a23,b01,b23]: two rounds give [s0..s3] and [s4..s7].
+                Vector128<sbyte> scb = Vector128.CreateScalar(Unsafe.ReadUnaligned<long>(sc)).AsSByte();
+                Vector128<short> scw = AdvSimd.SignExtendWideningLower(scb.GetLower());
+                Vector128<int> scL = AdvSimd.SignExtendWideningLower(scw.GetLower());
+                Vector128<int> scH = AdvSimd.SignExtendWideningLower(scw.GetUpper());
+                sumi = AdvSimd.Add(sumi,
+                    AdvSimd.Multiply(Neon.PairAdd(Neon.PairAdd(d0, d1), Neon.PairAdd(d2, d3)), scL));
+                sumi = AdvSimd.Add(sumi,
+                    AdvSimd.Multiply(Neon.PairAdd(Neon.PairAdd(d4, d5), Neon.PairAdd(d6, d7)), scH));
+            }
+
+            // -32 bias correction: subtract 32*Σ sc_i·bsum_i.
+            Vector128<sbyte> scb2 = Neon.Load16(x->Scales);
+            Vector128<short> scv = AdvSimd.SignExtendWideningLower(scb2.GetLower());
+            Vector128<short> scvH = AdvSimd.SignExtendWideningUpper(scb2);
+            Vector128<short> bs0 = Unsafe.ReadUnaligned<Vector128<short>>(y->Bsums);
+            Vector128<short> bs1 = Unsafe.ReadUnaligned<Vector128<short>>(y->Bsums + 8);
+            Vector128<int> corr = AdvSimd.Add(
+                AdvSimd.Add(AdvSimd.MultiplyWideningLower(scv.GetLower(), bs0.GetLower()),
+                            AdvSimd.MultiplyWideningUpper(scv, bs0)),
+                AdvSimd.Add(AdvSimd.MultiplyWideningLower(scvH.GetLower(), bs1.GetLower()),
+                            AdvSimd.MultiplyWideningUpper(scvH, bs1)));
+            int sub = Neon.Reduce(corr) << 5;
+
+            sumf += d * (Neon.Reduce(sumi) - sub);
+        }
+
+        return sumf;
+    }
 
     /// <summary>Portable single-row entry: builds the <see cref="BlockQ8KAct"/> view, then <see cref="DotAct"/>.</summary>
     public static float DotVec(BlockQ6K* x, BlockQ8K* y, int n)
@@ -573,7 +666,7 @@ public static unsafe class Q6K
         => GemvPrequantMulti(y, nIn, pool, weights, output, nOut, null, null, 0);
 
     /// <summary>Portable GEMV uses the <see cref="BlockQ8KAct"/> view; null means the AVX2/scalar Dot.</summary>
-    private static bool UseVecAct => !Simd.UseAvx2 && VecI8.PairLayoutSupported;
+    private static bool UseVecAct => !Simd.UseAvx2 && !Simd.UseDp && VecI8.PairLayoutSupported;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static float Row(BlockQ6K* w, BlockQ8K* y, BlockQ8KAct* act, int nIn, int nb)

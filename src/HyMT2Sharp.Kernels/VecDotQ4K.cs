@@ -1,6 +1,7 @@
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 
 namespace Sdcb.HyMT2Sharp.Kernels;
@@ -11,7 +12,96 @@ public static unsafe class VecDotQ4K
     {
         if (Simd.UseAvx2)
             return DotAvx2(x, y, n);
+        if (Simd.UseDp)
+            return DotNeon(x, y, n);
         return DotVec(x, y, n);
+    }
+
+    /// <summary>
+    /// ARM64 NEON row dot: nibble extraction stays in bytes (no u16 widening),
+    /// each 16-value group runs one SDOT, and the eight group dots get scaled by
+    /// a pairwise-pair tree so the whole loop stays in four i32 lanes.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotNeon(BlockQ4K* x, BlockQ8K* y, int n)
+    {
+        int nb = n / Qk.SuperBlock;
+        Vector128<byte> m4 = Vector128.Create((byte)0x0F);
+        float sumf = 0;
+        float minAcc = 0;
+        for (int i = 0; i < nb; i++, x++, y++)
+        {
+            float d = y->D * HalfBits.ToSingle(x->D);
+            float dmin = y->D * HalfBits.ToSingle(x->Dmin);
+
+            // Decode 12 packed scale bytes -> [sc0..sc7][mn0..mn7] via the utmp trick.
+            uint u0 = Unsafe.ReadUnaligned<uint>(x->Scales);
+            uint u1 = Unsafe.ReadUnaligned<uint>(x->Scales + 4);
+            uint u2 = Unsafe.ReadUnaligned<uint>(x->Scales + 8);
+            uint sc03 = u0 & 0x3f3f3f3f;
+            uint sc47 = (u2 & 0x0f0f0f0f) | (((u0 >> 6) & 0x03030303) << 4);
+            uint mn03 = u1 & 0x3f3f3f3f;
+            uint mn47 = ((u2 >> 4) & 0x0f0f0f0f) | (((u1 >> 6) & 0x03030303) << 4);
+
+            // mins: Σ_j bsums[2s]+bsums[2s+1] pairs · mins[s]  (s = 32-value group)
+            Vector128<short> bs0 = Unsafe.ReadUnaligned<Vector128<short>>(y->Bsums);
+            Vector128<short> bs1 = Unsafe.ReadUnaligned<Vector128<short>>(y->Bsums + 8);
+            Vector128<short> pairSums = AdvSimd.Arm64.AddPairwise(bs0, bs1); // 8 shorts
+            Vector128<short> mn = AdvSimd.ZeroExtendWideningLower(Vector128.Create(mn03, mn47, 0u, 0u).AsByte().GetLower()).AsInt16();
+            Vector128<int> prodLo = AdvSimd.MultiplyWideningLower(pairSums.GetLower(), mn.GetLower());
+            Vector128<int> prodHi = AdvSimd.MultiplyWideningUpper(pairSums, mn);
+            minAcc += dmin * AdvSimd.Arm64.AddAcross(AdvSimd.Add(prodLo, prodHi)).ToScalar();
+
+            // scale vectors: [sc0,sc2,sc4,sc6] for lo nibbles, [sc1,sc3,sc5,sc7] for hi
+            Vector128<byte> scAll = Vector128.Create(sc03, sc47, 0u, 0u).AsByte();
+            Vector128<int> scEven = Vector128.Create((int)scAll[0], (int)scAll[2], (int)scAll[4], (int)scAll[6]);
+            Vector128<int> scOdd = Vector128.Create((int)scAll[1], (int)scAll[3], (int)scAll[5], (int)scAll[7]);
+
+            byte* q = x->Qs;
+            sbyte* a = y->Qs;
+            Vector128<int> accLo0 = Vector128<int>.Zero, accLo1 = Vector128<int>.Zero;
+            Vector128<int> accLo2 = Vector128<int>.Zero, accLo3 = Vector128<int>.Zero;
+            Vector128<int> accHi0 = Vector128<int>.Zero, accHi1 = Vector128<int>.Zero;
+            Vector128<int> accHi2 = Vector128<int>.Zero, accHi3 = Vector128<int>.Zero;
+            for (int j = 0; j < 4; j++, q += 32, a += 64)
+            {
+                Vector128<byte> v0 = Neon.LoadU16(q);
+                Vector128<byte> v1 = Neon.LoadU16(q + 16);
+                Vector128<sbyte> lo0 = AdvSimd.And(v0, m4).AsSByte();
+                Vector128<sbyte> lo1 = AdvSimd.And(v1, m4).AsSByte();
+                Vector128<sbyte> hi0 = AdvSimd.And(AdvSimd.ShiftRightLogical(v0.AsUInt16(), 4).AsByte(), m4).AsSByte();
+                Vector128<sbyte> hi1 = AdvSimd.And(AdvSimd.ShiftRightLogical(v1.AsUInt16(), 4).AsByte(), m4).AsSByte();
+                switch (j)
+                {
+                    case 0:
+                        accLo0 = Neon.Sdot(Neon.Sdot(accLo0, lo0, Neon.Load16(a)), lo1, Neon.Load16(a + 16));
+                        accHi0 = Neon.Sdot(Neon.Sdot(accHi0, hi0, Neon.Load16(a + 32)), hi1, Neon.Load16(a + 48));
+                        break;
+                    case 1:
+                        accLo1 = Neon.Sdot(Neon.Sdot(accLo1, lo0, Neon.Load16(a)), lo1, Neon.Load16(a + 16));
+                        accHi1 = Neon.Sdot(Neon.Sdot(accHi1, hi0, Neon.Load16(a + 32)), hi1, Neon.Load16(a + 48));
+                        break;
+                    case 2:
+                        accLo2 = Neon.Sdot(Neon.Sdot(accLo2, lo0, Neon.Load16(a)), lo1, Neon.Load16(a + 16));
+                        accHi2 = Neon.Sdot(Neon.Sdot(accHi2, hi0, Neon.Load16(a + 32)), hi1, Neon.Load16(a + 48));
+                        break;
+                    default:
+                        accLo3 = Neon.Sdot(Neon.Sdot(accLo3, lo0, Neon.Load16(a)), lo1, Neon.Load16(a + 16));
+                        accHi3 = Neon.Sdot(Neon.Sdot(accHi3, hi0, Neon.Load16(a + 32)), hi1, Neon.Load16(a + 48));
+                        break;
+                }
+            }
+
+            // Pairwise trees -> [sub0 dot, sub2 dot, sub4 dot, sub6 dot] and odd subs.
+            Vector128<int> dotsLo = Neon.PairAdd(Neon.PairAdd(accLo0, accLo1), Neon.PairAdd(accLo2, accLo3));
+            Vector128<int> dotsHi = Neon.PairAdd(Neon.PairAdd(accHi0, accHi1), Neon.PairAdd(accHi2, accHi3));
+            Vector128<int> sumi = AdvSimd.Add(
+                AdvSimd.Multiply(dotsLo, scEven),
+                AdvSimd.Multiply(dotsHi, scOdd));
+            sumf += d * Neon.Reduce(sumi);
+        }
+
+        return sumf - minAcc;
     }
 
     /// <summary>Portable single-row entry: builds the <see cref="BlockQ8KAct"/> view, then <see cref="DotAct"/>.</summary>

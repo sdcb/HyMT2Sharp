@@ -109,7 +109,7 @@ public sealed class STQ1_0Tests
     [Fact]
     public unsafe void PackedPanelMatchesScalarGemvAndGemm()
     {
-        if (!Simd.UseAvx2)
+        if (!Simd.UsePanels)
             return;
         const int nIn = 512, nOut = 16, tokens = 4;
         Random rng = new(789);
@@ -156,7 +156,7 @@ public sealed class STQ1_0Tests
     [Fact]
     public unsafe void PackedPanelParallelMatchesScalar()
     {
-        if (!Simd.UseAvx2)
+        if (!Simd.UsePanels)
             return;
         const int nIn = 1024, nOut = 64, tokens = 8;
         Random rng = new(901);

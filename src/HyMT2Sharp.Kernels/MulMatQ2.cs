@@ -1,3 +1,4 @@
+using System.Threading;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics.X86;
 
@@ -28,7 +29,7 @@ public static unsafe class MulMatQ2
         float* y, int nIn, int nOut, CpuThreadPool? pool)
     {
         int nb = nIn / Q2_0C.BlockLength;
-        int groups = packed != null && Simd.UseAvx2 ? nOut / 8 : 0;
+        int groups = packed != null && Simd.UsePanels ? nOut / 8 : 0;
         int tail = nOut - groups * 8;
         void Run(int worker, int workers)
         {
@@ -54,7 +55,7 @@ public static unsafe class MulMatQ2
             Gemv(packed, rows, input, output, nIn, nOut, pool, scratch);
             return;
         }
-        if (!Simd.UseAvx2 || packed == null)
+        if (!Simd.UsePanels || packed == null)
         {
             int nbv = nIn / Q2_0C.BlockLength;
             VecGemmF.Gemm((byte*)rows, nbv * sizeof(BlockQ2_0C), sizeof(BlockQ2_0C), Q2_0C.BlockLength,
@@ -77,12 +78,19 @@ public static unsafe class MulMatQ2
             NativeMemory.Clear(src + tokens * nIn, (nuint)((long)(padded - tokens) * nIn * sizeof(float)));
         }
         int quantGroups = padded / 4;
+        int quantCursor = 0;
+        int gemmCursor = 0;
         void Run(int worker, int workers)
         {
-            for (int g = quantGroups * worker / workers; g < quantGroups * (worker + 1) / workers; g++)
+            while (true)
+            {
+                int g = Interlocked.Increment(ref quantCursor) - 1;
+                if (g >= quantGroups)
+                    break;
                 QuantizeQ8Kx4.Quantize4x8(src + g * 4 * nIn, q8 + g * q8Blocks, nIn);
+            }
             if (workers > 1) pool!.Barrier();
-            RunRange(packed, dst, groups, q8, nIn, nOut, padded, nb, worker, workers);
+            RunRange(packed, dst, groups, q8, nIn, nOut, padded, nb, ref gemmCursor);
         }
         if (pool == null) Run(0, 1); else pool.For(Math.Max(quantGroups, groups), Run);
 
@@ -113,8 +121,8 @@ public static unsafe class MulMatQ2
     private static void RunQuantized(float* input, float* up, BlockQ8Kx4* q8, int nIn, int tokens,
         CpuThreadPool? pool, Q2PanelWeight w0, Q2PanelWeight w1, Q2PanelWeight w2)
     {
-        if (!Simd.UseAvx2)
-            throw new PlatformNotSupportedException("Q2 panels require AVX2.");
+        if (!Simd.UsePanels)
+            throw new PlatformNotSupportedException("Q2 panels require AVX2 or AdvSimd+SDOT.");
         if (nIn <= 0 || nIn % Q2_0C.BlockLength != 0 || tokens <= 0 || (tokens & 3) != 0)
             throw new ArgumentException("Q2 panels require a positive multiple of 512 inputs and four tokens.");
         ValidatePanel(w0);
@@ -123,21 +131,25 @@ public static unsafe class MulMatQ2
         int nb = nIn / Q2_0C.BlockLength;
         int q8Blocks = nIn / Qk.SuperBlock;
         int quantGroups = tokens / 4;
+        int quantCursor = 0;
+        int c0 = 0, c1 = 0, c2 = 0;
         int count = Math.Max(quantGroups, Math.Max(w0.NOut / 8, Math.Max(w1.NOut / 8, w2.NOut / 8)));
         void Run(int worker, int workers)
         {
-            int begin = quantGroups * worker / workers;
-            int end = quantGroups * (worker + 1) / workers;
-            if (up == null)
-                for (int g = begin; g < end; g++)
+            while (true)
+            {
+                int g = Interlocked.Increment(ref quantCursor) - 1;
+                if (g >= quantGroups)
+                    break;
+                if (up == null)
                     QuantizeQ8Kx4.Quantize4x8(input + g * 4 * nIn, q8 + g * q8Blocks, nIn);
-            else
-                for (int g = begin; g < end; g++)
+                else
                     QuantizeQ8Kx4.Quantize4x8Silu(input + g * 4 * nIn, up + g * 4 * nIn, q8 + g * q8Blocks, nIn);
+            }
             if (workers > 1) pool!.Barrier();
-            RunRange(w0.Packed, w0.Dst, w0.NOut / 8, q8, nIn, w0.NOut, tokens, nb, worker, workers);
-            RunRange(w1.Packed, w1.Dst, w1.NOut / 8, q8, nIn, w1.NOut, tokens, nb, worker, workers);
-            RunRange(w2.Packed, w2.Dst, w2.NOut / 8, q8, nIn, w2.NOut, tokens, nb, worker, workers);
+            RunRange(w0.Packed, w0.Dst, w0.NOut / 8, q8, nIn, w0.NOut, tokens, nb, ref c0);
+            RunRange(w1.Packed, w1.Dst, w1.NOut / 8, q8, nIn, w1.NOut, tokens, nb, ref c1);
+            RunRange(w2.Packed, w2.Dst, w2.NOut / 8, q8, nIn, w2.NOut, tokens, nb, ref c2);
         }
         if (pool == null) Run(0, 1); else pool.For(count, Run);
     }
@@ -151,15 +163,19 @@ public static unsafe class MulMatQ2
     private static void DequantBlock(byte* p, float* dst) =>
         Q2_0C.DequantizeRow((BlockQ2_0C*)p, dst, Q2_0C.BlockLength);
 
+    /// <summary>Workers claim column tiles until the weight is exhausted (dynamic, not static).</summary>
     private static void RunRange(BlockQ2x8* packed, float* output, int groups, BlockQ8Kx4* q8,
-        int nIn, int nOut, int tokens, int nb, int worker, int workers)
+        int nIn, int nOut, int tokens, int nb, ref int cursor)
     {
         if (packed == null || groups == 0)
             return;
-        int begin = groups * worker / workers;
-        int end = groups * (worker + 1) / workers;
         int tile = Math.Max(1, ColTileBytes / (nb * sizeof(BlockQ2x8)));
-        for (int g = begin; g < end; g += tile)
-            Q2Panel.Gemm(packed + g * nb, q8, output + g * 8, nIn, nOut, tokens, Math.Min(tile, end - g));
+        while (true)
+        {
+            int g = Interlocked.Add(ref cursor, tile) - tile;
+            if (g >= groups)
+                break;
+            Q2Panel.Gemm(packed + g * nb, q8, output + g * 8, nIn, nOut, tokens, Math.Min(tile, groups - g));
+        }
     }
 }

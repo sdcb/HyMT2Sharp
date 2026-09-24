@@ -59,9 +59,9 @@ public sealed class Q4KKernelTests
             {
                 // Portable dispatch runs an f32 dequant GEMM; AVX2 runs the
                 // Q8-quantized packed panel.
-                float tol = Simd.UseAvx2 ? 1e-4f : 1e-3f;
+                float tol = Simd.UsePanels ? 1e-4f : 1e-3f;
                 float expected;
-                if (Simd.UseAvx2)
+                if (Simd.UsePanels)
                 {
                     using NativeBuffer rowQ8 = new((nuint)Q8K.RowBytes(nIn));
                     Q8K.QuantizeRow(ip + t * nIn, (BlockQ8K*)rowQ8.Pointer, nIn);
@@ -122,13 +122,13 @@ public sealed class Q4KKernelTests
         MulMatQ2.Gemm((BlockQ2x8*)panel.Pointer, (BlockQ2_0C*)raw.Pointer, (float*)input.Pointer, (float*)output.Pointer, nIn, nOut, tokens, null, scratch);
         using NativeBuffer dw = new((nuint)(nIn * sizeof(float)));
         float* ip2 = (float*)input.Pointer;
-        float tol2 = Simd.UseAvx2 ? 1e-4f : 1e-3f;
+        float tol2 = Simd.UsePanels ? 1e-4f : 1e-3f;
         for (int t = 0; t < tokens; t++)
         {
             for (int r = 0; r < nOut; r++)
             {
                 float expected;
-                if (Simd.UseAvx2)
+                if (Simd.UsePanels)
                 {
                     using NativeBuffer q8 = new((nuint)Q8K.RowBytes(nIn));
                     Q8K.QuantizeRow(ip2 + t * nIn, (BlockQ8K*)q8.Pointer, nIn);
@@ -150,7 +150,7 @@ public sealed class Q4KKernelTests
     [Fact]
     public unsafe void Q2_QuantizeAndGemmMatchesRows()
     {
-        if (!Simd.UseAvx2)
+        if (!Simd.UsePanels)
             return;
         const int nIn = 1024, nOut = 8, tokens = 4;
         Random rng = new(91);

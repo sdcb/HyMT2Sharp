@@ -21,7 +21,7 @@ public static unsafe class KQuantGemv
         int nb = nIn / Qk.SuperBlock;
         int n0 = t0.Rows, n1 = t1.Rows, n2 = t2.Rows;
         int total = n0 + n1 + n2;
-        bool vec = !Simd.UseAvx2 && VecI8.PairLayoutSupported;
+        bool vec = !Simd.UseAvx2 && !Simd.UseDp && VecI8.PairLayoutSupported;
         NativeBuffer? actOwned = vec && nb > 64 ? new NativeBuffer((nuint)(nb * sizeof(BlockQ8KAct))) : null;
         BlockQ8KAct* actStack = stackalloc BlockQ8KAct[vec && actOwned == null ? nb : 0];
         BlockQ8KAct* act = actOwned != null ? (BlockQ8KAct*)actOwned.Pointer : vec ? actStack : null;

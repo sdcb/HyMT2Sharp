@@ -1,6 +1,7 @@
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 
 namespace Sdcb.HyMT2Sharp.Kernels;
@@ -31,7 +32,7 @@ public static unsafe class Q2_0C
     }
 
     public static float Dot(BlockQ2_0C* x, BlockQ8K* y, int n) =>
-        Simd.UseAvx2 ? DotAvx2(x, y, n) : DotVec(x, y, n);
+        Simd.UseAvx2 ? DotAvx2(x, y, n) : Simd.UseDp ? DotNeon(x, y, n) : DotVec(x, y, n);
 
     /// <summary>
     /// Portable fallback: same dword bit-spread as <see cref="DotAvx2"/> via
@@ -89,6 +90,48 @@ public static unsafe class Q2_0C
         v = (v | (v << 12)) & new Vector<uint>(0x000F000F);
         v = (v | (v << 6)) & new Vector<uint>(0x03030303);
         VecI8.AccDotI8(Vector.AsVectorSByte(v), VecI8.LoadS8(a), ref acc);
+    }
+
+    /// <summary>
+    /// NEON/SDOT version of <see cref="DotAvx2"/>: the same dword bit-spread, but
+    /// the -3 correction is folded into the weight operand (codes 0..3 become
+    /// -3/-1/+1/+3) so each 16-byte step is a single sdot.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotNeon(BlockQ2_0C* x, BlockQ8K* y, int n)
+    {
+        float sum = 0;
+        for (int b = 0; b < n / BlockLength; b++)
+        {
+            int s0 = Dot256Neon(x[b].Qs, y[b * 2].Qs);
+            int s1 = Dot256Neon(x[b].Qs + 64, y[b * 2 + 1].Qs);
+            sum += HalfBits.ToSingle(x[b].D) * (s0 * y[b * 2].D + s1 * y[b * 2 + 1].D);
+        }
+        return sum;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static int Dot256Neon(byte* q, sbyte* a)
+    {
+        Vector128<int> acc = Vector128<int>.Zero;
+        for (int j = 0; j < 64; j += 8, a += 32)
+        {
+            // Eight packed bytes -> eight dwords, same spread as the AVX2 path.
+            Vector128<byte> packed = Vector128.CreateScalar(Unsafe.ReadUnaligned<ulong>(q + j)).AsByte();
+            Vector128<ushort> w16 = AdvSimd.ZeroExtendWideningLower(packed.GetLower());
+            acc = SpreadDotNeon(AdvSimd.ZeroExtendWideningLower(w16.GetLower()), a, acc);
+            acc = SpreadDotNeon(AdvSimd.ZeroExtendWideningUpper(w16), a + 16, acc);
+        }
+        return Neon.Reduce(acc);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<int> SpreadDotNeon(Vector128<uint> v, sbyte* a, Vector128<int> acc)
+    {
+        v = AdvSimd.And(AdvSimd.Or(v, AdvSimd.ShiftLeftLogical(v, 12)), Vector128.Create(0x000F000Fu));
+        v = AdvSimd.And(AdvSimd.Or(v, AdvSimd.ShiftLeftLogical(v, 6)), Vector128.Create(0x03030303u));
+        Vector128<sbyte> w = AdvSimd.Subtract(AdvSimd.Add(v, v).AsByte().AsSByte(), Vector128.Create((sbyte)3));
+        return Neon.Sdot(acc, w, Neon.Load16(a));
     }
 
     public static float DotScalarForTest(BlockQ2_0C* x, BlockQ8K* y, int n)

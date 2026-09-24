@@ -2,6 +2,7 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using System.Runtime.Intrinsics.Arm;
 using System.Runtime.Intrinsics.X86;
 
 namespace Sdcb.HyMT2Sharp.Kernels;
@@ -87,7 +88,23 @@ public static unsafe class Q8_0
 
     /// <summary>Row dot on raw blocks; portable widening path on non-AVX2 hosts.</summary>
     public static float Dot(BlockQ8_0* weight, BlockQ8_0Act* act, int n) =>
-        Simd.UseAvx2 ? DotScalar(weight, act, n) : DotVec(weight, act, n);
+        Simd.UseAvx2 ? DotScalar(weight, act, n) : Simd.UseDp ? DotNeon(weight, act, n) : DotVec(weight, act, n);
+
+    /// <summary>Two sdot per 32-value block — signed int8 needs no correction.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotNeon(BlockQ8_0* weight, BlockQ8_0Act* act, int n)
+    {
+        int nb = n / Qk.Q8_0Block;
+        float sum = 0;
+        for (int i = 0; i < nb; i++)
+        {
+            Vector128<int> j = Neon.Sdot(
+                Neon.Sdot(Vector128<int>.Zero, Neon.Load16(weight[i].Qs), Neon.Load16(act[i].Qs)),
+                Neon.Load16(weight[i].Qs + 16), Neon.Load16(act[i].Qs + 16));
+            sum += HalfBits.ToSingle(weight[i].D) * act[i].D * Neon.Reduce(j);
+        }
+        return sum;
+    }
 
     public static float DotVec(BlockQ8_0* weight, BlockQ8_0Act* act, int n)
     {
@@ -126,6 +143,11 @@ public static unsafe class Q8_0
             {
                 for (; row + 3 < end; row += 4)
                     Dot4Rows(weights, act, output, nIn, row);
+            }
+            else if (Simd.UseDp)
+            {
+                for (; row + 3 < end; row += 4)
+                    Dot4RowsNeon(weights, act, output, nIn, row);
             }
 
             int nb = nIn / Qk.Q8_0Block;
@@ -166,6 +188,8 @@ public static unsafe class Q8_0
                         PackedGroupVnni(w, act, output + g * 8, nb);
                     else if (Simd.UseAvx2)
                         PackedGroupAvx2(w, act, output + g * 8, nb);
+                    else if (Simd.UseDp)
+                        PackedGroupNeon(w, act, output + g * 8, nb);
                     else
                         PackedGroupScalar(w, act, output + g * 8, nb);
                 }
@@ -214,6 +238,8 @@ public static unsafe class Q8_0
                 PackedGroupVnni(w, act, t.Dst + g * 8, nb);
             else if (Simd.UseAvx2)
                 PackedGroupAvx2(w, act, t.Dst + g * 8, nb);
+            else if (Simd.UseDp)
+                PackedGroupNeon(w, act, t.Dst + g * 8, nb);
             else
                 PackedGroupScalar(w, act, t.Dst + g * 8, nb);
         }
@@ -316,6 +342,39 @@ public static unsafe class Q8_0
         Avx.Store(dst, acc);
     }
 
+    /// <summary>
+    /// Panel version for NEON: each 32-byte step holds 8 columns × 4 weights, so
+    /// two sdot against the broadcast activation quad produce per-column dots.
+    /// </summary>
+    private static void PackedGroupNeon(BlockQ8_0x8* w, BlockQ8_0Act* act, float* dst, int nb)
+    {
+        Vector128<float> accLo = Vector128<float>.Zero;
+        Vector128<float> accHi = Vector128<float>.Zero;
+        for (int b = 0; b < nb; b++)
+        {
+            BlockQ8_0x8* wb = w + b;
+            Vector128<int> jLo = Vector128<int>.Zero;
+            Vector128<int> jHi = Vector128<int>.Zero;
+            sbyte* aq = act[b].Qs;
+            sbyte* q = (sbyte*)wb->Qs;
+            for (int step = 0; step < 8; step++)
+            {
+                Vector128<sbyte> a = Neon.Dup4(aq + step * 4);
+                jLo = Neon.Sdot(jLo, Neon.Load16(q + step * 32), a);
+                jHi = Neon.Sdot(jHi, Neon.Load16(q + step * 32 + 16), a);
+            }
+
+            float ad = act[b].D;
+            accLo = AdvSimd.FusedMultiplyAdd(accLo, AdvSimd.ConvertToSingle(jLo),
+                AdvSimd.Multiply(Unsafe.ReadUnaligned<Vector128<float>>(wb->D), Vector128.Create(ad)));
+            accHi = AdvSimd.FusedMultiplyAdd(accHi, AdvSimd.ConvertToSingle(jHi),
+                AdvSimd.Multiply(Unsafe.ReadUnaligned<Vector128<float>>(wb->D + 4), Vector128.Create(ad)));
+        }
+
+        Unsafe.WriteUnaligned(dst, accLo);
+        Unsafe.WriteUnaligned(dst + 4, accHi);
+    }
+
     private static void PackedGroupScalar(BlockQ8_0x8* w, BlockQ8_0Act* act, float* dst, int nb)
     {
         for (int c = 0; c < 8; c++)
@@ -404,6 +463,37 @@ public static unsafe class Q8_0
             a1 += da * HalfBits.ToSingle(r1[b].D) * Dot32(r1[b].Qs, aq, sum);
             a2 += da * HalfBits.ToSingle(r2[b].D) * Dot32(r2[b].Qs, aq, sum);
             a3 += da * HalfBits.ToSingle(r3[b].D) * Dot32(r3[b].Qs, aq, sum);
+        }
+
+        output[row] = a0;
+        output[row + 1] = a1;
+        output[row + 2] = a2;
+        output[row + 3] = a3;
+    }
+
+    /// <summary>NEON variant of <see cref="Dot4Rows"/>: activation stays in two registers across the four row dots.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Dot4RowsNeon(BlockQ8_0* weights, BlockQ8_0Act* act, float* output, int nIn, int row)
+    {
+        int nb = nIn / Qk.Q8_0Block;
+        BlockQ8_0* r0 = weights + row * nb;
+        BlockQ8_0* r1 = r0 + nb;
+        BlockQ8_0* r2 = r1 + nb;
+        BlockQ8_0* r3 = r2 + nb;
+        Vector128<int> zero = Vector128<int>.Zero;
+        float a0 = 0;
+        float a1 = 0;
+        float a2 = 0;
+        float a3 = 0;
+        for (int b = 0; b < nb; b++)
+        {
+            Vector128<sbyte> aq0 = Neon.Load16(act[b].Qs);
+            Vector128<sbyte> aq1 = Neon.Load16(act[b].Qs + 16);
+            float da = act[b].D;
+            a0 += da * HalfBits.ToSingle(r0[b].D) * Neon.Reduce(Neon.Sdot(Neon.Sdot(zero, Neon.Load16(r0[b].Qs), aq0), Neon.Load16(r0[b].Qs + 16), aq1));
+            a1 += da * HalfBits.ToSingle(r1[b].D) * Neon.Reduce(Neon.Sdot(Neon.Sdot(zero, Neon.Load16(r1[b].Qs), aq0), Neon.Load16(r1[b].Qs + 16), aq1));
+            a2 += da * HalfBits.ToSingle(r2[b].D) * Neon.Reduce(Neon.Sdot(Neon.Sdot(zero, Neon.Load16(r2[b].Qs), aq0), Neon.Load16(r2[b].Qs + 16), aq1));
+            a3 += da * HalfBits.ToSingle(r3[b].D) * Neon.Reduce(Neon.Sdot(Neon.Sdot(zero, Neon.Load16(r3[b].Qs), aq0), Neon.Load16(r3[b].Qs + 16), aq1));
         }
 
         output[row] = a0;
