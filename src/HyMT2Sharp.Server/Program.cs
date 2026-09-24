@@ -10,12 +10,19 @@ string modelPath = GetArg(args, "--model", "-m")
     ?? @"D:\_\model\Hy-MT2-1.8B-2Bit.gguf";
 int threads = GetInt(args, 0, "--threads", "-t");
 int maxTokens = GetInt(args, 256, "--max-tokens");
-// Stateless translation serving defaults to no cross-request cache.
+// Stateless translation serving defaults to no cross-request cache; "blocks"
+// keeps completed 64-token prefix blocks in a bounded pool so shared
+// prefixes survive across unrelated requests.
+int kvBlockMb = GetInt(args, 1024, "--kv-block-mb");
+int kvBlockTokens = GetInt(args, 64, "--kv-block-tokens");
+if (kvBlockTokens <= 0)
+    throw new ArgumentException($"--kv-block-tokens must be positive, got {kvBlockTokens}");
 KvCacheConfig kvCache = GetArg(args, "--kv-cache")?.ToLowerInvariant() switch
 {
     null or "none" => KvCacheConfig.None,
     "memory" => KvCacheConfig.Memory,
-    string other => throw new ArgumentException($"--kv-cache must be none|memory, got {other}"),
+    "blocks" => KvCacheConfig.BlockPolicy(kvBlockMb << 20, kvBlockTokens),
+    string other => throw new ArgumentException($"--kv-cache must be none|memory|blocks, got {other}"),
 };
 string urls = GetArg(args, "--urls")
     ?? Environment.GetEnvironmentVariable("ASPNETCORE_URLS")
