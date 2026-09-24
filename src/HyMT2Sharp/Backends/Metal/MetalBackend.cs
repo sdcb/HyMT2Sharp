@@ -20,6 +20,8 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private readonly Dictionary<string, IntPtr> _w = new(StringComparer.Ordinal);
     private readonly Dictionary<string, GgmlTensorType> _wtype = new(StringComparer.Ordinal);
     private IntPtr _psoGemv, _psoGemvQ6, _psoEmbedQ4, _psoEmbedQ6, _psoRms, _psoRope, _psoKvAppend, _psoAttn, _psoSilu, _psoAdd;
+    private IntPtr _psoGemm, _psoGemmQ6, _psoEmbedRowsQ4, _psoEmbedRowsQ6, _psoRopeMulti, _psoKvAppendMulti;
+    private IntPtr _psoAttnScores, _psoAttnCombine;
     private IntPtr[] _kvK = null!, _kvV = null!;
     private int _kvCap;
     private int _kvStride;
@@ -35,7 +37,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
 
     public string Name => "metal";
 
-    public bool SupportsPrefill => false;
+    public bool SupportsPrefill => true;
 
     public MetalBackend()
     {
@@ -64,6 +66,14 @@ public sealed unsafe class MetalBackend : IComputeBackend
         _psoAttn = NewPso(lib2, "attn_decode");
         _psoSilu = NewPso(lib2, "silu_mul");
         _psoAdd = NewPso(lib2, "add_inplace");
+        _psoGemm = NewPso(lib2, "q4k_gemm");
+        _psoGemmQ6 = NewPso(lib2, "q6k_gemm");
+        _psoEmbedRowsQ4 = NewPso(lib2, "q4k_embed_rows");
+        _psoEmbedRowsQ6 = NewPso(lib2, "q6k_embed_rows");
+        _psoRopeMulti = NewPso(lib2, "rope_neox_multi");
+        _psoKvAppendMulti = NewPso(lib2, "kv_append_multi");
+        _psoAttnScores = NewPso(lib2, "attn_scores");
+        _psoAttnCombine = NewPso(lib2, "attn_combine");
 
         foreach ((string name, GgufTensorInfo info) in gguf.Tensors)
         {
@@ -137,8 +147,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
     public float[] ForwardStep(ReadOnlySpan<int> tokens, int pos)
     {
         if (tokens.Length != 1)
-            throw new NotSupportedException(
-                "Metal backend (M2) runs decode only (seq == 1); prefill stays on CPU — use --backend cpu if that is not desired");
+            return PrefillStep(tokens, pos);
         int tokenId = tokens[0];
         ModelConfig c = _cfg;
         int hidden = c.HiddenSize, heads = c.NumHeads, kvHeads = c.NumKvHeads;
@@ -225,24 +234,155 @@ public sealed unsafe class MetalBackend : IComputeBackend
         return _logitsHost;
     }
 
+    // seq > 1 forward: same layer sequence as decode but GEMM instead of GEMV,
+    // multi-token rope/KV-append variants, and attention dispatched per position
+    // (kvLen = start + t + 1). Per-call scratch buffers are autoreleased MTLBuffers —
+    // they live until the pool drains in Finish(), after waitUntilCompleted.
+    private float[] PrefillStep(ReadOnlySpan<int> tokens, int start)
+    {
+        ModelConfig c = _cfg;
+        int hidden = c.HiddenSize, heads = c.NumHeads, kvHeads = c.NumKvHeads;
+        int dim = c.HeadDim, qDim = heads * dim, kDim = kvHeads * dim, ffn = c.FfnSize;
+        int T = tokens.Length, kvLen = start + T;
+        if (kvLen > _kvCap)
+            throw new NotSupportedException($"Metal KV capacity {_kvCap} exceeded at {kvLen} (M3 flat cap)");
+        float scale = 1f / MathF.Sqrt(dim);
+
+        IntPtr toks;
+        fixed (int* tp = tokens) toks = _dev.NewBufferBytes(tp, (nuint)(T * 4));
+        IntPtr h = _dev.NewBuffer((nuint)(T * hidden * 4));
+        IntPtr n1 = _dev.NewBuffer((nuint)(T * hidden * 4));
+        IntPtr n2 = _dev.NewBuffer((nuint)(T * hidden * 4));
+        IntPtr q = _dev.NewBuffer((nuint)(T * qDim * 4));
+        IntPtr kb = _dev.NewBuffer((nuint)(T * kDim * 4));
+        IntPtr vb = _dev.NewBuffer((nuint)(T * kDim * 4));
+        IntPtr ao = _dev.NewBuffer((nuint)(T * qDim * 4));
+        IntPtr attnOut = _dev.NewBuffer((nuint)(T * hidden * 4));
+        IntPtr gate = _dev.NewBuffer((nuint)(T * ffn * 4));
+        IntPtr up = _dev.NewBuffer((nuint)(T * ffn * 4));
+        IntPtr down = _dev.NewBuffer((nuint)(T * hidden * 4));
+        IntPtr normed = _dev.NewBuffer((nuint)(T * hidden * 4));
+        IntPtr scores = _dev.NewBuffer((nuint)heads * (nuint)T * (nuint)kvLen * 4);
+
+        var cc = CmdCtx.Begin(_dev.Queue);
+        cc.SetPso(PsoFor("token_embd.weight", _psoEmbedRowsQ4, _psoEmbedRowsQ6));
+        cc.SetBuffer(_embd, 0, 0); cc.SetBuffer(toks, 0, 1); cc.SetBuffer(h, 0, 2);
+        cc.SetInt(3, hidden);
+        cc.Dispatch((nuint)T, 1, 1, 256, 1, 1);
+
+        for (int l = 0; l < c.NumLayers; l++)
+        {
+            Rms(cc, h, W($"blk.{l}.attn_norm.weight"), n1, T, hidden);
+            Gemm(cc, $"blk.{l}.attn_q.weight", n1, q, hidden, qDim, T);
+            Gemm(cc, $"blk.{l}.attn_k.weight", n1, kb, hidden, kDim, T);
+            Gemm(cc, $"blk.{l}.attn_v.weight", n1, vb, hidden, kDim, T);
+            RopeMulti(cc, q, heads, dim, start, T);
+            RopeMulti(cc, kb, kvHeads, dim, start, T);
+            Rms(cc, q, W($"blk.{l}.attn_q_norm.weight"), q, T * heads, dim);
+            Rms(cc, kb, W($"blk.{l}.attn_k_norm.weight"), kb, T * kvHeads, dim);
+            cc.SetPso(_psoKvAppendMulti);
+            cc.SetBuffer(kb, 0, 0); cc.SetBuffer(vb, 0, 1);
+            cc.SetBuffer(_kvK[l], 0, 2); cc.SetBuffer(_kvV[l], 0, 3);
+            cc.SetInt(4, kDim); cc.SetInt(5, _kvStride); cc.SetInt(6, start);
+            cc.Dispatch((nuint)((T * kDim + 255) / 256), 1, 1, 256, 1, 1);
+            if (Environment.GetEnvironmentVariable("HYMT_METAL_SLOWATTN") == "1")
+            {
+                for (int t = 0; t < T; t++)
+                {
+                    cc.SetPso(_psoAttn);
+                    cc.SetBuffer(q, (nuint)(t * qDim * 4), 0);
+                    cc.SetBuffer(_kvK[l], 0, 1); cc.SetBuffer(_kvV[l], 0, 2);
+                    cc.SetBuffer(ao, (nuint)(t * qDim * 4), 3);
+                    cc.SetInt(4, heads); cc.SetInt(5, kvHeads); cc.SetInt(6, dim);
+                    cc.SetInt(7, _kvStride); cc.SetInt(8, start + t + 1); cc.SetFloat(9, scale);
+                    cc.Dispatch((nuint)heads, 1, 1, 128, 1, 1);
+                }
+            }
+            else
+            {
+                cc.SetPso(_psoAttnScores);
+                cc.SetBuffer(q, 0, 0); cc.SetBuffer(_kvK[l], 0, 1); cc.SetBuffer(scores, 0, 2);
+                cc.SetInt(3, heads); cc.SetInt(4, kvHeads); cc.SetInt(5, dim);
+                cc.SetInt(6, _kvStride); cc.SetInt(7, kvLen); cc.SetInt(8, start); cc.SetInt(9, T);
+                cc.SetFloat(10, scale);
+                cc.Dispatch((nuint)T, (nuint)heads, 1, 128, 1, 1);
+                cc.SetPso(_psoAttnCombine);
+                cc.SetBuffer(scores, 0, 0); cc.SetBuffer(_kvV[l], 0, 1); cc.SetBuffer(ao, 0, 2);
+                cc.SetInt(3, heads); cc.SetInt(4, kvHeads); cc.SetInt(5, dim);
+                cc.SetInt(6, _kvStride); cc.SetInt(7, kvLen); cc.SetInt(8, start); cc.SetInt(9, T);
+                cc.Dispatch((nuint)T, (nuint)heads, 1, 128, 1, 1);
+            }
+            Gemm(cc, $"blk.{l}.attn_output.weight", ao, attnOut, qDim, hidden, T);
+            Add(cc, h, attnOut, T * hidden);
+
+            Rms(cc, h, W($"blk.{l}.ffn_norm.weight"), n2, T, hidden);
+            Gemm(cc, $"blk.{l}.ffn_gate.weight", n2, gate, hidden, ffn, T);
+            Gemm(cc, $"blk.{l}.ffn_up.weight", n2, up, hidden, ffn, T);
+            cc.SetPso(_psoSilu);
+            cc.SetBuffer(gate, 0, 0); cc.SetBuffer(up, 0, 1);
+            cc.SetInt(2, T * ffn);
+            cc.Dispatch((nuint)((T * ffn + 255) / 256), 1, 1, 256, 1, 1);
+            Gemm(cc, $"blk.{l}.ffn_down.weight", gate, down, ffn, hidden, T);
+            Add(cc, h, down, T * hidden);
+        }
+
+        Rms(cc, h, _outNorm, normed, T, hidden);
+        Gemv(cc, "output.weight", normed, (nuint)((T - 1) * hidden * 4), _logitsBuf, 0, hidden, _vocab);
+
+        cc.EndEnc();
+        cc.Commit();
+        cc.Wait();
+        cc.Drain();
+
+        Marshal.Copy((IntPtr)Contents(_logitsBuf), _logitsHost, 0, _vocab);
+        return _logitsHost;
+    }
+
+    private void RopeMulti(CmdCtx c, IntPtr x, int heads, int headDim, int posBase, int T)
+    {
+        int half = _cfg.RopeDim / 2;
+        int n = T * heads * half;
+        c.SetPso(_psoRopeMulti);
+        c.SetBuffer(x, 0, 0);
+        c.SetInt(1, headDim); c.SetInt(2, _cfg.RopeDim); c.SetInt(3, posBase);
+        c.SetFloat(4, _cfg.RopeBase); c.SetInt(5, heads); c.SetInt(6, n);
+        c.Dispatch((nuint)((n + 255) / 256), 1, 1, 256, 1, 1);
+    }
+
+    private IntPtr PsoFor(string name, IntPtr q4, IntPtr q6) => _wtype[name] switch
+    {
+        GgmlTensorType.Q4_K => q4,
+        GgmlTensorType.Q6_K => q6,
+        GgmlTensorType t => throw new NotSupportedException(
+            $"gemv/gemm {name}: {t} not supported on Metal backend — use --backend cpu"),
+    };
+
     private void Gemv(CmdCtx c, string name, IntPtr x, IntPtr y, int inDim, int outDim)
+        => Gemv(c, name, x, 0, y, 0, inDim, outDim);
+
+    private void Gemv(CmdCtx c, string name, IntPtr x, nuint xOff, IntPtr y, nuint yOff, int inDim, int outDim)
     {
         IntPtr w = W(name);
-        IntPtr pso = _wtype[name] switch
-        {
-            GgmlTensorType.Q4_K => _psoGemv,
-            GgmlTensorType.Q6_K => _psoGemvQ6,
-            GgmlTensorType t => throw new NotSupportedException(
-                $"gemv {name}: {t} not supported on Metal backend — use --backend cpu"),
-        };
         // fast4 kernels stage scales in threadgroup sf[]:
         // q4k -> in_dim <= 6144 (sf[4*192] groups of 32), q6k -> sf[4*384] groups of 16.
         if (inDim > 6144)
             throw new NotSupportedException($"gemv {name}: in_dim {inDim} exceeds fast4 limit 6144");
-        c.SetPso(pso);
-        c.SetBuffer(w, 0, 0); c.SetBuffer(x, 0, 1); c.SetBuffer(y, 0, 2);
+        c.SetPso(PsoFor(name, _psoGemv, _psoGemvQ6));
+        c.SetBuffer(w, 0, 0); c.SetBuffer(x, xOff, 1); c.SetBuffer(y, yOff, 2);
         c.SetInt(3, inDim); c.SetInt(4, outDim);
         c.Dispatch((nuint)((outDim + 3) / 4), 1, 1, 256, 1, 1);
+    }
+
+    // [T x inDim] · W^T -> [T x outDim]; TILE_T=8 token rows per threadgroup tile.
+    private void Gemm(CmdCtx c, string name, IntPtr x, IntPtr y, int inDim, int outDim, int T)
+    {
+        IntPtr w = W(name);
+        if (inDim > 6144)
+            throw new NotSupportedException($"gemm {name}: in_dim {inDim} exceeds fast4 limit 6144");
+        c.SetPso(PsoFor(name, _psoGemm, _psoGemmQ6));
+        c.SetBuffer(w, 0, 0); c.SetBuffer(x, 0, 1); c.SetBuffer(y, 0, 2);
+        c.SetInt(3, inDim); c.SetInt(4, outDim); c.SetInt(5, T);
+        c.Dispatch((nuint)((outDim + 3) / 4), (nuint)((T + 7) / 8), 1, 256, 1, 1);  // TILE_T=8
     }
 
     private void Rms(CmdCtx c, IntPtr x, IntPtr w, IntPtr y, int rows, int dim)

@@ -42,6 +42,12 @@ if (args.Contains("--micro-metal-q6"))
     return;
 }
 
+if (args.Contains("--micro-metal-attn"))
+{
+    Sdcb.HyMT2Sharp.Backends.Metal.MetalGemvMicro.RunAttn();
+    return;
+}
+
 if (args.Contains("--micro-vec-q4"))
 {
     MicroVecQ4(Args.GetInt(args, "--micro-in", 2048), Args.GetInt(args, "--micro-out", 6144), Args.GetInt(args, "--micro-tokens", 512), Args.GetInt(args, "--micro-reps", 5), threads);
