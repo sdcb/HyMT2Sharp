@@ -4,7 +4,7 @@ using System.Runtime.Intrinsics.X86;
 namespace Sdcb.HyMT2Sharp.Kernels;
 
 /// <summary>
-/// ISA dispatch order: AVX-VNNI → AVX2 → AdvSimd+SDOT (ARM64) → portable
+/// ISA dispatch order: AVX-512 → AVX-VNNI → AVX2 → AdvSimd+SDOT (ARM64) → portable
 /// <see cref="System.Numerics.Vector{T}"/> → scalar (kept for tests/reference only).
 /// Setting HYMT2SHARP_FORCE_PORTABLE=1 skips the hardware paths so the
 /// Vector&lt;T&gt; tier can be exercised everywhere; on ARM64 it is the tier
@@ -14,6 +14,13 @@ public static class Simd
 {
     public static readonly bool ForcePortable =
         Environment.GetEnvironmentVariable("HYMT2SHARP_FORCE_PORTABLE") is "1" or "true" or "TRUE";
+
+    /// <summary>AVX-512 baseline for 512-bit kernels: F + BW + VL.</summary>
+    public static bool UseAvx512 =>
+        Avx512F.IsSupported && Avx512BW.IsSupported && Avx512F.VL.IsSupported && Avx512BW.VL.IsSupported && !ForcePortable;
+
+    /// <summary>AVX-512 VBMI (<c>vpermb</c>): full-width byte lookups for codebook/tile decode.</summary>
+    public static bool UseAvx512Vbmi => UseAvx512 && Avx512Vbmi.IsSupported;
 
     public static bool UseAvx2 => Avx2.IsSupported && !ForcePortable;
     public static bool UseAvxVnni => AvxVnni.IsSupported && !ForcePortable;
@@ -28,8 +35,9 @@ public static class Simd
 
     /// <summary>
     /// Whether the x8 packed weight panels have a fast kernel on this machine
-    /// (AVX2 on x86, SDOT on ARM64). Repack runs once at load, so pack whenever
-    /// either kernel can consume them.
+    /// (AVX-512/AVX2 on x86, SDOT on ARM64). Repack runs once at load, so pack
+    /// whenever either kernel can consume them. AVX-512 kernels read the same
+    /// canonical AVX2 panel layouts — no separate repack variant exists.
     /// </summary>
-    public static bool UsePanels => UseAvx2 || UseDp;
+    public static bool UsePanels => UseAvx512 || UseAvx2 || UseDp;
 }
