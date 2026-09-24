@@ -28,7 +28,9 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     public ModelConfig Config { get; private set; }
     public BpeTokenizer Tokenizer { get; }
     public int ThreadCount => _pool.ThreadCount;
-    public string ThreadAutoHint => CpuTopology.AutoHint;
+    public string ThreadAutoHint => CpuThreadPool.CalibratedWorkers > 0
+        ? $"{CpuTopology.AutoHint}; calibrated={CpuThreadPool.CalibratedWorkers}"
+        : CpuTopology.AutoHint;
     public static bool ProfileEnabled;
     public static long TicksQ4;
     public static long TicksQ2;
