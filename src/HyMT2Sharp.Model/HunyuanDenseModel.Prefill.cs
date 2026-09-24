@@ -38,8 +38,8 @@ public sealed unsafe partial class HunyuanDenseModel
         int qDim = heads * dim;
         int kDim = kvHeads * dim;
         float* q = (float*)Bump((nuint)((long)seq * qDim * sizeof(float)));
-        float* k = _cacheK[layer] + start * kDim;
-        float* v = _cacheV[layer] + start * kDim;
+        float* k = (float*)Bump((nuint)((long)seq * kDim * sizeof(float)));
+        float* v = (float*)Bump((nuint)((long)seq * kDim * sizeof(float)));
         PrefillQkv(input, q, k, v, layer, seq);
 
         long tRope = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
@@ -49,6 +49,8 @@ public sealed unsafe partial class HunyuanDenseModel
             TicksRope += Stopwatch.GetTimestamp() - tRope;
         Rms($"blk.{layer}.attn_q_norm.weight", q, q, seq * heads, dim);
         Rms($"blk.{layer}.attn_k_norm.weight", k, k, seq * kvHeads, dim);
+        Ops.ConvertToBf16(k, _cacheK[layer] + start * kDim, seq * kDim, _pool);
+        Ops.ConvertToBf16(v, _cacheV[layer] + start * kDim, seq * kDim, _pool);
 
         int kvStride = kDim;
         int kvLen = start + seq;

@@ -17,14 +17,15 @@ public sealed class AttentionTests
         float scale = 1f / MathF.Sqrt(dim);
 
         float[] q = Random(qLen * qDim, 1);
-        float[] cacheK = Random(kvLen * kvStride, 2);
-        float[] cacheV = Random(kvLen * kvStride, 3);
+        ushort[] cacheK = Random(kvLen * kvStride, 2).Select(ToBf16).ToArray();
+        ushort[] cacheV = Random(kvLen * kvStride, 3).Select(ToBf16).ToArray();
         float[] scores = new float[heads * qLen * kvLen];
         float[] scoresRef = new float[heads * qLen * kvLen];
         float[] ao = new float[qLen * qDim];
         float[] aoRef = new float[qLen * qDim];
 
-        fixed (float* qp = q, kp = cacheK, vp = cacheV, sc = scores, scr = scoresRef, aop = ao, aor = aoRef)
+        fixed (float* qp = q, sc = scores, scr = scoresRef, aop = ao, aor = aoRef)
+        fixed (ushort* kp = cacheK, vp = cacheV)
         {
             int group = heads / kvHeads;
             for (int h = 0; h < heads; h++)
@@ -36,10 +37,10 @@ public sealed class AttentionTests
                     float* row = scr + (h * qLen + qt) * kvLen;
                     for (int kt = 0; kt < kvLen; kt++)
                     {
-                        float* kh = kp + kt * kvStride + kvh * dim;
+                        ushort* kh = kp + kt * kvStride + kvh * dim;
                         float dot = 0;
                         for (int i = 0; i < dim; i++)
-                            dot += qh[i] * kh[i];
+                            dot += qh[i] * B2F(kh[i]);
                         row[kt] = dot * scale;
                     }
                 }
@@ -58,9 +59,9 @@ public sealed class AttentionTests
                     for (int kt = 0; kt < kvLen; kt++)
                     {
                         float w = row[kt];
-                        float* vh = vp + kt * kvStride + kvh * dim;
+                        ushort* vh = vp + kt * kvStride + kvh * dim;
                         for (int i = 0; i < dim; i++)
-                            outH[i] += w * vh[i];
+                            outH[i] += w * B2F(vh[i]);
                     }
                 }
             }
@@ -129,6 +130,14 @@ public sealed class AttentionTests
             Assert.True(MathF.Abs(got - expected) < 1e-4f * n, $"{got} vs {expected}");
         }
     }
+
+    private static ushort ToBf16(float x)
+    {
+        uint bits = BitConverter.SingleToUInt32Bits(x);
+        return (ushort)((bits + 0x7FFFu + ((bits >> 16) & 1)) >> 16);
+    }
+
+    private static float B2F(ushort h) => BitConverter.UInt32BitsToSingle((uint)h << 16);
 
     private static float[] Random(int n, int seed)
     {
