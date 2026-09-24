@@ -1,9 +1,7 @@
 <Solution>
   <Project Path="src/HyMT2Sharp.Benchmark/HyMT2Sharp.Benchmark.csproj" />
   <Project Path="src/HyMT2Sharp.Cli/HyMT2Sharp.Cli.csproj" />
-  <Project Path="src/HyMT2Sharp.Gguf/HyMT2Sharp.Gguf.csproj" />
-  <Project Path="src/HyMT2Sharp.Kernels/HyMT2Sharp.Kernels.csproj" />
-  <Project Path="src/HyMT2Sharp.Model/HyMT2Sharp.Model.csproj" />
+  <Project Path="src/HyMT2Sharp/HyMT2Sharp.csproj" />
   <Project Path="src/HyMT2Sharp.Server/HyMT2Sharp.Server.csproj" />
   <Project Path="tests/HyMT2Sharp.Tests/HyMT2Sharp.Tests.csproj" />
 </Solution>

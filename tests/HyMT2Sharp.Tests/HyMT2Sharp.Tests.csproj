@@ -14,8 +14,7 @@
     </PackageReference>
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\..\src\HyMT2Sharp.Kernels\HyMT2Sharp.Kernels.csproj" />
-    <ProjectReference Include="..\..\src\HyMT2Sharp.Model\HyMT2Sharp.Model.csproj" />
+    <ProjectReference Include="..\..\src\HyMT2Sharp\HyMT2Sharp.csproj" />
     <ProjectReference Include="..\..\src\HyMT2Sharp.Server\HyMT2Sharp.Server.csproj" />
   </ItemGroup>
 </Project>

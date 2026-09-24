@@ -1,9 +1,0 @@
-<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup>
-    <Description>Hy-MT2 hunyuan-dense CPU inference: load GGUF, tokenize, KV cache and Forward.</Description>
-  </PropertyGroup>
-  <ItemGroup>
-    <ProjectReference Include="..\HyMT2Sharp.Kernels\HyMT2Sharp.Kernels.csproj" />
-    <ProjectReference Include="..\HyMT2Sharp.Gguf\HyMT2Sharp.Gguf.csproj" />
-  </ItemGroup>
-</Project>

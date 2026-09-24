@@ -26,9 +26,7 @@ static void Run(string exe, string args, Encoding encoding) => Util.Cmd(exe, arg
 // Model package can still depend on an older Gguf / Kernels package.
 static ProjectVersion[] Projects =
 {
-	new("HyMT2Sharp.Gguf", "1.0.0"),
-	new("HyMT2Sharp.Kernels", "1.0.0"),
-	new("HyMT2Sharp.Model", "1.0.0"),
+	new("HyMT2Sharp", "1.0.0"),
 };
 
 static string VersionPropertyName(string projectName) => projectName.Replace(".", "") + "Version";

@@ -30,6 +30,12 @@ if (args.Contains("--micro-q4"))
     return;
 }
 
+if (args.Contains("--micro-metal-q4"))
+{
+    Sdcb.HyMT2Sharp.Backends.Metal.MetalGemvMicro.Run();
+    return;
+}
+
 if (args.Contains("--micro-vec-q4"))
 {
     MicroVecQ4(Args.GetInt(args, "--micro-in", 2048), Args.GetInt(args, "--micro-out", 6144), Args.GetInt(args, "--micro-tokens", 512), Args.GetInt(args, "--micro-reps", 5), threads);
@@ -86,6 +92,7 @@ if (!bench && !args.Contains("--verify-prefill"))
     Console.WriteLine("  --dump-q4-gemm");
     Console.WriteLine("  --dump-silu");
     Console.WriteLine("  --micro-q4 [--micro-in N --micro-out N --micro-tokens N --micro-reps N]");
+    Console.WriteLine("  --micro-metal-q4   (macOS only: Q4_K Metal GEMV correctness + bandwidth)");
     return;
 }
 

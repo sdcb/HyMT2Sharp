@@ -1,6 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk.Web">
   <ItemGroup>
-    <ProjectReference Include="..\HyMT2Sharp.Model\HyMT2Sharp.Model.csproj" />
-    <ProjectReference Include="..\HyMT2Sharp.Gguf\HyMT2Sharp.Gguf.csproj" />
+    <ProjectReference Include="..\HyMT2Sharp\HyMT2Sharp.csproj" />
   </ItemGroup>
 </Project>
