@@ -53,6 +53,23 @@ HyMT2Sharp 分发顺序 **AVX-VNNI → AVX2 → AdvSimd/SDOT → `Vector<float>`
 - **Decode**：瓶颈从 portable 的 ALU-bound（`Vector<T>` 表达不了 sdot，只能 u16 lane 拆位）翻转为带宽/权重流式读取。STQ 提升 9 倍最夸张（portable 下 stride-16 布局接近半标量）。llama.cpp 的 Q8 decode 仍快 ~8%，差距在其 GEMV 的 load 排布；HyMT2Sharp 已在 Q4/Q6 反超。
 - **bf16 KV 的长上下文收益**（同一构建 A/B，pp2048+decode128 @2K ctx）：AdvSimd 档 decode fp32-KV 33.10 → bf16-KV **41.21** tok/s（+24.5%），Vector 档 22.65 → **27.23**（+20.2%）；prefill 同步 +2~5%。KV 读取带宽减半，收益随上下文长度继续放大（2K ctx 时 KV 读约占 decode 时间的 1/3）；同时 2048 ctx 的 KV 内存从 512MB 降到 256MB。
 
+### Metal GPU 后端（纯 net10.0 + libobjc P/Invoke，`--backend metal`，同日补测）
+
+同一 VM 的 Apple M4 paravirtual GPU（Metal only，无 bfloat/simdgroup 特性，走 portable 档 kernel）。decode 为 M2 融合图（embed_gather 去 host 化，~165 dispatch/token），prefill 为量化 GEMM（TILE_T=8）+ 融合 causal attention；KV 为 bf16 + 64-token 块表分页（device 侧 KvBlockStore）。支持全部 5 种量化（Q2_0C/STQ1_0 的 embd 为 Q6_K，output.weight 与其绑定）。
+
+| 量化   | Metal prefill 512 | SDOT prefill | Metal decode 128 | SDOT decode | Metal/SDOT decode |
+| ------ | ----------------: | -----------: | ---------------: | ----------: | ----------------: |
+| STQ1_0 |              89.9 |     140.00   |            59.76 |      38.54  |           1.55×   |
+| Q2_0C  |             115.1 |     137.89   |            59.37 |      46.46  |           1.28×   |
+| Q4_K_M |             203.6 |     147.70   |            56.25 |      40.83  |           1.38×   |
+| Q6_K   |             211.3 |     194.86   |            53.63 |      35.87  |           1.50×   |
+| Q8_0   |             164.1 |     207.81   |            43.50 |      34.41  |           1.26×   |
+
+- **decode 全面反超 SDOT**（1.26–1.55×），但各量化收敛在 44–60 tok/s 而非随位宽下降等比变快——瓶颈已移到与量化无关的部分：vocab=120818 的 logits gemv（embd/output 恒为 Q6_K，STQ/Q2 文件里它独占 ~44% 字节）加固定 dispatch 序列；低位量化的权重字节优势被淹没。
+- **prefill 只有 Q4/Q6 反超**：paravirt GPU 算力弱（paravirt GPU 无 tensor core 路径，纯 ALU），GEMM 吞吐与 SDOT CPU 接近，Q8/Q2/STQ 的反量化成本把 GPU 拖回 CPU 之下。
+- **STQ kernel 曾撞 paravirt GPU watchdog**（~10s command buffer 上限）：初版逐 lane 标量 gather + 函数内 `const uchar CB[32]` 被编译器 spill 到私有显存，512-token prefill 25s 触发 timeout（`status=5,error=2`），之后所有 command buffer 被秒拒（`error=4`）表现为 decode "1368 tok/s" 假象。改法：CB 提为文件作用域 `constant`、内层按 4 组一批做 `float4` 向量化读 x——25s→5.7s，回到阈值内。**对低位量化 kernel 的教训：paravirt GPU 上私有地址空间的动态索引小表是性能杀手。**
+- 复现：`./Sdcb.HyMT2Sharp.Benchmark --model <gguf> --bench-prefill 512 --bench-decode 128 --backend metal`；`HYMT_METAL_TIMING=1` 可看每 token 的 encode/GPU 分解。
+
 ## 3. 实现要点
 
 - **Decode GEMV**：5 种量化全部 SDOT。Q6_K 在 `RepackQ6K.RowsNeon` 里把码值预偏移成有符号（code−32），GEMV 免掉 bsum 校正；Q2_0C 为 `2·dot − 3·Σa`，STQ1_0 为 `dot − Σa`（`TotalSums` 的三重加只用于 Q2）。

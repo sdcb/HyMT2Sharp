@@ -19,8 +19,10 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private ModelConfig _cfg = null!;
     private readonly Dictionary<string, IntPtr> _w = new(StringComparer.Ordinal);
     private readonly Dictionary<string, GgmlTensorType> _wtype = new(StringComparer.Ordinal);
-    private IntPtr _psoGemv, _psoGemvQ6, _psoEmbedQ4, _psoEmbedQ6, _psoRms, _psoRope, _psoKvAppend, _psoAttn, _psoSilu, _psoAdd;
-    private IntPtr _psoGemm, _psoGemmQ6, _psoEmbedRowsQ4, _psoEmbedRowsQ6, _psoRopeMulti, _psoKvAppendMulti;
+    private IntPtr _psoGemv, _psoGemvQ6, _psoGemvQ8, _psoGemvQ2, _psoGemvStq;
+    private IntPtr _psoGemm, _psoGemmQ6, _psoGemmQ8, _psoGemmQ2, _psoGemmStq;
+    private IntPtr _psoEmbedQ4, _psoEmbedQ6, _psoEmbedQ8, _psoRms, _psoRope, _psoKvAppend, _psoAttn, _psoSilu, _psoAdd;
+    private IntPtr _psoEmbedRowsQ4, _psoEmbedRowsQ6, _psoEmbedRowsQ8, _psoRopeMulti, _psoKvAppendMulti;
     private IntPtr _psoAttnScores, _psoAttnCombine, _psoKvCopy;
     private IntPtr[] _kvK = null!, _kvV = null!;
     private int _kvCap;
@@ -77,8 +79,12 @@ public sealed unsafe class MetalBackend : IComputeBackend
         IntPtr lib2 = _dev.NewLibraryFromSource(MslDecodeKernels.Source);
         _psoGemv = NewPso(lib1, "q4k_gemv_fast4");
         _psoGemvQ6 = NewPso(lib2, "q6k_gemv_fast4");
+        _psoGemvQ8 = NewPso(lib2, "q8_0_gemv_fast4");
+        _psoGemvQ2 = NewPso(lib2, "q2c_gemv_fast4");
+        _psoGemvStq = NewPso(lib2, "stq_gemv_fast4");
         _psoEmbedQ4 = NewPso(lib2, "q4k_embed_row");
         _psoEmbedQ6 = NewPso(lib2, "q6k_embed_row");
+        _psoEmbedQ8 = NewPso(lib2, "q8_0_embed_row");
         _psoRms = NewPso(lib2, "rmsnorm_rows");
         _psoRope = NewPso(lib2, "rope_neox");
         _psoKvAppend = NewPso(lib2, "kv_append_bf16");
@@ -87,8 +93,12 @@ public sealed unsafe class MetalBackend : IComputeBackend
         _psoAdd = NewPso(lib2, "add_inplace");
         _psoGemm = NewPso(lib2, "q4k_gemm");
         _psoGemmQ6 = NewPso(lib2, "q6k_gemm");
+        _psoGemmQ8 = NewPso(lib2, "q8_0_gemm");
+        _psoGemmQ2 = NewPso(lib2, "q2c_gemm");
+        _psoGemmStq = NewPso(lib2, "stq_gemm");
         _psoEmbedRowsQ4 = NewPso(lib2, "q4k_embed_rows");
         _psoEmbedRowsQ6 = NewPso(lib2, "q6k_embed_rows");
+        _psoEmbedRowsQ8 = NewPso(lib2, "q8_0_embed_rows");
         _psoRopeMulti = NewPso(lib2, "rope_neox_multi");
         _psoKvAppendMulti = NewPso(lib2, "kv_append_multi");
         if (cfg.HeadDim > 128)
@@ -105,8 +115,11 @@ public sealed unsafe class MetalBackend : IComputeBackend
                 GgmlTensorType.F32 => info.NumElements * sizeof(float),
                 GgmlTensorType.Q4_K => info.NumElements / 256 * (ulong)144,
                 GgmlTensorType.Q6_K => info.NumElements / 256 * (ulong)210,
+                GgmlTensorType.Q8_0 => info.NumElements / 32 * (ulong)34,
+                GgmlTensorType.Q2_0C => info.NumElements / 512 * (ulong)130,
+                GgmlTensorType.STQ1_0 => info.NumElements / 256 * (ulong)42,
                 _ => throw new NotSupportedException(
-                    $"Metal backend (M2) supports F32/Q4_K/Q6_K only; {name} is {info.Type} — use --backend cpu"),
+                    $"Metal backend supports F32/Q4_K/Q6_K/Q8_0/Q2_0C/STQ1_0 only; {name} is {info.Type} — use --backend cpu"),
             };
             byte* data = gguf.DataBase + (long)info.Offset;
             _w[name] = _dev.NewBufferBytes(data, (nuint)bytes);
@@ -373,6 +386,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
         {
             GgmlTensorType.Q4_K => _psoEmbedQ4,
             GgmlTensorType.Q6_K => _psoEmbedQ6,
+            GgmlTensorType.Q8_0 => _psoEmbedQ8,
             GgmlTensorType t => throw new NotSupportedException(
                 $"embed token_embd.weight: {t} not supported on Metal backend — use --backend cpu"),
         });
@@ -478,7 +492,8 @@ public sealed unsafe class MetalBackend : IComputeBackend
 
         var cc = CmdCtx.Begin(_dev.Queue);
         ExecCopies(cc);
-        cc.SetPso(PsoFor("token_embd.weight", _psoEmbedRowsQ4, _psoEmbedRowsQ6));
+        cc.SetPso(PsoFor("token_embd.weight", hidden,
+            (_psoEmbedRowsQ4, _psoEmbedRowsQ6, _psoEmbedRowsQ8, default, default)));
         cc.SetBuffer(_embd, 0, 0); cc.SetBuffer(toks, 0, 1); cc.SetBuffer(h, 0, 2);
         cc.SetInt(3, hidden);
         cc.Dispatch((nuint)T, 1, 1, 256, 1, 1);
@@ -570,13 +585,31 @@ public sealed unsafe class MetalBackend : IComputeBackend
         c.Dispatch((nuint)((n + 255) / 256), 1, 1, 256, 1, 1);
     }
 
-    private IntPtr PsoFor(string name, IntPtr q4, IntPtr q6) => _wtype[name] switch
+    // (q4k, q6k, q8_0, q2_0c, stq1_0)
+    private IntPtr PsoFor(string name, int inDim,
+        (IntPtr q4, IntPtr q6, IntPtr q8, IntPtr q2, IntPtr stq) p)
     {
-        GgmlTensorType.Q4_K => q4,
-        GgmlTensorType.Q6_K => q6,
-        GgmlTensorType t => throw new NotSupportedException(
-            $"gemv/gemm {name}: {t} not supported on Metal backend — use --backend cpu"),
-    };
+        GgmlTensorType t = _wtype[name];
+        int granule = t switch
+        {
+            GgmlTensorType.Q4_K or GgmlTensorType.Q6_K or GgmlTensorType.STQ1_0 => 256,
+            GgmlTensorType.Q2_0C => 512,
+            GgmlTensorType.Q8_0 => 32,
+            _ => 1,
+        };
+        if (inDim % granule != 0)
+            throw new NotSupportedException($"gemv/gemm {name}: in_dim {inDim} not a multiple of {t} granule {granule}");
+        return t switch
+        {
+            GgmlTensorType.Q4_K => p.q4,
+            GgmlTensorType.Q6_K => p.q6,
+            GgmlTensorType.Q8_0 => p.q8,
+            GgmlTensorType.Q2_0C => p.q2,
+            GgmlTensorType.STQ1_0 => p.stq,
+            _ => throw new NotSupportedException(
+                $"gemv/gemm {name}: {t} not supported on Metal backend — use --backend cpu"),
+        };
+    }
 
     private void Gemv(CmdCtx c, string name, IntPtr x, IntPtr y, int inDim, int outDim)
         => Gemv(c, name, x, 0, y, 0, inDim, outDim);
@@ -588,7 +621,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
         // q4k -> in_dim <= 6144 (sf[4*192] groups of 32), q6k -> sf[4*384] groups of 16.
         if (inDim > 6144)
             throw new NotSupportedException($"gemv {name}: in_dim {inDim} exceeds fast4 limit 6144");
-        c.SetPso(PsoFor(name, _psoGemv, _psoGemvQ6));
+        c.SetPso(PsoFor(name, inDim, (_psoGemv, _psoGemvQ6, _psoGemvQ8, _psoGemvQ2, _psoGemvStq)));
         c.SetBuffer(w, 0, 0); c.SetBuffer(x, xOff, 1); c.SetBuffer(y, yOff, 2);
         c.SetInt(3, inDim); c.SetInt(4, outDim);
         c.Dispatch((nuint)((outDim + 3) / 4), 1, 1, 256, 1, 1);
@@ -600,7 +633,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
         IntPtr w = W(name);
         if (inDim > 6144)
             throw new NotSupportedException($"gemm {name}: in_dim {inDim} exceeds fast4 limit 6144");
-        c.SetPso(PsoFor(name, _psoGemm, _psoGemmQ6));
+        c.SetPso(PsoFor(name, inDim, (_psoGemm, _psoGemmQ6, _psoGemmQ8, _psoGemmQ2, _psoGemmStq)));
         c.SetBuffer(w, 0, 0); c.SetBuffer(x, 0, 1); c.SetBuffer(y, 0, 2);
         c.SetInt(3, inDim); c.SetInt(4, outDim); c.SetInt(5, T);
         c.Dispatch((nuint)((outDim + 3) / 4), (nuint)((T + 7) / 8), 1, 256, 1, 1);  // TILE_T=8
