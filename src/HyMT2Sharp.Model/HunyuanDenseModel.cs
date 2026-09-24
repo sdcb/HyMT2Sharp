@@ -63,9 +63,9 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         TicksEmbed = 0;
     }
 
-    public HunyuanDenseModel(string ggufPath, int threads = 0, KvCachePolicy cachePolicy = KvCachePolicy.Memory)
+    public HunyuanDenseModel(string ggufPath, int threads = 0, KvCacheConfig? cacheConfig = null)
     {
-        CachePolicy = cachePolicy;
+        CacheConfig = cacheConfig ?? KvCacheConfig.Memory;
         _gguf = new GgufFile(ggufPath);
         Config = ModelConfig.FromGguf(_gguf);
         if (Config.VocabSize == 0)
@@ -85,7 +85,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         _cacheKBuffers = new NativeBuffer[Config.NumLayers];
         _cacheVBuffers = new NativeBuffer[Config.NumLayers];
         int kvStride = Config.NumKvHeads * Config.HeadDim;
-        if (cachePolicy == KvCachePolicy.Memory)
+        if (CacheConfig.KeepFlatCache && CacheConfig.Blocks is null)
         {
             for (int l = 0; l < Config.NumLayers; l++)
             {
@@ -99,29 +99,31 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         }
         else
         {
-            // None: buffers grow lazily through EnsureCache and are returned
-            // at end of request, so an idle service holds no KV memory.
+            // Buffers grow lazily through EnsureCache — under KeepFlatCache
+            // they stay warm (block-store prefixes live in _blockStore);
+            // without it they're returned at end of request so an idle
+            // service holds no KV memory.
             _cacheCap = 0;
         }
     }
 
-    public KvCachePolicy CachePolicy { get; }
+    public KvCacheConfig CacheConfig { get; }
 
     public int CacheLength => _cacheLen;
 
     public void ResetCache() => TruncateCache(0);
 
     /// <summary>
-    /// Drop the request's cache at end of turn. Under
-    /// <see cref="KvCachePolicy.None"/> the KV buffers themselves are
-    /// returned to the OS; under <see cref="KvCachePolicy.Memory"/> this is
-    /// just <see cref="TruncateCache(int)"/>(0) and the buffers stay warm for
-    /// the next request's prefix match.
+    /// Drop the request's cache at end of turn. Without
+    /// <see cref="KvCacheConfig.KeepFlatCache"/> the KV buffers themselves
+    /// are returned to the OS; with it this is just
+    /// <see cref="TruncateCache(int)"/>(0) and the buffers stay warm for the
+    /// next request's prefix match.
     /// </summary>
     public void EndRequest()
     {
         TruncateCache(0);
-        if (CachePolicy == KvCachePolicy.None)
+        if (!CacheConfig.KeepFlatCache)
             FreeCache();
     }
 

@@ -10,12 +10,11 @@ string modelPath = GetArg(args, "--model", "-m")
     ?? @"D:\_\model\Hy-MT2-1.8B-2Bit.gguf";
 int threads = GetInt(args, 0, "--threads", "-t");
 int maxTokens = GetInt(args, 256, "--max-tokens");
-// Stateless translation serving defaults to no cross-request cache; "disk"
-// is reserved for a later block-store tier.
-KvCachePolicy kvCache = GetArg(args, "--kv-cache")?.ToLowerInvariant() switch
+// Stateless translation serving defaults to no cross-request cache.
+KvCacheConfig kvCache = GetArg(args, "--kv-cache")?.ToLowerInvariant() switch
 {
-    null or "none" => KvCachePolicy.None,
-    "memory" => KvCachePolicy.Memory,
+    null or "none" => KvCacheConfig.None,
+    "memory" => KvCacheConfig.Memory,
     string other => throw new ArgumentException($"--kv-cache must be none|memory, got {other}"),
 };
 string urls = GetArg(args, "--urls")
