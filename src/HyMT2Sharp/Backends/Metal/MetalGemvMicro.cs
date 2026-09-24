@@ -286,4 +286,101 @@ public static class MetalGemvMicro
         int q = hi ? (blk[off + 16 + pi * 32 + w32] >> 4) : (blk[off + 16 + pi * 32 + w32] & 15);
         return d * sc * q - dm * mn;
     }
+
+    // attn_scores/attn_combine synthetic check: random q, KV; compare vs managed.
+    // --micro-metal-attn
+    public static unsafe void RunAttn()
+    {
+        if (!RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+            throw new PlatformNotSupportedException("Metal backend requires macOS.");
+        var dev = MtlDevice.Create();
+        var lib = dev.NewLibraryFromSource(MslDecodeKernels.Source);
+        IntPtr psS = dev.NewPso(dev.NewFunction(lib, "attn_scores"));
+        IntPtr psC = dev.NewPso(dev.NewFunction(lib, "attn_combine"));
+
+        int heads = 4, kvHeads = 2, headDim = 128, kvStride = kvHeads * headDim;
+        int T = 9, posBase = 3, kvLen = posBase + T;
+        var rng = new Random(7);
+        var q = new float[T * heads * headDim];
+        for (int i = 0; i < q.Length; i++) q[i] = (float)(rng.NextDouble() - 0.5);
+        // bf16 KV: write fp32 value as bf16 bits in ushort[]
+        var kb16 = new ushort[kvLen * kvStride];
+        var vb16 = new ushort[kvLen * kvStride];
+        var kvF = new float[kvLen * kvStride];
+        for (int i = 0; i < kvF.Length; i++)
+        {
+            float f = (float)(rng.NextDouble() - 0.5);
+            kvF[i] = f;
+            uint b = BitConverter.SingleToUInt32Bits(f);
+            kb16[i] = vb16[i] = (ushort)(b >> 16);
+        }
+        IntPtr qb = dev.NewBuffer((nuint)(q.Length * 4));
+        IntPtr kb = dev.NewBuffer((nuint)(kb16.Length * 2));
+        IntPtr vb = dev.NewBuffer((nuint)(vb16.Length * 2));
+        IntPtr sb = dev.NewBuffer((nuint)(heads * T * kvLen * 4));
+        IntPtr ob = dev.NewBuffer((nuint)(T * heads * headDim * 4));
+        unsafe
+        {
+            fixed (float* pq = q) Marshal.Copy(q, 0, ObjC.Send0(qb, ObjC.Sel("contents")), q.Length);
+            fixed (ushort* pk = kb16) Buffer.MemoryCopy(pk, (void*)ObjC.Send0(kb, ObjC.Sel("contents")), kb16.Length * 2, kb16.Length * 2);
+            fixed (ushort* pv = vb16) Buffer.MemoryCopy(pv, (void*)ObjC.Send0(vb, ObjC.Sel("contents")), vb16.Length * 2, vb16.Length * 2);
+        }
+        MtlDevice.DidModifyRange(qb, 0, (nuint)(q.Length * 4));
+        MtlDevice.DidModifyRange(kb, 0, (nuint)(kb16.Length * 2));
+        MtlDevice.DidModifyRange(vb, 0, (nuint)(vb16.Length * 2));
+
+        var c = CmdCtx.Begin(dev.Queue);
+        c.SetPso(psS);
+        c.SetBuffer(qb, 0, 0); c.SetBuffer(kb, 0, 1); c.SetBuffer(sb, 0, 2);
+        c.SetInt(3, heads); c.SetInt(4, kvHeads); c.SetInt(5, headDim);
+        c.SetInt(6, kvStride); c.SetInt(7, kvLen); c.SetInt(8, posBase); c.SetInt(9, T);
+        int[] tab = new int[64];
+        for (int i = 0; i < tab.Length; i++) tab[i] = i;  // identity table
+        IntPtr tabB;
+        fixed (int* tp = tab) tabB = dev.NewBufferBytes(tp, (nuint)(tab.Length * 4));
+        c.SetFloat(10, 1f / MathF.Sqrt(headDim));
+        c.SetBuffer(tabB, 0, 11); c.SetInt(12, 6);
+        c.Dispatch((nuint)T, (nuint)heads, 1, 128, 1, 1);
+        c.SetPso(psC);
+        c.SetBuffer(sb, 0, 0); c.SetBuffer(vb, 0, 1); c.SetBuffer(ob, 0, 2);
+        c.SetInt(3, heads); c.SetInt(4, kvHeads); c.SetInt(5, headDim);
+        c.SetInt(6, kvStride); c.SetInt(7, kvLen); c.SetInt(8, posBase); c.SetInt(9, T);
+        c.SetBuffer(tabB, 0, 10); c.SetInt(11, 6);
+        c.Dispatch((nuint)T, (nuint)heads, 1, 128, 1, 1);
+        c.Finish();
+
+        var o = new float[T * heads * headDim];
+        Marshal.Copy(ObjC.Send0(ob, ObjC.Sel("contents")), o, 0, o.Length);
+        double maxErr = 0; int bad = 0;
+        float scale = 1f / MathF.Sqrt(headDim);
+        for (int t = 0; t < T; t++)
+        for (int h = 0; h < heads; h++)
+        {
+            int kvh = h * kvHeads / heads;
+            int kvHere = posBase + t + 1;
+            var sc = new float[kvHere];
+            for (int j = 0; j < kvHere; j++)
+            {
+                double acc = 0;
+                for (int i = 0; i < headDim; i++)
+                    acc += q[t * heads * headDim + h * headDim + i] * kvF[j * kvStride + kvh * headDim + i];
+                sc[j] = (float)(acc * scale);
+            }
+            float mx = sc.Max(), sm = 0;
+            for (int j = 0; j < kvHere; j++) sm += sc[j] = (float)Math.Exp(sc[j] - mx);
+            for (int d = 0; d < headDim; d++)
+            {
+                double acc = 0;
+                for (int j = 0; j < kvHere; j++)
+                    acc += sc[j] * kvF[j * kvStride + kvh * headDim + d];
+                float want = (float)(acc / sm);
+                float got = o[t * heads * headDim + h * headDim + d];
+                double err = Math.Abs(want - got);
+                if (err > 1e-3) bad++;
+                if (err > maxErr) maxErr = err;
+            }
+        }
+        Console.WriteLine($"attn prefill: maxErr={maxErr:F5} bad={bad}/{T * heads * headDim}");
+    }
+
 }

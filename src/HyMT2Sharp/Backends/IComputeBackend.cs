@@ -45,4 +45,44 @@ public interface IComputeBackend : IDisposable
     /// hold positions [0, pos); on return it holds [0, pos+seq) for every layer.
     /// </summary>
     float[] ForwardStep(ReadOnlySpan<int> tokens, int pos);
+
+    /// <summary>
+    /// Whether the backend keeps its own device-side prefix block store.
+    /// When true and the model is configured with KvCacheConfig.Blocks, the
+    /// model delegates harvest/restore to <see cref="HarvestPrefix"/>/
+    /// <see cref="RestorePrefix"/> instead of the CPU-side KvBlockStore:
+    /// blocks then reference KV already resident on the device, so restore
+    /// is a zero-copy table update with no upload.
+    /// </summary>
+    bool SupportsBlockStore => false;
+
+    /// <summary>
+    /// Block size in tokens the device store operates on. The model falls back
+    /// to the CPU-side KvBlockStore when it differs from the configured
+    /// block granularity.
+    /// </summary>
+    int DeviceBlockTokens => 0;
+
+    /// <summary>
+    /// Snapshot device KV for every complete <paramref name="blockTokens"/>-sized
+    /// block inside <paramref name="tokens"/> (the live sequence prefix) into
+    /// the device block store. Called before the cache is disturbed; only
+    /// positions already written on device are harvestable.
+    /// </summary>
+    void HarvestPrefix(ReadOnlySpan<int> tokens, int blockTokens) { }
+
+    /// <summary>
+    /// Restore the longest hash-chained prefix of <paramref name="tokens"/>
+    /// found in the device block store. On return the device KV block table
+    /// covers [0, n) where n is a multiple of
+    /// <paramref name="blockTokens"/> (0 when nothing matched).
+    /// </summary>
+    int RestorePrefix(ReadOnlySpan<int> tokens, int blockTokens) => 0;
+
+    /// <summary>
+    /// Tell the backend the live cache prefix length: positions at or beyond
+    /// <paramref name="len"/> may be recycled freely. Called when the model
+    /// truncates its cache so a paged backend can protect only live blocks.
+    /// </summary>
+    void SetCacheLen(int len) { }
 }

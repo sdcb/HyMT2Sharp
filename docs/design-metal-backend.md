@@ -131,6 +131,6 @@ load 时 `supportsFamily:`/`supportsFeatureSet:` 探测选档;paravirt GPU(Apple
 
 - **M1(spike)**:ObjC.cs + qmatmul_gemv(Q4_K,portable+simdgroup 两档)+ 带宽微基准 → **先测出 portable 档在 paravirt VM 的实墙**,再对照 simdgroup 档;门槛:达到有效带宽 ≥140 GB/s 或给出 VM portable 上限数据
 - **M2**:全 decode 图(embedding→argmax→token 环)Level 0/1,flat KV → 目标按 M1 实测口径定(参考 ≥150 tok/s)
-- **M3**:prefill GEMM + 对拍套件 → 目标 prefill ≥1000 tok/s(VM 上)
-- **M4**:block-table paged attention + `KvBlockStore` 对齐(bf16 块管理)
+- **M3(已落地)**:prefill GEMM(TILE_T=8 量化 tiled matmul)+ 多 token causal attention(`ForwardStep` seq>1)→ 实测 VM prefill ~205 tok/s(paravirt GPU 计算受限,非带宽);接口即 Vulkan 侧 `SupportsPrefill` 同款
+- **M4(已落地)**:block-table paged KV + **device 侧 block store**。KV 池按 64-token 物理块分页,所有 kernel 经 `kv_row(tab,j)` 间接寻址;`MetalBackend` 内置 hash-chain 块存(镜像 `KvBlockStore` 语义——CPU store 看不到 GPU 追加的 KV,`_cpuKvLen` 恒 0,故必须 device 侧)。**restore = 只改表项零拷贝**;pinned phys 写时复制(CoW)保护已存块,`kv_copy_block` 保留部分块前段;LRU 驱逐只碰 live 区外 phys。`IComputeBackend` 加 `SupportsBlockStore`/`DeviceBlockTokens`/`HarvestPrefix`/`RestorePrefix`/`SetCacheLen` 默认成员,块粒度不匹配自动回退 CPU store
 - **M5(可选)**:ICB 调度、Q6_K/Q8_0 kernel、STQ/Q2 自定义量化

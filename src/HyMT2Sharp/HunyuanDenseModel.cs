@@ -70,8 +70,6 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     public HunyuanDenseModel(string ggufPath, int threads = 0, KvCacheConfig? cacheConfig = null, IComputeBackend? backend = null)
     {
         CacheConfig = cacheConfig ?? KvCacheConfig.Memory;
-        if (backend is not null && CacheConfig.Blocks is not null)
-            throw new NotSupportedException("Device backends do not support KvCacheConfig.Blocks yet (M4: paged KV).");
         _gguf = new GgufFile(ggufPath);
         Config = ModelConfig.FromGguf(_gguf);
         _backend = backend;
@@ -171,6 +169,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
             throw new ArgumentOutOfRangeException(nameof(length), length, $"Cannot extend cache from {_cacheLen}.");
         _cacheLen = length;
         _cpuKvLen = Math.Min(_cpuKvLen, length);
+        _backend?.SetCacheLen(length);
         if (_cacheTokens.Count > length)
             _cacheTokens.RemoveRange(length, _cacheTokens.Count - length);
     }
@@ -191,9 +190,18 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     {
         KvBlockStore store = _blockStore!;
         int bt = store.BlockTokens;
+        if (_backend is { SupportsBlockStore: true } dev && dev.DeviceBlockTokens == bt)
+        {
+            dev.HarvestPrefix(CollectionsMarshal.AsSpan(_cacheTokens)[.._cacheLen], bt);
+            return;
+        }
         ulong h = KvBlockStore.Seed;
+        // Only positions with valid CPU KV may be snapshotted: on a device
+        // backend, positions past _cpuKvLen were appended on-GPU and the CPU
+        // rows are stale.
+        int harvestLen = Math.Min(_cacheLen, _cpuKvLen);
         Span<int> tokens = CollectionsMarshal.AsSpan(_cacheTokens);
-        for (int b = 0; b * bt + bt <= _cacheLen; b++)
+        for (int b = 0; b * bt + bt <= harvestLen; b++)
         {
             int[] blockTokens = tokens.Slice(b * bt, bt).ToArray();
             h = KvBlockStore.ChainHash(h, blockTokens);
@@ -208,6 +216,27 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     private void RestoreBlocks(ReadOnlySpan<int> promptIds)
     {
         KvBlockStore store = _blockStore!;
+        if (_backend is { SupportsBlockStore: true } dev && dev.DeviceBlockTokens == store.BlockTokens)
+        {
+            int dbt = store.BlockTokens;
+            dev.HarvestPrefix(CollectionsMarshal.AsSpan(_cacheTokens)[.._cacheLen], dbt);
+            int restored = dev.RestorePrefix(promptIds, dbt);
+            if (restored == 0)
+                return;
+            // Same bookkeeping as the CPU path, minus the KV copy: restored
+            // positions already hold their KV on device.
+            bool devTailValid = KvCacheAlign.PrefixMatches(
+                CollectionsMarshal.AsSpan(_cacheTokens), promptIds, restored);
+            while (_cacheTokens.Count < restored)
+                _cacheTokens.Add(0);
+            promptIds[..restored].CopyTo(CollectionsMarshal.AsSpan(_cacheTokens));
+            if (_cacheLen < restored)
+                _cacheLen = restored;
+            else if (!devTailValid && _cacheLen > restored)
+                TruncateCache(restored);
+            dev.SetCacheLen(_cacheLen);
+            return;
+        }
         HarvestBlocks();
         int bt = store.BlockTokens;
         ulong h = KvBlockStore.Seed;
@@ -272,6 +301,16 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
             // Forward on device: KV is appended on-GPU, CPU caches only hold
             // CPU-prefill positions (a subsequent CPU prefill re-uploads its
             // range; a backend with SupportsPrefill handles seq>1 itself).
+            // Block restore may have rewritten CPU rows for a prefix range —
+            // push that dirty range to the device first. Only rows the CPU
+            // actually holds are valid: min(start, _cpuKvLen).
+            int upTo = Math.Min(start, _cpuKvLen);
+            if (_kvDirtyFrom < upTo)
+            {
+                for (int l = 0; l < Config.NumLayers; l++)
+                    _backend.UploadKv(l, _kvDirtyFrom, upTo - _kvDirtyFrom, _cacheK[l], _cacheV[l]);
+            }
+            _kvDirtyFrom = int.MaxValue;
             float[] devLogits = _backend.ForwardStep(tokens, start);
             _cacheLen += seq;
             _cacheTokens.AddRange(tokens);
