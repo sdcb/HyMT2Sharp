@@ -480,65 +480,7 @@ static unsafe void DumpSilu()
     Console.WriteLine($"dump-silu g0={g[0]}");
 }
 
-static unsafe int ArgMax(float[] logits)
-{
-    int n = logits.Length;
-    int best = 0;
-    float max;
-    fixed (float* p = logits)
-    {
-        if (Avx.IsSupported)
-        {
-            var vmax = Avx.LoadVector256(p);
-            var vidx = Vector256.Create(0, 1, 2, 3, 4, 5, 6, 7);
-            var vbest = vidx;
-            var step = Vector256.Create(8);
-            int i = 8;
-            for (; i + 8 <= n; i += 8)
-            {
-                var v = Avx.LoadVector256(p + i);
-                vidx = Avx2.Add(vidx, step);
-                var gt = Avx.Compare(v, vmax, FloatComparisonMode.OrderedGreaterThanNonSignaling);
-                vmax = Avx.BlendVariable(vmax, v, gt);
-                vbest = Avx2.BlendVariable(vbest, vidx, gt.AsInt32());
-            }
-
-            best = 0;
-            max = vmax.GetElement(0);
-            for (int l = 1; l < 8; l++)
-            {
-                if (vmax.GetElement(l) > max)
-                {
-                    max = vmax.GetElement(l);
-                    best = vbest.GetElement(l);
-                }
-            }
-
-            for (; i < n; i++)
-            {
-                if (p[i] > max)
-                {
-                    max = p[i];
-                    best = i;
-                }
-            }
-
-            return best;
-        }
-
-        max = p[0];
-        for (int i = 1; i < n; i++)
-        {
-            if (p[i] > max)
-            {
-                max = p[i];
-                best = i;
-            }
-        }
-    }
-
-    return best;
-}
+static int ArgMax(float[] logits) => Sampler.ArgMax(logits);
 
 static unsafe class ReadOnly
 {

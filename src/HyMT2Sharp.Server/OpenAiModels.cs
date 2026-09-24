@@ -1,6 +1,7 @@
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Sdcb.HyMT2Sharp.Model;
 
 namespace Sdcb.HyMT2Sharp.Server;
 
@@ -12,6 +13,27 @@ public sealed class ChatCompletionRequest
     public int? MaxCompletionTokens { get; set; }
     public bool Stream { get; set; }
     public StreamOptions? StreamOptions { get; set; }
+
+    // Sampling. Null temperature keeps historical behavior: greedy argmax.
+    public float? Temperature { get; set; }
+    public float? TopP { get; set; }
+    public int? TopK { get; set; }
+    public float? MinP { get; set; }
+    public float? RepetitionPenalty { get; set; }
+    public int? Seed { get; set; }
+
+    public SamplingParams ResolveSampling()
+    {
+        return new SamplingParams
+        {
+            Temperature = Temperature ?? 0f,
+            TopP = TopP ?? 1f,
+            TopK = TopK ?? 0,
+            MinP = MinP ?? 0f,
+            RepeatPenalty = RepetitionPenalty ?? 1f,
+            Seed = Seed,
+        };
+    }
 
     public int ResolveMaxTokens(int fallback)
     {
