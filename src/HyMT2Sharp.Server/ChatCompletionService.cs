@@ -10,7 +10,7 @@ public sealed class ChatCompletionService : IDisposable
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly int _defaultMaxTokens;
 
-    public ChatCompletionService(string modelPath, int threads, int defaultMaxTokens = 256)
+    public ChatCompletionService(string modelPath, int threads, int defaultMaxTokens = 256, KvCachePolicy cachePolicy = KvCachePolicy.Memory)
     {
         if (!File.Exists(modelPath))
             throw new FileNotFoundException($"Model not found: {modelPath}", modelPath);
@@ -21,8 +21,8 @@ public sealed class ChatCompletionService : IDisposable
         CreatedUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
         Console.WriteLine($"loading {ModelPath}");
-        _model = new HunyuanDenseModel(ModelPath, threads);
-        Console.WriteLine($"ready  threads={_model.ThreadCount}{(threads <= 0 ? $" ({_model.ThreadAutoHint})" : "")}  arch={_model.Config.Architecture} layers={_model.Config.NumLayers} hidden={_model.Config.HiddenSize} heads={_model.Config.NumHeads}/{_model.Config.NumKvHeads} vocab={_model.Config.VocabSize}");
+        _model = new HunyuanDenseModel(ModelPath, threads, cachePolicy);
+        Console.WriteLine($"ready  threads={_model.ThreadCount}{(threads <= 0 ? $" ({_model.ThreadAutoHint})" : "")}  kv-cache={cachePolicy.ToString().ToLowerInvariant()}  arch={_model.Config.Architecture} layers={_model.Config.NumLayers} hidden={_model.Config.HiddenSize} heads={_model.Config.NumHeads}/{_model.Config.NumKvHeads} vocab={_model.Config.VocabSize}");
     }
 
     public string ModelId { get; }
@@ -51,8 +51,8 @@ public sealed class ChatCompletionService : IDisposable
         }
         finally
         {
-            if (!ok)
-                ResetSession();
+            if (!ok || _model.CachePolicy == KvCachePolicy.None)
+                _model.EndRequest();
             _gate.Release();
         }
     }
@@ -75,8 +75,8 @@ public sealed class ChatCompletionService : IDisposable
         }
         finally
         {
-            if (!ok)
-                ResetSession();
+            if (!ok || _model.CachePolicy == KvCachePolicy.None)
+                _model.EndRequest();
             _gate.Release();
         }
     }
@@ -209,8 +209,6 @@ public sealed class ChatCompletionService : IDisposable
             yield return response;
         }
     }
-
-    private void ResetSession() => _model.ResetCache();
 
     private static ChatCompletionChunk ContentChunk(string id, long created, string model, string delta)
         => new()
