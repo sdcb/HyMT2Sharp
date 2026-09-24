@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Runtime.Intrinsics.X86;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Sdcb.HyMT2Sharp.Model;
 using Sdcb.HyMT2Sharp.Server;
 
 string modelPath = GetArg(args, "--model", "-m")
@@ -9,6 +10,13 @@ string modelPath = GetArg(args, "--model", "-m")
     ?? @"D:\_\model\Hy-MT2-1.8B-2Bit.gguf";
 int threads = GetInt(args, 0, "--threads", "-t");
 int maxTokens = GetInt(args, 256, "--max-tokens");
+// Stateless translation serving defaults to no cross-request cache.
+KvCacheConfig kvCache = GetArg(args, "--kv-cache")?.ToLowerInvariant() switch
+{
+    null or "none" => KvCacheConfig.None,
+    "memory" => KvCacheConfig.Memory,
+    string other => throw new ArgumentException($"--kv-cache must be none|memory, got {other}"),
+};
 string urls = GetArg(args, "--urls")
     ?? Environment.GetEnvironmentVariable("ASPNETCORE_URLS")
     ?? "http://127.0.0.1:8080";
@@ -25,7 +33,7 @@ builder.WebHost.UseUrls(urls);
 builder.Services.ConfigureHttpJsonOptions(options => ConfigureJson(options.SerializerOptions));
 builder.Services.AddCors(options => options.AddDefaultPolicy(policy =>
     policy.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
-builder.Services.AddSingleton(_ => new ChatCompletionService(modelPath, threads, maxTokens));
+builder.Services.AddSingleton(_ => new ChatCompletionService(modelPath, threads, maxTokens, kvCache));
 
 WebApplication app = builder.Build();
 app.UseCors();

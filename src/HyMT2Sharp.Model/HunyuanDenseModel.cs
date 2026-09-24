@@ -63,8 +63,9 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         TicksEmbed = 0;
     }
 
-    public HunyuanDenseModel(string ggufPath, int threads = 0)
+    public HunyuanDenseModel(string ggufPath, int threads = 0, KvCacheConfig? cacheConfig = null)
     {
+        CacheConfig = cacheConfig ?? KvCacheConfig.Memory;
         _gguf = new GgufFile(ggufPath);
         Config = ModelConfig.FromGguf(_gguf);
         if (Config.VocabSize == 0)
@@ -84,20 +85,72 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         _cacheKBuffers = new NativeBuffer[Config.NumLayers];
         _cacheVBuffers = new NativeBuffer[Config.NumLayers];
         int kvStride = Config.NumKvHeads * Config.HeadDim;
-        for (int l = 0; l < Config.NumLayers; l++)
+        if (CacheConfig.KeepFlatCache && CacheConfig.Blocks is null)
         {
-            NativeBuffer k = Rent((nuint)((long)_cacheCap * kvStride * sizeof(ushort)));
-            NativeBuffer v = Rent((nuint)((long)_cacheCap * kvStride * sizeof(ushort)));
-            _cacheKBuffers[l] = k;
-            _cacheVBuffers[l] = v;
-            _cacheK[l] = (ushort*)k.Pointer;
-            _cacheV[l] = (ushort*)v.Pointer;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                NativeBuffer k = Rent((nuint)((long)_cacheCap * kvStride * sizeof(ushort)));
+                NativeBuffer v = Rent((nuint)((long)_cacheCap * kvStride * sizeof(ushort)));
+                _cacheKBuffers[l] = k;
+                _cacheVBuffers[l] = v;
+                _cacheK[l] = (ushort*)k.Pointer;
+                _cacheV[l] = (ushort*)v.Pointer;
+            }
+        }
+        else
+        {
+            // Buffers grow lazily through EnsureCache — under KeepFlatCache
+            // they stay warm (block-store prefixes live in _blockStore);
+            // without it they're returned at end of request so an idle
+            // service holds no KV memory.
+            _cacheCap = 0;
         }
     }
+
+    public KvCacheConfig CacheConfig { get; }
 
     public int CacheLength => _cacheLen;
 
     public void ResetCache() => TruncateCache(0);
+
+    /// <summary>
+    /// Drop the request's cache at end of turn. Without
+    /// <see cref="KvCacheConfig.KeepFlatCache"/> the KV buffers themselves
+    /// are returned to the OS; with it this is just
+    /// <see cref="TruncateCache(int)"/>(0) and the buffers stay warm for the
+    /// next request's prefix match.
+    /// </summary>
+    public void EndRequest()
+    {
+        TruncateCache(0);
+        if (!CacheConfig.KeepFlatCache)
+            FreeCache();
+    }
+
+    private void FreeCache()
+    {
+        for (int l = 0; l < Config.NumLayers; l++)
+        {
+            NativeBuffer k = _cacheKBuffers[l];
+            NativeBuffer v = _cacheVBuffers[l];
+            _cacheKBuffers[l] = null!;
+            _cacheVBuffers[l] = null!;
+            _cacheK[l] = null;
+            _cacheV[l] = null;
+            if (k is not null)
+            {
+                _buffers.Remove(k);
+                k.Dispose();
+            }
+            if (v is not null)
+            {
+                _buffers.Remove(v);
+                v.Dispose();
+            }
+        }
+
+        _cacheCap = 0;
+    }
 
     public void TruncateCache(int length)
     {
@@ -443,8 +496,11 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
                 nextK[l] = k;
                 nextV[l] = v;
                 long copyBytes = (long)_cacheLen * kvStride * sizeof(ushort);
-                Buffer.MemoryCopy(_cacheK[l], k.Pointer, copyBytes, copyBytes);
-                Buffer.MemoryCopy(_cacheV[l], v.Pointer, copyBytes, copyBytes);
+                if (copyBytes > 0)
+                {
+                    Buffer.MemoryCopy(_cacheK[l], k.Pointer, copyBytes, copyBytes);
+                    Buffer.MemoryCopy(_cacheV[l], v.Pointer, copyBytes, copyBytes);
+                }
             }
         }
         catch
@@ -472,18 +528,24 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         // pointing at different capacities.
         for (int l = 0; l < Config.NumLayers; l++)
         {
-            NativeBuffer oldK = _cacheKBuffers[l];
-            NativeBuffer oldV = _cacheVBuffers[l];
+            NativeBuffer? oldK = _cacheKBuffers[l];
+            NativeBuffer? oldV = _cacheVBuffers[l];
             NativeBuffer k = nextK[l]!;
             NativeBuffer v = nextV[l]!;
             _cacheKBuffers[l] = k;
             _cacheVBuffers[l] = v;
             _cacheK[l] = (ushort*)k.Pointer;
             _cacheV[l] = (ushort*)v.Pointer;
-            _buffers.Remove(oldK);
-            _buffers.Remove(oldV);
-            oldK.Dispose();
-            oldV.Dispose();
+            if (oldK is not null)
+            {
+                _buffers.Remove(oldK);
+                oldK.Dispose();
+            }
+            if (oldV is not null)
+            {
+                _buffers.Remove(oldV);
+                oldV.Dispose();
+            }
         }
 
         _cacheCap = next;
