@@ -11,15 +11,15 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     private readonly CpuThreadPool _pool;
     private readonly ScratchArena _gemmScratch = new();
     private readonly Dictionary<string, Weight> _weights = new(StringComparer.Ordinal);
-    private readonly float*[] _cacheK;
-    private readonly float*[] _cacheV;
+    private readonly ushort*[] _cacheK;
+    private readonly ushort*[] _cacheV;
     // Keep ownership of the currently active cache allocations separately so
     // that an expansion can release the previous generation immediately.
     private readonly NativeBuffer[] _cacheKBuffers;
     private readonly NativeBuffer[] _cacheVBuffers;
     private readonly List<NativeBuffer> _buffers = [];
     private NativeBuffer? _scratch;
-    private int _scratchUsed;
+    private nuint _scratchUsed;
     private readonly List<int> _cacheTokens = [];
     private int _cacheLen;
     private int _cacheCap;
@@ -79,19 +79,19 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         if (Config.VocabSize == 0 && _weights.TryGetValue("token_embd.weight", out Weight emb) && emb.NOut > 0)
             Config.VocabSize = emb.NOut;
         _cacheCap = Math.Min(Config.ContextLength, 4096);
-        _cacheK = new float*[Config.NumLayers];
-        _cacheV = new float*[Config.NumLayers];
+        _cacheK = new ushort*[Config.NumLayers];
+        _cacheV = new ushort*[Config.NumLayers];
         _cacheKBuffers = new NativeBuffer[Config.NumLayers];
         _cacheVBuffers = new NativeBuffer[Config.NumLayers];
         int kvStride = Config.NumKvHeads * Config.HeadDim;
         for (int l = 0; l < Config.NumLayers; l++)
         {
-            NativeBuffer k = Rent((nuint)((long)_cacheCap * kvStride * sizeof(float)));
-            NativeBuffer v = Rent((nuint)((long)_cacheCap * kvStride * sizeof(float)));
+            NativeBuffer k = Rent((nuint)((long)_cacheCap * kvStride * sizeof(ushort)));
+            NativeBuffer v = Rent((nuint)((long)_cacheCap * kvStride * sizeof(ushort)));
             _cacheKBuffers[l] = k;
             _cacheVBuffers[l] = v;
-            _cacheK[l] = (float*)k.Pointer;
-            _cacheV[l] = (float*)v.Pointer;
+            _cacheK[l] = (ushort*)k.Pointer;
+            _cacheV[l] = (ushort*)v.Pointer;
         }
     }
 
@@ -118,14 +118,28 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
 
     public float[] Forward(int[] tokens)
     {
+        // Chunked prefill: the scores buffer is heads·seq·kvLen floats, which
+        // would be gigabytes for long prompts. Split the prompt into chunks so
+        // peak scratch stays bounded; each chunk attends over the cache built
+        // by the previous ones, so results are identical.
+        const int PrefillChunk = 1024;
+        if (tokens.Length > PrefillChunk)
+        {
+            float[]? chunkLogits = null;
+            for (int off = 0; off < tokens.Length; off += PrefillChunk)
+                chunkLogits = Forward(tokens.AsSpan(off, Math.Min(PrefillChunk, tokens.Length - off)).ToArray());
+            return chunkLogits!;
+        }
+
         _scratchUsed = 0;
         int seq = tokens.Length;
         int start = _cacheLen;
         EnsureCache(start + seq);
+        EnsureScratch(seq, start + seq);
         int hidden = Config.HiddenSize;
         float* h = (float*)Bump((nuint)((long)seq * hidden * sizeof(float)));
         Embed(tokens, h);
-        int layerMark = _scratchUsed;
+        nuint layerMark = _scratchUsed;
         if (seq == 1)
         {
             for (int layer = 0; layer < Config.NumLayers; layer++)
@@ -424,11 +438,11 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         {
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                NativeBuffer k = Rent((nuint)((long)next * kvStride * sizeof(float)));
-                NativeBuffer v = Rent((nuint)((long)next * kvStride * sizeof(float)));
+                NativeBuffer k = Rent((nuint)((long)next * kvStride * sizeof(ushort)));
+                NativeBuffer v = Rent((nuint)((long)next * kvStride * sizeof(ushort)));
                 nextK[l] = k;
                 nextV[l] = v;
-                long copyBytes = (long)_cacheLen * kvStride * sizeof(float);
+                long copyBytes = (long)_cacheLen * kvStride * sizeof(ushort);
                 Buffer.MemoryCopy(_cacheK[l], k.Pointer, copyBytes, copyBytes);
                 Buffer.MemoryCopy(_cacheV[l], v.Pointer, copyBytes, copyBytes);
             }
@@ -464,8 +478,8 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
             NativeBuffer v = nextV[l]!;
             _cacheKBuffers[l] = k;
             _cacheVBuffers[l] = v;
-            _cacheK[l] = (float*)k.Pointer;
-            _cacheV[l] = (float*)v.Pointer;
+            _cacheK[l] = (ushort*)k.Pointer;
+            _cacheV[l] = (ushort*)v.Pointer;
             _buffers.Remove(oldK);
             _buffers.Remove(oldV);
             oldK.Dispose();
@@ -482,13 +496,33 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         return buf;
     }
 
+    // Reserve one scratch buffer big enough for h plus a whole layer's bumps.
+    // Called only while _scratchUsed == 0, so the old buffer holds no live
+    // pointers and can be released instead of retained in _buffers.
+    private void EnsureScratch(int seq, int kvLen)
+    {
+        long floats = (long)seq * (3L * Config.HiddenSize
+            + (long)Config.NumHeads * Config.HeadDim
+            + 2L * Config.NumKvHeads * Config.HeadDim
+            + 2L * Config.NumHeads * kvLen);
+        nuint need = (nuint)(floats * sizeof(float) + (1 << 20));
+        if (_scratch != null && _scratch.Bytes >= need) return;
+        if (_scratch != null)
+        {
+            _buffers.Remove(_scratch);
+            _scratch.Dispose();
+        }
+        _scratch = Rent(Math.Max(need, 128 * 1024 * 1024));
+        _scratchUsed = 0;
+    }
+
     private void* Bump(nuint bytes)
     {
         const int scratchBytes = 128 * 1024 * 1024;
         if (_scratch == null)
             _scratch = Rent(scratchBytes);
-        int aligned = (int)((bytes + 63) & ~(nuint)63);
-        if (_scratchUsed + aligned > (int)_scratch.Bytes)
+        nuint aligned = (bytes + 63) & ~(nuint)63;
+        if (_scratchUsed + aligned > _scratch.Bytes)
         {
             _scratch = Rent((nuint)Math.Max(scratchBytes, aligned));
             _scratchUsed = 0;

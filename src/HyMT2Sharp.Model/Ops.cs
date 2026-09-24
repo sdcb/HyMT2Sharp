@@ -358,7 +358,7 @@ public static unsafe class Ops
     /// </summary>
     public static void AttentionScores(
         float* q,
-        float* cacheK,
+        ushort* cacheK,
         float* scores,
         int heads,
         int kvHeads,
@@ -379,9 +379,9 @@ public static unsafe class Ops
             for (int h = begin; h < end; h++)
             {
                 int kvh = h / group;
-                float* kBase = cacheK + kvh * headDim;
+                ushort* kBase = cacheK + kvh * headDim;
                 int qt = 0;
-                if (Simd.UseAvx && Simd.UseFma && (headDim & 7) == 0)
+                if (Simd.UseAvx2 && Simd.UseFma && (headDim & 7) == 0)
                 {
                     // Two q rows share each K load; row qt's extra (masked) score lands in the
                     // tail that SoftmaxCausal zeroes anyway.
@@ -394,12 +394,12 @@ public static unsafe class Ops
                         int allowed = Math.Min(kvLen, startPos + qt + 2);
                         int kt = 0;
                         for (; kt + 3 < allowed; kt += 4)
-                            Dot2x4(q0, q1, kBase + kt * kvStride, kvStride, headDim, row0 + kt, row1 + kt, scale);
+                            Dot2x4Bf16(q0, q1, kBase + kt * kvStride, kvStride, headDim, row0 + kt, row1 + kt, scale);
                         for (; kt < allowed; kt++)
                         {
-                            float* kh = kBase + kt * kvStride;
-                            row0[kt] = DotF32(q0, kh, headDim) * scale;
-                            row1[kt] = DotF32(q1, kh, headDim) * scale;
+                            ushort* kh = kBase + kt * kvStride;
+                            row0[kt] = DotBf16(q0, kh, headDim) * scale;
+                            row1[kt] = DotBf16(q1, kh, headDim) * scale;
                         }
                     }
                 }
@@ -414,12 +414,12 @@ public static unsafe class Ops
                         int allowed = Math.Min(kvLen, startPos + qt + 2);
                         int kt = 0;
                         for (; kt + 3 < allowed; kt += 4)
-                            Dot2x4Vec(q0, q1, kBase + kt * kvStride, kvStride, headDim, row0 + kt, row1 + kt, scale);
+                            Dot2x4Bf16Vec(q0, q1, kBase + kt * kvStride, kvStride, headDim, row0 + kt, row1 + kt, scale);
                         for (; kt < allowed; kt++)
                         {
-                            float* kh = kBase + kt * kvStride;
-                            row0[kt] = DotF32(q0, kh, headDim) * scale;
-                            row1[kt] = DotF32(q1, kh, headDim) * scale;
+                            ushort* kh = kBase + kt * kvStride;
+                            row0[kt] = DotBf16(q0, kh, headDim) * scale;
+                            row1[kt] = DotBf16(q1, kh, headDim) * scale;
                         }
                     }
                 }
@@ -432,17 +432,17 @@ public static unsafe class Ops
                     int kt = 0;
                     for (; kt + 3 < allowed; kt += 4)
                     {
-                        float* k0 = kBase + (kt + 0) * kvStride;
-                        float* k1 = kBase + (kt + 1) * kvStride;
-                        float* k2 = kBase + (kt + 2) * kvStride;
-                        float* k3 = kBase + (kt + 3) * kvStride;
-                        DotF32x4(qh, k0, k1, k2, k3, headDim, row + kt, scale);
+                        ushort* k0 = kBase + (kt + 0) * kvStride;
+                        ushort* k1 = kBase + (kt + 1) * kvStride;
+                        ushort* k2 = kBase + (kt + 2) * kvStride;
+                        ushort* k3 = kBase + (kt + 3) * kvStride;
+                        DotBf16x4(qh, k0, k1, k2, k3, headDim, row + kt, scale);
                     }
 
                     for (; kt < allowed; kt++)
                     {
-                        float* kh = kBase + kt * kvStride;
-                        row[kt] = DotF32(qh, kh, headDim) * scale;
+                        ushort* kh = kBase + kt * kvStride;
+                        row[kt] = DotBf16(qh, kh, headDim) * scale;
                     }
                 }
             }
@@ -461,8 +461,8 @@ public static unsafe class Ops
     /// </summary>
     public static void AttentionDecode(
         float* q,
-        float* cacheK,
-        float* cacheV,
+        ushort* cacheK,
+        ushort* cacheV,
         float* scores,
         float* output,
         int heads,
@@ -483,36 +483,36 @@ public static unsafe class Ops
             {
                 int kvh = h / group;
                 float* qh = q + h * headDim;
-                float* kBase = cacheK + kvh * headDim;
-                float* vBase = cacheV + kvh * headDim;
+                ushort* kBase = cacheK + kvh * headDim;
+                ushort* vBase = cacheV + kvh * headDim;
                 float* row = scores + h * kvLen;
                 int allowed = Math.Min(kvLen, startPos + 1);
                 int kt = 0;
                 for (; kt + 3 < allowed; kt += 4)
                 {
-                    float* k0 = kBase + (kt + 0) * kvStride;
-                    float* k1 = kBase + (kt + 1) * kvStride;
-                    float* k2 = kBase + (kt + 2) * kvStride;
-                    float* k3 = kBase + (kt + 3) * kvStride;
-                    DotF32x4(qh, k0, k1, k2, k3, headDim, row + kt, scale);
+                    ushort* k0 = kBase + (kt + 0) * kvStride;
+                    ushort* k1 = kBase + (kt + 1) * kvStride;
+                    ushort* k2 = kBase + (kt + 2) * kvStride;
+                    ushort* k3 = kBase + (kt + 3) * kvStride;
+                    DotBf16x4(qh, k0, k1, k2, k3, headDim, row + kt, scale);
                 }
 
                 for (; kt < allowed; kt++)
-                    row[kt] = DotF32(qh, kBase + kt * kvStride, headDim) * scale;
+                    row[kt] = DotBf16(qh, kBase + kt * kvStride, headDim) * scale;
 
                 SoftmaxRow(row, allowed);
 
                 float* outH = output + h * headDim;
                 int d = 0;
-                if (Simd.UseAvx && Simd.UseFma)
+                if (Simd.UseAvx2 && Simd.UseFma)
                 {
                     for (; d + 63 < headDim; d += 64)
-                        Axpy64(row, vBase + d, kvStride, allowed, outH + d);
+                        Axpy64Bf16(row, vBase + d, kvStride, allowed, outH + d);
                 }
                 else if (!Simd.UseAvx)
                 {
                     for (; d + 8 * Vector<float>.Count <= headDim; d += 8 * Vector<float>.Count)
-                        AxpyRegVec(row, vBase + d, kvStride, allowed, outH + d);
+                        AxpyRegVecBf16(row, vBase + d, kvStride, allowed, outH + d);
                 }
 
                 if (d < headDim)
@@ -520,7 +520,7 @@ public static unsafe class Ops
                     for (int i = d; i < headDim; i++)
                         outH[i] = 0;
                     for (int k = 0; k < allowed; k++)
-                        AxpyF32(outH + d, vBase + k * kvStride + d, row[k], headDim - d);
+                        AxpyBf16(outH + d, vBase + k * kvStride + d, row[k], headDim - d);
                 }
             }
         }
@@ -533,7 +533,7 @@ public static unsafe class Ops
 
     /// <summary>output[qt,h] = Σ_{kt &lt; startPos+qt+1} scores[h,qt,kt] · v[kt,kvh].</summary>
     public static void AttentionCombine(
-        float* cacheV,
+        ushort* cacheV,
         float* scores,
         float* output,
         int heads,
@@ -554,23 +554,23 @@ public static unsafe class Ops
             for (int h = begin; h < end; h++)
             {
                 int kvh = h / group;
-                float* vBase = cacheV + kvh * headDim;
+                ushort* vBase = cacheV + kvh * headDim;
                 for (int qt = 0; qt < qLen; qt++)
                 {
                     float* row = scores + (h * qLen + qt) * kvLen;
                     float* outH = output + qt * qDim + h * headDim;
                     int allowed = Math.Min(kvLen, startPos + qt + 1);
                     int d = 0;
-                    if (Simd.UseAvx && Simd.UseFma)
+                    if (Simd.UseAvx2 && Simd.UseFma)
                     {
                         // 64 output dims live in 8 accumulators; V streams through once per half.
                         for (; d + 63 < headDim; d += 64)
-                            Axpy64(row, vBase + d, kvStride, allowed, outH + d);
+                            Axpy64Bf16(row, vBase + d, kvStride, allowed, outH + d);
                     }
                     else if (!Simd.UseAvx)
                     {
                         for (; d + 8 * Vector<float>.Count <= headDim; d += 8 * Vector<float>.Count)
-                            AxpyRegVec(row, vBase + d, kvStride, allowed, outH + d);
+                            AxpyRegVecBf16(row, vBase + d, kvStride, allowed, outH + d);
                     }
 
                     if (d < headDim)
@@ -580,8 +580,8 @@ public static unsafe class Ops
                         for (int kt = 0; kt < allowed; kt++)
                         {
                             float w = row[kt];
-                            float* vh = vBase + kt * kvStride;
-                            AxpyF32(outH + d, vh + d, w, headDim - d);
+                            ushort* vh = vBase + kt * kvStride;
+                            AxpyBf16(outH + d, vh + d, w, headDim - d);
                         }
                     }
                 }
@@ -643,13 +643,185 @@ public static unsafe class Ops
         return sum;
     }
 
-    /// <summary>Two q rows × four consecutive K rows (stride <paramref name="kvStride"/>), 8 live accumulators.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void Dot2x4(float* q0, float* q1, float* k, int kvStride, int n, float* dst0, float* dst1, float scale)
+    /// <summary>[Σa, Σb, Σc, Σd] with two hadd stages instead of four scalar reductions.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector128<float> HorizontalSum4(Vector256<float> a, Vector256<float> b, Vector256<float> c, Vector256<float> d)
     {
-        float* k1 = k + kvStride;
-        float* k2 = k1 + kvStride;
-        float* k3 = k2 + kvStride;
+        Vector256<float> ab = Avx.HorizontalAdd(a, b);
+        Vector256<float> cd = Avx.HorizontalAdd(c, d);
+        Vector256<float> abcd = Avx.HorizontalAdd(ab, cd);
+        return Sse.Add(abcd.GetLower(), abcd.GetUpper());
+    }
+
+
+    /// <summary>fp32→bf16 for K/V writes into the cache (round-to-nearest-even).</summary>
+    public static void ConvertToBf16(float* src, ushort* dst, int n, CpuThreadPool? pool = null)
+    {
+        if (pool == null || n < 65536)
+        {
+            for (int i = 0; i < n; i++)
+            {
+                uint bits = Unsafe.ReadUnaligned<uint>(src + i);
+                dst[i] = (ushort)((bits + 0x7FFFu + ((bits >> 16) & 1)) >> 16);
+            }
+            return;
+        }
+
+        pool.For(n, (int worker, int workers) =>
+        {
+            int begin = n * worker / workers;
+            int end = n * (worker + 1) / workers;
+            for (int i = begin; i < end; i++)
+            {
+                uint bits = Unsafe.ReadUnaligned<uint>(src + i);
+                dst[i] = (ushort)((bits + 0x7FFFu + ((bits >> 16) & 1)) >> 16);
+            }
+        });
+    }
+
+    // bf16 = top 16 bits of fp32: decode is a u16→u32 widen + <<16, encode is
+    // RNE truncation. bf16 keeps fp32's exponent range (no overflow possible)
+    // at 8 mantissa bits — enough for K/V payloads. .NET exposes no vectorized
+    // Half conversion intrinsics at all, so fp16 would need ~4× more ALU ops
+    // here; bf16 decode is nearly free on every ISA.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static float Bf16ToF32(ushort h) => BitConverter.UInt32BitsToSingle((uint)h << 16);
+
+    /// <summary>Load 2V bf16 lanes as two fp32 vectors.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static (Vector<float> Lo, Vector<float> Hi) LoadBf16x2(ushort* p)
+    {
+        Vector<ushort> u = Unsafe.ReadUnaligned<Vector<ushort>>(p);
+        Vector.Widen(u, out Vector<uint> lo, out Vector<uint> hi);
+        return (Unsafe.BitCast<Vector<uint>, Vector<float>>(Vector.ShiftLeft(lo, 16)),
+                Unsafe.BitCast<Vector<uint>, Vector<float>>(Vector.ShiftLeft(hi, 16)));
+    }
+
+    /// <summary>Load 8 bf16 lanes, widen to fp32 (AVX2: vpmovzxwd + vpslld).</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static Vector256<float> LoadBf16x8(ushort* p)
+        => Vector256.ShiftLeft(Avx2.ConvertToVector256Int32(Unsafe.ReadUnaligned<Vector128<ushort>>(p)), 16).AsSingle();
+
+    /// <summary>bf16-cache dot: q fp32 × one K row, bit-decoded on load.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    public static float DotBf16(float* a, ushort* b, int n)
+    {
+        int i = 0;
+        float sum = 0;
+        if (Simd.UseAvx2 && Simd.UseFma)
+        {
+            Vector256<float> acc0 = Vector256<float>.Zero;
+            Vector256<float> acc1 = Vector256<float>.Zero;
+            for (; i <= n - 16; i += 16)
+            {
+                acc0 = Fma.MultiplyAdd(Avx.LoadVector256(a + i), LoadBf16x8(b + i), acc0);
+                acc1 = Fma.MultiplyAdd(Avx.LoadVector256(a + i + 8), LoadBf16x8(b + i + 8), acc1);
+            }
+
+            for (; i <= n - 8; i += 8)
+                acc0 = Fma.MultiplyAdd(Avx.LoadVector256(a + i), LoadBf16x8(b + i), acc0);
+
+            sum = VecDotQ4K.HorizontalSum(Avx.Add(acc0, acc1));
+        }
+        else
+        {
+            int V = Vector<float>.Count;
+            Vector<float> v0 = Vector<float>.Zero;
+            Vector<float> v1 = Vector<float>.Zero;
+            for (; i + 2 * V <= n; i += 2 * V)
+            {
+                (Vector<float> lo, Vector<float> hi) = LoadBf16x2(b + i);
+                v0 = Vector.MultiplyAddEstimate(VecF.Load(a + i), lo, v0);
+                v1 = Vector.MultiplyAddEstimate(VecF.Load(a + i + V), hi, v1);
+            }
+
+            sum = Vector.Sum(v0 + v1);
+        }
+
+        for (; i < n; i++)
+            sum += a[i] * Bf16ToF32(b[i]);
+        return sum;
+    }
+
+    /// <summary>bf16-cache counterpart of the old fp32 4-row dot: q fp32 × four K rows widened on load.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void DotBf16x4(float* q, ushort* k0, ushort* k1, ushort* k2, ushort* k3, int n, float* dst, float scale)
+    {
+        float s0 = 0, s1 = 0, s2 = 0, s3 = 0;
+        int i = 0;
+        if (Simd.UseAvx2 && Simd.UseFma)
+        {
+            Vector256<float> acc0 = Vector256<float>.Zero;
+            Vector256<float> acc1 = Vector256<float>.Zero;
+            Vector256<float> acc2 = Vector256<float>.Zero;
+            Vector256<float> acc3 = Vector256<float>.Zero;
+            for (; i <= n - 8; i += 8)
+            {
+                Vector256<float> qv = Avx.LoadVector256(q + i);
+                acc0 = Fma.MultiplyAdd(qv, LoadBf16x8(k0 + i), acc0);
+                acc1 = Fma.MultiplyAdd(qv, LoadBf16x8(k1 + i), acc1);
+                acc2 = Fma.MultiplyAdd(qv, LoadBf16x8(k2 + i), acc2);
+                acc3 = Fma.MultiplyAdd(qv, LoadBf16x8(k3 + i), acc3);
+            }
+
+            s0 = VecDotQ4K.HorizontalSum(acc0);
+            s1 = VecDotQ4K.HorizontalSum(acc1);
+            s2 = VecDotQ4K.HorizontalSum(acc2);
+            s3 = VecDotQ4K.HorizontalSum(acc3);
+        }
+        else
+        {
+            Vector<float> acc0 = Vector<float>.Zero;
+            Vector<float> acc1 = Vector<float>.Zero;
+            Vector<float> acc2 = Vector<float>.Zero;
+            Vector<float> acc3 = Vector<float>.Zero;
+            int V = Vector<float>.Count;
+            for (; i + 2 * V <= n; i += 2 * V)
+            {
+                Vector<float> q0 = VecF.Load(q + i);
+                Vector<float> q1 = VecF.Load(q + i + V);
+                (Vector<float> lo, Vector<float> hi) = LoadBf16x2(k0 + i);
+                acc0 = Vector.MultiplyAddEstimate(q0, lo, acc0);
+                acc0 = Vector.MultiplyAddEstimate(q1, hi, acc0);
+                (lo, hi) = LoadBf16x2(k1 + i);
+                acc1 = Vector.MultiplyAddEstimate(q0, lo, acc1);
+                acc1 = Vector.MultiplyAddEstimate(q1, hi, acc1);
+                (lo, hi) = LoadBf16x2(k2 + i);
+                acc2 = Vector.MultiplyAddEstimate(q0, lo, acc2);
+                acc2 = Vector.MultiplyAddEstimate(q1, hi, acc2);
+                (lo, hi) = LoadBf16x2(k3 + i);
+                acc3 = Vector.MultiplyAddEstimate(q0, lo, acc3);
+                acc3 = Vector.MultiplyAddEstimate(q1, hi, acc3);
+            }
+
+            s0 = Vector.Sum(acc0);
+            s1 = Vector.Sum(acc1);
+            s2 = Vector.Sum(acc2);
+            s3 = Vector.Sum(acc3);
+        }
+
+        for (; i < n; i++)
+        {
+            float qv = q[i];
+            s0 += qv * Bf16ToF32(k0[i]);
+            s1 += qv * Bf16ToF32(k1[i]);
+            s2 += qv * Bf16ToF32(k2[i]);
+            s3 += qv * Bf16ToF32(k3[i]);
+        }
+
+        dst[0] = s0 * scale;
+        dst[1] = s1 * scale;
+        dst[2] = s2 * scale;
+        dst[3] = s3 * scale;
+    }
+
+    /// <summary>bf16-cache counterpart of the old fp32 2x4 dot (AVX2): two q rows share each decoded K load.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void Dot2x4Bf16(float* q0, float* q1, ushort* k, int kvStride, int n, float* dst0, float* dst1, float scale)
+    {
+        ushort* k1 = k + kvStride;
+        ushort* k2 = k1 + kvStride;
+        ushort* k3 = k2 + kvStride;
         Vector256<float> a00 = Vector256<float>.Zero;
         Vector256<float> a01 = Vector256<float>.Zero;
         Vector256<float> a02 = Vector256<float>.Zero;
@@ -660,10 +832,10 @@ public static unsafe class Ops
         Vector256<float> a13 = Vector256<float>.Zero;
         for (int i = 0; i < n; i += 8)
         {
-            Vector256<float> v0 = Avx.LoadVector256(k + i);
-            Vector256<float> v1 = Avx.LoadVector256(k1 + i);
-            Vector256<float> v2 = Avx.LoadVector256(k2 + i);
-            Vector256<float> v3 = Avx.LoadVector256(k3 + i);
+            Vector256<float> v0 = LoadBf16x8(k + i);
+            Vector256<float> v1 = LoadBf16x8(k1 + i);
+            Vector256<float> v2 = LoadBf16x8(k2 + i);
+            Vector256<float> v3 = LoadBf16x8(k3 + i);
             Vector256<float> x0 = Avx.LoadVector256(q0 + i);
             a00 = Fma.MultiplyAdd(x0, v0, a00);
             a01 = Fma.MultiplyAdd(x0, v1, a01);
@@ -681,129 +853,42 @@ public static unsafe class Ops
         Sse.Store(dst1, Sse.Multiply(HorizontalSum4(a10, a11, a12, a13), s));
     }
 
-    /// <summary>[Σa, Σb, Σc, Σd] with two hadd stages instead of four scalar reductions.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static Vector128<float> HorizontalSum4(Vector256<float> a, Vector256<float> b, Vector256<float> c, Vector256<float> d)
-    {
-        Vector256<float> ab = Avx.HorizontalAdd(a, b);
-        Vector256<float> cd = Avx.HorizontalAdd(c, d);
-        Vector256<float> abcd = Avx.HorizontalAdd(ab, cd);
-        return Sse.Add(abcd.GetLower(), abcd.GetUpper());
-    }
-
-    /// <summary>out[0..64) = Σ_kt w[kt] · v[kt][0..64) with the 64 outputs held in registers.</summary>
+    /// <summary>Portable counterpart of <see cref="Dot2x4Bf16"/> on <see cref="Vector{T}"/> integer decode.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void Axpy64(float* w, float* v, int kvStride, int count, float* dst)
+    private static void Dot2x4Bf16Vec(float* q0, float* q1, ushort* k, int kvStride, int n, float* dst0, float* dst1, float scale)
     {
-        Vector256<float> a0 = Vector256<float>.Zero;
-        Vector256<float> a1 = Vector256<float>.Zero;
-        Vector256<float> a2 = Vector256<float>.Zero;
-        Vector256<float> a3 = Vector256<float>.Zero;
-        Vector256<float> a4 = Vector256<float>.Zero;
-        Vector256<float> a5 = Vector256<float>.Zero;
-        Vector256<float> a6 = Vector256<float>.Zero;
-        Vector256<float> a7 = Vector256<float>.Zero;
-        for (int kt = 0; kt < count; kt++)
-        {
-            Vector256<float> wv = Avx.BroadcastScalarToVector256(w + kt);
-            float* row = v + kt * kvStride;
-            a0 = Fma.MultiplyAdd(wv, Avx.LoadVector256(row), a0);
-            a1 = Fma.MultiplyAdd(wv, Avx.LoadVector256(row + 8), a1);
-            a2 = Fma.MultiplyAdd(wv, Avx.LoadVector256(row + 16), a2);
-            a3 = Fma.MultiplyAdd(wv, Avx.LoadVector256(row + 24), a3);
-            a4 = Fma.MultiplyAdd(wv, Avx.LoadVector256(row + 32), a4);
-            a5 = Fma.MultiplyAdd(wv, Avx.LoadVector256(row + 40), a5);
-            a6 = Fma.MultiplyAdd(wv, Avx.LoadVector256(row + 48), a6);
-            a7 = Fma.MultiplyAdd(wv, Avx.LoadVector256(row + 56), a7);
-        }
-
-        Avx.Store(dst, a0);
-        Avx.Store(dst + 8, a1);
-        Avx.Store(dst + 16, a2);
-        Avx.Store(dst + 24, a3);
-        Avx.Store(dst + 32, a4);
-        Avx.Store(dst + 40, a5);
-        Avx.Store(dst + 48, a6);
-        Avx.Store(dst + 56, a7);
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void DotF32x4(float* q, float* k0, float* k1, float* k2, float* k3, int n, float* dst, float scale)
-    {
-        if (!Simd.UseAvx)
-        {
-            DotF32x4Vec(q, k0, k1, k2, k3, n, dst, scale);
-            return;
-        }
-
-        Vector256<float> acc0 = Vector256<float>.Zero;
-        Vector256<float> acc1 = Vector256<float>.Zero;
-        Vector256<float> acc2 = Vector256<float>.Zero;
-        Vector256<float> acc3 = Vector256<float>.Zero;
-        int i = 0;
-        for (; i <= n - 8; i += 8)
-        {
-            Vector256<float> qv = Avx.LoadVector256(q + i);
-            if (Simd.UseFma)
-            {
-                acc0 = Fma.MultiplyAdd(qv, Avx.LoadVector256(k0 + i), acc0);
-                acc1 = Fma.MultiplyAdd(qv, Avx.LoadVector256(k1 + i), acc1);
-                acc2 = Fma.MultiplyAdd(qv, Avx.LoadVector256(k2 + i), acc2);
-                acc3 = Fma.MultiplyAdd(qv, Avx.LoadVector256(k3 + i), acc3);
-            }
-            else
-            {
-                acc0 = Avx.Add(acc0, Avx.Multiply(qv, Avx.LoadVector256(k0 + i)));
-                acc1 = Avx.Add(acc1, Avx.Multiply(qv, Avx.LoadVector256(k1 + i)));
-                acc2 = Avx.Add(acc2, Avx.Multiply(qv, Avx.LoadVector256(k2 + i)));
-                acc3 = Avx.Add(acc3, Avx.Multiply(qv, Avx.LoadVector256(k3 + i)));
-            }
-        }
-
-        float s0 = VecDotQ4K.HorizontalSum(acc0);
-        float s1 = VecDotQ4K.HorizontalSum(acc1);
-        float s2 = VecDotQ4K.HorizontalSum(acc2);
-        float s3 = VecDotQ4K.HorizontalSum(acc3);
-        for (; i < n; i++)
-        {
-            float qv = q[i];
-            s0 += qv * k0[i];
-            s1 += qv * k1[i];
-            s2 += qv * k2[i];
-            s3 += qv * k3[i];
-        }
-
-        dst[0] = s0 * scale;
-        dst[1] = s1 * scale;
-        dst[2] = s2 * scale;
-        dst[3] = s3 * scale;
-    }
-
-    /// <summary>Portable <see cref="Dot2x4"/>: two q rows share each K load; n is a multiple of Vector&lt;float&gt;.Count.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void Dot2x4Vec(float* q0, float* q1, float* k, int kvStride, int n, float* dst0, float* dst1, float scale)
-    {
-        float* k1 = k + kvStride;
-        float* k2 = k1 + kvStride;
-        float* k3 = k2 + kvStride;
+        ushort* k1 = k + kvStride;
+        ushort* k2 = k1 + kvStride;
+        ushort* k3 = k2 + kvStride;
         Vector<float> a00 = Vector<float>.Zero, a01 = Vector<float>.Zero, a02 = Vector<float>.Zero, a03 = Vector<float>.Zero;
         Vector<float> a10 = Vector<float>.Zero, a11 = Vector<float>.Zero, a12 = Vector<float>.Zero, a13 = Vector<float>.Zero;
-        for (int i = 0; i < n; i += Vector<float>.Count)
+        int V = Vector<float>.Count;
+        for (int i = 0; i + 2 * V <= n; i += 2 * V)
         {
-            Vector<float> v0 = VecF.Load(k + i);
-            Vector<float> v1 = VecF.Load(k1 + i);
-            Vector<float> v2 = VecF.Load(k2 + i);
-            Vector<float> v3 = VecF.Load(k3 + i);
+            (Vector<float> k0l, Vector<float> k0h) = LoadBf16x2(k + i);
+            (Vector<float> k1l, Vector<float> k1h) = LoadBf16x2(k1 + i);
+            (Vector<float> k2l, Vector<float> k2h) = LoadBf16x2(k2 + i);
+            (Vector<float> k3l, Vector<float> k3h) = LoadBf16x2(k3 + i);
             Vector<float> x0 = VecF.Load(q0 + i);
-            a00 = Vector.MultiplyAddEstimate(x0, v0, a00);
-            a01 = Vector.MultiplyAddEstimate(x0, v1, a01);
-            a02 = Vector.MultiplyAddEstimate(x0, v2, a02);
-            a03 = Vector.MultiplyAddEstimate(x0, v3, a03);
-            Vector<float> x1 = VecF.Load(q1 + i);
-            a10 = Vector.MultiplyAddEstimate(x1, v0, a10);
-            a11 = Vector.MultiplyAddEstimate(x1, v1, a11);
-            a12 = Vector.MultiplyAddEstimate(x1, v2, a12);
-            a13 = Vector.MultiplyAddEstimate(x1, v3, a13);
+            Vector<float> x1 = VecF.Load(q0 + i + V);
+            a00 = Vector.MultiplyAddEstimate(x0, k0l, a00);
+            a00 = Vector.MultiplyAddEstimate(x1, k0h, a00);
+            a01 = Vector.MultiplyAddEstimate(x0, k1l, a01);
+            a01 = Vector.MultiplyAddEstimate(x1, k1h, a01);
+            a02 = Vector.MultiplyAddEstimate(x0, k2l, a02);
+            a02 = Vector.MultiplyAddEstimate(x1, k2h, a02);
+            a03 = Vector.MultiplyAddEstimate(x0, k3l, a03);
+            a03 = Vector.MultiplyAddEstimate(x1, k3h, a03);
+            Vector<float> y0 = VecF.Load(q1 + i);
+            Vector<float> y1 = VecF.Load(q1 + i + V);
+            a10 = Vector.MultiplyAddEstimate(y0, k0l, a10);
+            a10 = Vector.MultiplyAddEstimate(y1, k0h, a10);
+            a11 = Vector.MultiplyAddEstimate(y0, k1l, a11);
+            a11 = Vector.MultiplyAddEstimate(y1, k1h, a11);
+            a12 = Vector.MultiplyAddEstimate(y0, k2l, a12);
+            a12 = Vector.MultiplyAddEstimate(y1, k2h, a12);
+            a13 = Vector.MultiplyAddEstimate(y0, k3l, a13);
+            a13 = Vector.MultiplyAddEstimate(y1, k3h, a13);
         }
 
         dst0[0] = Vector.Sum(a00) * scale;
@@ -816,9 +901,45 @@ public static unsafe class Ops
         dst1[3] = Vector.Sum(a13) * scale;
     }
 
-    /// <summary>Portable <see cref="Axpy64"/>: dst[0..8V) = Σ_kt w[kt] · v[kt][0..8V), accumulators in registers.</summary>
+    /// <summary>bf16-cache counterpart of the old fp32 64-dim axpy (AVX2): 64 output dims, 8 accumulators.</summary>
     [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void AxpyRegVec(float* w, float* v, int kvStride, int count, float* dst)
+    private static void Axpy64Bf16(float* w, ushort* v, int kvStride, int count, float* dst)
+    {
+        Vector256<float> a0 = Vector256<float>.Zero;
+        Vector256<float> a1 = Vector256<float>.Zero;
+        Vector256<float> a2 = Vector256<float>.Zero;
+        Vector256<float> a3 = Vector256<float>.Zero;
+        Vector256<float> a4 = Vector256<float>.Zero;
+        Vector256<float> a5 = Vector256<float>.Zero;
+        Vector256<float> a6 = Vector256<float>.Zero;
+        Vector256<float> a7 = Vector256<float>.Zero;
+        for (int kt = 0; kt < count; kt++)
+        {
+            Vector256<float> wv = Avx.BroadcastScalarToVector256(w + kt);
+            ushort* row = v + kt * kvStride;
+            a0 = Fma.MultiplyAdd(wv, LoadBf16x8(row), a0);
+            a1 = Fma.MultiplyAdd(wv, LoadBf16x8(row + 8), a1);
+            a2 = Fma.MultiplyAdd(wv, LoadBf16x8(row + 16), a2);
+            a3 = Fma.MultiplyAdd(wv, LoadBf16x8(row + 24), a3);
+            a4 = Fma.MultiplyAdd(wv, LoadBf16x8(row + 32), a4);
+            a5 = Fma.MultiplyAdd(wv, LoadBf16x8(row + 40), a5);
+            a6 = Fma.MultiplyAdd(wv, LoadBf16x8(row + 48), a6);
+            a7 = Fma.MultiplyAdd(wv, LoadBf16x8(row + 56), a7);
+        }
+
+        Avx.Store(dst, a0);
+        Avx.Store(dst + 8, a1);
+        Avx.Store(dst + 16, a2);
+        Avx.Store(dst + 24, a3);
+        Avx.Store(dst + 32, a4);
+        Avx.Store(dst + 40, a5);
+        Avx.Store(dst + 48, a6);
+        Avx.Store(dst + 56, a7);
+    }
+
+    /// <summary>Portable counterpart of <see cref="Axpy64Bf16"/> on <see cref="Vector{T}"/> integer decode.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+    private static void AxpyRegVecBf16(float* w, ushort* v, int kvStride, int count, float* dst)
     {
         int V = Vector<float>.Count;
         Vector<float> a0 = Vector<float>.Zero, a1 = Vector<float>.Zero, a2 = Vector<float>.Zero, a3 = Vector<float>.Zero;
@@ -826,15 +947,19 @@ public static unsafe class Ops
         for (int kt = 0; kt < count; kt++)
         {
             Vector<float> wv = new(w[kt]);
-            float* row = v + kt * kvStride;
-            a0 = Vector.MultiplyAddEstimate(wv, VecF.Load(row), a0);
-            a1 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + V), a1);
-            a2 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 2 * V), a2);
-            a3 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 3 * V), a3);
-            a4 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 4 * V), a4);
-            a5 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 5 * V), a5);
-            a6 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 6 * V), a6);
-            a7 = Vector.MultiplyAddEstimate(wv, VecF.Load(row + 7 * V), a7);
+            ushort* row = v + kt * kvStride;
+            (Vector<float> lo, Vector<float> hi) = LoadBf16x2(row);
+            a0 = Vector.MultiplyAddEstimate(wv, lo, a0);
+            a1 = Vector.MultiplyAddEstimate(wv, hi, a1);
+            (lo, hi) = LoadBf16x2(row + 2 * V);
+            a2 = Vector.MultiplyAddEstimate(wv, lo, a2);
+            a3 = Vector.MultiplyAddEstimate(wv, hi, a3);
+            (lo, hi) = LoadBf16x2(row + 4 * V);
+            a4 = Vector.MultiplyAddEstimate(wv, lo, a4);
+            a5 = Vector.MultiplyAddEstimate(wv, hi, a5);
+            (lo, hi) = LoadBf16x2(row + 6 * V);
+            a6 = Vector.MultiplyAddEstimate(wv, lo, a6);
+            a7 = Vector.MultiplyAddEstimate(wv, hi, a7);
         }
 
         VecF.Store(dst, a0);
@@ -847,81 +972,11 @@ public static unsafe class Ops
         VecF.Store(dst + 7 * V, a7);
     }
 
-    /// <summary>Portable counterpart of <see cref="DotF32x4"/> using <see cref="Vector{T}"/>.</summary>
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    private static void DotF32x4Vec(float* q, float* k0, float* k1, float* k2, float* k3, int n, float* dst, float scale)
+    /// <summary>Scalar tail of the bf16 axpy: y[i] += a·x[i], x decoded per element.</summary>
+    private static void AxpyBf16(float* y, ushort* x, float a, int n)
     {
-        Vector<float> acc0 = Vector<float>.Zero;
-        Vector<float> acc1 = Vector<float>.Zero;
-        Vector<float> acc2 = Vector<float>.Zero;
-        Vector<float> acc3 = Vector<float>.Zero;
-        int i = 0;
-        for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
-        {
-            Vector<float> qv = VecF.Load(q + i);
-            acc0 = Vector.MultiplyAddEstimate(qv, VecF.Load(k0 + i), acc0);
-            acc1 = Vector.MultiplyAddEstimate(qv, VecF.Load(k1 + i), acc1);
-            acc2 = Vector.MultiplyAddEstimate(qv, VecF.Load(k2 + i), acc2);
-            acc3 = Vector.MultiplyAddEstimate(qv, VecF.Load(k3 + i), acc3);
-        }
-
-        float s0 = Vector.Sum(acc0);
-        float s1 = Vector.Sum(acc1);
-        float s2 = Vector.Sum(acc2);
-        float s3 = Vector.Sum(acc3);
-        for (; i < n; i++)
-        {
-            float qv = q[i];
-            s0 += qv * k0[i];
-            s1 += qv * k1[i];
-            s2 += qv * k2[i];
-            s3 += qv * k3[i];
-        }
-
-        dst[0] = s0 * scale;
-        dst[1] = s1 * scale;
-        dst[2] = s2 * scale;
-        dst[3] = s3 * scale;
-    }
-
-    [MethodImpl(MethodImplOptions.AggressiveOptimization)]
-    public static void AxpyF32(float* y, float* x, float a, int n)
-    {
-        int i = 0;
-        if (Simd.UseAvx)
-        {
-            Vector256<float> av = Vector256.Create(a);
-            for (; i <= n - 16; i += 16)
-            {
-                if (Simd.UseFma)
-                {
-                    Avx.Store(y + i, Fma.MultiplyAdd(av, Avx.LoadVector256(x + i), Avx.LoadVector256(y + i)));
-                    Avx.Store(y + i + 8, Fma.MultiplyAdd(av, Avx.LoadVector256(x + i + 8), Avx.LoadVector256(y + i + 8)));
-                }
-                else
-                {
-                    Avx.Store(y + i, Avx.Add(Avx.LoadVector256(y + i), Avx.Multiply(av, Avx.LoadVector256(x + i))));
-                    Avx.Store(y + i + 8, Avx.Add(Avx.LoadVector256(y + i + 8), Avx.Multiply(av, Avx.LoadVector256(x + i + 8))));
-                }
-            }
-
-            for (; i <= n - 8; i += 8)
-            {
-                if (Simd.UseFma)
-                    Avx.Store(y + i, Fma.MultiplyAdd(av, Avx.LoadVector256(x + i), Avx.LoadVector256(y + i)));
-                else
-                    Avx.Store(y + i, Avx.Add(Avx.LoadVector256(y + i), Avx.Multiply(av, Avx.LoadVector256(x + i))));
-            }
-        }
-        else
-        {
-            Vector<float> av = new Vector<float>(a);
-            for (; i + Vector<float>.Count <= n; i += Vector<float>.Count)
-                VecF.Store(y + i, Vector.MultiplyAddEstimate(av, VecF.Load(x + i), VecF.Load(y + i)));
-        }
-
-        for (; i < n; i++)
-            y[i] += a * x[i];
+        for (int i = 0; i < n; i++)
+            y[i] += a * Bf16ToF32(x[i]);
     }
 
     public static void SiLUMul(float* gate, float* up, int n, CpuThreadPool? pool = null)
