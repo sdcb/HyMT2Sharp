@@ -291,8 +291,6 @@ public sealed class CpuThreadPool : IDisposable
 
     private void TryPinToPCore(int index)
     {
-        if (!OperatingSystem.IsWindows())
-            return;
         try
         {
             IReadOnlyList<int> targets = ThreadCount <= CpuTopology.PCoreLeaders.Count
@@ -304,17 +302,42 @@ public sealed class CpuThreadPool : IDisposable
                 return;
 
             int cpu = targets[index % targets.Count];
-            if ((uint)cpu >= 64)
-                return;
-
-            nint mask = (nint)(1UL << cpu);
-            SetThreadAffinityMask(GetCurrentThread(), mask);
+            if (OperatingSystem.IsWindows())
+            {
+                if ((uint)cpu >= 64)
+                    return;
+                SetThreadAffinityMask(GetCurrentThread(), (nint)(1UL << cpu));
+            }
+            else if (OperatingSystem.IsLinux())
+            {
+                PinToCpuLinux(cpu);
+            }
         }
         catch
         {
             // Affinity is best-effort.
         }
     }
+
+    /// <summary>
+    /// sched_setaffinity on the calling thread. cpu_set_t is a 1024-bit mask;
+    /// cpus beyond that are skipped the same way Windows skips group 1+.
+    /// Containers without CAP_SYS_NICE or with a restricted cpuset return
+    /// EPERM/EINVAL — silently ignored like any other pin failure.
+    /// </summary>
+    private static unsafe void PinToCpuLinux(int cpu)
+    {
+        if ((uint)cpu >= 1024)
+            return;
+        ulong* mask = stackalloc ulong[16];
+        for (int i = 0; i < 16; i++)
+            mask[i] = 0;
+        mask[cpu / 64] = 1UL << (cpu % 64);
+        sched_setaffinity(0, (nuint)128, mask);
+    }
+
+    [DllImport("libc")]
+    private static extern unsafe int sched_setaffinity(int pid, nuint cpusetsize, ulong* mask);
 
     [DllImport("kernel32.dll")]
     private static extern IntPtr GetCurrentThread();
