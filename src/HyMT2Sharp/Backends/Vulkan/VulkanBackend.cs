@@ -57,7 +57,6 @@ public sealed unsafe class VulkanBackend : IComputeBackend
     private readonly bool _noBarrier = Environment.GetEnvironmentVariable("HYMT_VK_NOBARRIER") == "1";
     private readonly bool _noPush = Environment.GetEnvironmentVariable("HYMT_VK_NOPUSH") == "1";
     private int _seq;
-    private bool _kvF32;
     private bool _splitFfn = Environment.GetEnvironmentVariable("HYMT_VK_SPLITFFN") == "1";
     private bool _dump;
     private bool _pfFastAttn;
@@ -70,8 +69,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend
     private double[] _opMs = new double[6];
 
     public string Name => "vulkan";
-    // pf kernels assume the fp16 KV layout; KVF32 (debug knob) can't prefill.
-    public bool SupportsPrefill => !_kvF32 && !_noPf;
+    // pf kernels assume the fp16 KV layout (device KV is always fp16).
+    public bool SupportsPrefill => !_noPf;
 
     public VulkanBackend()
     {
@@ -108,7 +107,6 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         _pEmbed4 = Mk("dec_embed_q4k", bindings: 3, pushBytes: 4);
         _pEmbed6 = Mk("dec_embed_q6k", bindings: 3, pushBytes: 4);
         _pRms = Mk("dec_rmsnorm", bindings: 3, pushBytes: 8);
-        _kvF32 = Environment.GetEnvironmentVariable("HYMT_VK_KVF32") == "1";
         _pAttn2 = Mk("dec_attn2", bindings: 11, pushBytes: 32);
         _pFfnGu = Mk("dec_ffngu", bindings: 4, pushBytes: 16);
         _pPreKv = Mk("dec_prekv", bindings: 8, pushBytes: 28);
@@ -198,9 +196,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         _kvVHost = new ushort*[cfg.NumLayers];
         for (int l = 0; l < cfg.NumLayers; l++)
         {
-            int kvBytes = _kvF32 ? 4 : 2;
-            _kvK[l] = _dev.NewStorageBuffer((ulong)(_kvCap * _kvStride * kvBytes), hostVisible: true);
-            _kvV[l] = _dev.NewStorageBuffer((ulong)(_kvCap * _kvStride * kvBytes), hostVisible: true);
+            _kvK[l] = _dev.NewStorageBuffer((ulong)(_kvCap * _kvStride * 2), hostVisible: true);
+            _kvV[l] = _dev.NewStorageBuffer((ulong)(_kvCap * _kvStride * 2), hostVisible: true);
             _kvKHost[l] = (ushort*)_kvK[l].Map();
             _kvVHost[l] = (ushort*)_kvV[l].Map();
         }
@@ -678,29 +675,15 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         // CPU KV is bf16; device KV is fp16 — convert on host.
         ushort* ks = k + pos * _kvStride;
         ushort* vs = v + pos * _kvStride;
-        if (_kvF32)
+        ushort* kd = _kvKHost[layer] + pos * _kvStride;
+        ushort* vd = _kvVHost[layer] + pos * _kvStride;
+        for (long i = 0; i < (long)len * _kvStride; i++)
         {
-            float* kdf = (float*)_kvKHost[layer] + pos * _kvStride;
-            float* vdf = (float*)_kvVHost[layer] + pos * _kvStride;
-            for (long i = 0; i < (long)len * _kvStride; i++)
-            {
-                kdf[i] = BitConverter.UInt32BitsToSingle(((uint)ks[i]) << 16);
-                vdf[i] = BitConverter.UInt32BitsToSingle(((uint)vs[i]) << 16);
-            }
+            kd[i] = BitConverter.HalfToUInt16Bits((Half)BitConverter.UInt32BitsToSingle(((uint)ks[i]) << 16));
+            vd[i] = BitConverter.HalfToUInt16Bits((Half)BitConverter.UInt32BitsToSingle(((uint)vs[i]) << 16));
         }
-        else
-        {
-            ushort* kd = _kvKHost[layer] + pos * _kvStride;
-            ushort* vd = _kvVHost[layer] + pos * _kvStride;
-            for (long i = 0; i < (long)len * _kvStride; i++)
-            {
-                kd[i] = BitConverter.HalfToUInt16Bits((Half)BitConverter.UInt32BitsToSingle(((uint)ks[i]) << 16));
-                vd[i] = BitConverter.HalfToUInt16Bits((Half)BitConverter.UInt32BitsToSingle(((uint)vs[i]) << 16));
-            }
-        }
-        int kvb = _kvF32 ? 4 : 2;
-        _kvK[layer].Flush((ulong)(pos * _kvStride * kvb), (ulong)(len * _kvStride * kvb));
-        _kvV[layer].Flush((ulong)(pos * _kvStride * kvb), (ulong)(len * _kvStride * kvb));
+        _kvK[layer].Flush((ulong)(pos * _kvStride * 2), (ulong)(len * _kvStride * 2));
+        _kvV[layer].Flush((ulong)(pos * _kvStride * 2), (ulong)(len * _kvStride * 2));
     }
 
     private void DumpBuffers()
