@@ -143,6 +143,8 @@ internal unsafe sealed class VkDevice : IDisposable
             SubgroupSizeControl = hasSgc ? 1u : 0u,
         };
         d.SubgroupSizeControl = hasSgc;
+        if (Environment.GetEnvironmentVariable("HYMT_VK_DEBUG") == "1")
+            Console.Error.WriteLine($"vk-dbg coop={d.CoopMatrix} sgc={hasSgc} sgMin={d.SubgroupMin} sgMax={d.SubgroupMax} push={hasPush}");
         s16en.PNext = d.CoopMatrix ? &coopEn : null;
         coopEn.PNext = hasSgc ? &sgcEn : null;
         Vk.VkPhysicalDeviceFeatures feats = new();
