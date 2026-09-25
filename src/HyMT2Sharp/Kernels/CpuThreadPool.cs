@@ -30,7 +30,7 @@ public sealed class CpuThreadPool : IDisposable
     public CpuThreadPool(int threadCount = 0)
     {
         if (threadCount <= 0)
-            threadCount = CalibrateThreadCount(CpuTopology.LogicalCount);
+            threadCount = AutoThreadCount();
         ThreadCount = Math.Max(1, threadCount);
         _threads = new Thread[ThreadCount];
         _starts = new AutoResetEvent[ThreadCount];
@@ -173,6 +173,23 @@ public sealed class CpuThreadPool : IDisposable
                 _starts[index].WaitOne();
             Volatile.Write(ref _parked[index], 0);
         }
+    }
+
+    /// <summary>
+    /// Default worker count: bare metal with enumerated topology uses
+    /// <see cref="CpuTopology.PreferPCoreCount"/> (the probe's synthetic
+    /// rounds scale into SMT siblings, which the bandwidth-bound decode and
+    /// lockstep GEMM cannot use). On VMs or when topology detection failed,
+    /// reported core counts are untrustworthy, so the probe locates the
+    /// oversubscription cliff instead.
+    /// </summary>
+    public static int AutoThreadCount()
+    {
+        if (Environment.GetEnvironmentVariable("HYMT2SHARP_CALIBRATION") != "0"
+            && !CpuTopology.IsVirtualMachine
+            && CpuTopology.PhysicalCoreCount > 0)
+            return CpuTopology.PreferPCoreCount;
+        return CalibrateThreadCount(CpuTopology.LogicalCount);
     }
 
     /// <summary>
