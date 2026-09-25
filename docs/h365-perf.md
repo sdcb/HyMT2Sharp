@@ -11,7 +11,8 @@
 | 内存       | 32 GB LPDDR5X-7500（4×8 GB 板载）                                        |
 | OS         | Windows，Release 构建，`net10.0`                                         |
 | 线程       | 8（为与 5800X 口径一致；CPU 实测 avx2=True，vnni=True）                   |
-| HyMT2Sharp | git `d74799b`（2026-09-25）                                              |
+| HyMT2Sharp | git `6928558`（2026-09-25；CPU 与 K 量化数据测于 `d74799b`，区间仅新增 STQ/Q2 GPU kernel） |
+| llama.cpp  | build **11177**，commit `1ab7e5ad2`（`ggml-cpu-zen4` + `ggml-vulkan`）    |
 | 模型路径   | `D:\_\hy-mt2\Hy-MT2-1.8B-*.gguf`（5 个量化，同 perf.md）                  |
 
 ## 2. 主表：HyMT2Sharp CPU @ H 365
@@ -50,19 +51,47 @@
 
 ## 4. Vulkan 后端 @ Radeon 880M
 
-`--backend vulkan` 直接可用（`--backend` 省略时 auto 探测也会选中 Vulkan）。RDNA 3.5 subgroup=32，prefill 走 sg32 cooperative-matrix tensor-core 管线（同 NVIDIA 路径）。权重支持 Q4_K/Q6_K/Q8_0；STQ1_0/Q2_0C 无 GPU kernel，`LoadModel` 回落 CPU。
+`--backend vulkan` 直接可用（`--backend` 省略时 auto 探测也会选中 Vulkan）。RDNA 3.5，prefill 走 sg32 cooperative-matrix tensor-core 管线（同 NVIDIA 路径）。五种量化均有 GPU kernel（STQ1_0/Q2_0C 于 `1b760b6` 加入）。
 
-| 量化   | Vulkan pp512 / tg128 | 同机 CPU（第 2 节） | 加速比         |
-| ------ | -------------------: | ------------------: | -------------- |
-| Q4_K_M |    **1103.09 / 60.54** |    454.24 / 41.68   | ~2.4× / ~1.5×  |
-| Q6_K   |    **1061.06 / 44.30** |    396.28 / 38.93   | ~2.7× / ~1.1×  |
-| Q8_0   |     **891.02 / 40.68** |    467.92 / 32.32   | ~1.9× / ~1.3×  |
+| 量化              | Vulkan pp512 / tg128   | 同机 CPU（第 2 节） | 加速比        |
+| ----------------- | ---------------------: | ------------------: | ------------- |
+| Q1.25 / STQ1_0    |    **1096.31 / 89.89** |    529.01 / 63.92   | ~2.1× / ~1.4× |
+| Q2_0C             |     **917.60 / 82.68** |    502.76 / 71.56   | ~1.8× / ~1.2× |
+| Q4_K_M            |   **1103.09 / 60.54**  |    454.24 / 41.68   | ~2.4× / ~1.5× |
+| Q6_K              |   **1061.06 / 44.30**  |    396.28 / 38.93   | ~2.7× / ~1.1× |
+| Q8_0              |    **891.02 / 40.68**  |    467.92 / 32.32   | ~1.9× / ~1.3× |
 
-- 正确性：`--verify-decode 8`（Q4_K_M）top1 与 CPU 8/8 一致，prefill max-abs ~1e0（fp16 累加正常量级）。
+- 正确性：`--verify-decode 8`（Q4_K_M、STQ1_0）top1 与 CPU 均 8/8 一致，prefill max-abs ~1e0（fp16 累加正常量级）。
 - 量级参考：同代码在 RTX 3080 Ti 上 pp512 ~15.8k tok/s（perf.md 第 7 节），880M 约为 7%——核显共享内存带宽与 CU 规模所限，符合预期。Decode 侧 880M（~61 tok/s @Q4_K_M）已超 5800X 的 CPU 成绩，但相对 3080 Ti（~277）差 4.6 倍，符合显存带宽差距。
 - iGPU 与 CPU 共享内存控制器：Vulkan decode 与 CPU decode 的量级接近是带宽墙在两端的同一体现。
 
-## 5. 复现
+## 5. 同窗口 llama.cpp 对照（同机，build 11177）
+
+`llama-bench -m <same.gguf> -p 512 -n 128 -t 8 -r 3`；CPU 档 `-ngl 0 -dev none`，GPU 档 `-ngl 99`（自动选中 Vulkan0 = 880M，`KHR_coopmat`）。llama.cpp 加载不了 STQ1_0 / Q2_0C，只对照三种 K 量化。
+
+### 5.1 纯 CPU
+
+| 量化   | HyMT2Sharp pp / tg | llama.cpp pp / tg        | prefill 倍率 | decode 比值 |
+| ------ | -----------------: | -----------------------: | -----------: | ----------: |
+| Q4_K_M |      454.24 / 41.68 |    393.81±1.50 / 57.07±3.97 |   **1.15×** |       0.73× |
+| Q6_K   |      396.28 / 38.93 |    184.77±6.20 / 48.89±1.54 |   **2.14×** |       0.80× |
+| Q8_0   |      467.92 / 32.32 |    248.99±3.47 / 39.51±1.10 |   **1.88×** |       0.82× |
+
+- Prefill 领先 1.15–2.14×（Q4 差距最小，与 5800X 上 Q4 领先 1.72× 的趋势一致——Zen5 上 llama.cpp Q4_K kernel 明显比 Q6/Q8 调得好）。
+- Decode 落后 18–27%：两家都贴带宽墙，llama.cpp GEMV 对 RDNA/Zen5 的访存排布更优，差距比 5800X 上（0.84–0.93×）略大。
+
+### 5.2 Vulkan（880M）
+
+| 量化   | HyMT2Sharp pp / tg | llama.cpp Vulkan pp / tg      | prefill 比值 | decode 比值 |
+| ------ | -----------------: | ----------------------------: | -----------: | ----------: |
+| Q4_K_M |     1103.09 / 60.54 |   1357.08±13.28 / 74.25±0.85 |       0.81× |       0.82× |
+| Q6_K   |     1061.06 / 44.30 |   1203.81±14.54 / 56.15±0.44 |       0.88× |       0.79× |
+| Q8_0   |      891.02 / 40.68 |   1380.55±20.80 / 48.33±0.42 |       0.65× |       0.84× |
+
+- 与 3080 Ti 上「HyMT2Sharp prefill 反超 CUDA llama.cpp 1.04–1.18×」相反：880M 上 llama.cpp Vulkan 全面领先约 1.1–1.5×。880M 原生 subgroup=64（wave64），sg32 coopmat 管线在 RDNA 上拿不到 NVIDIA 上的收益；llama.cpp 的 coopmat kernel 按设备 warp size 自适应，更贴合 wave64。
+- Q8_0 prefill 差距最大（0.65×）：Q8 是我们管线里 unpack 成本最高的格式，wave64 下访存粒度错配被放大，列为后续调优项。
+
+## 6. 复现
 
 ```powershell
 # CPU
@@ -75,6 +104,12 @@ src/HyMT2Sharp.Benchmark/bin/Release/net10.0/Sdcb.HyMT2Sharp.Benchmark.exe `
 
 # GPU 正确性
 ... --backend vulkan --verify-decode 8
+```
+
+```powershell
+# llama.cpp（C:\_\3rd\bin\llama.cpp\llama-bench.exe）
+llama-bench.exe -m "D:\_\hy-mt2\Hy-MT2-1.8B-Q4_K_M.gguf" -p 512 -n 128 -t 8 -ngl 0 -dev none -r 3   # CPU
+llama-bench.exe -m "D:\_\hy-mt2\Hy-MT2-1.8B-Q4_K_M.gguf" -p 512 -n 128 -t 8 -ngl 99 -r 3            # Vulkan
 ```
 
 其余量化换 `--model` 路径即可。注意 `--backend` 缺省为 auto：有可用 Vulkan 设备时会自动走 GPU，跑 CPU 对照务必显式 `--backend cpu`。
