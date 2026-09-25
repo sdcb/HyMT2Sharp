@@ -112,12 +112,18 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         }
 
         bool isAmd = _dev.VendorId == 0x1002;
-        // RDNA (wave64): *_sr variants replace the shared-memory 5-barrier tail
-        // reduction with subgroup xor-shuffles (16-lane clusters, sg32/sg64 safe).
-        // Other vendors keep the committed glslc SPV. HYMT_VK_SR=1 forces them on,
-        // HYMT_VK_NOSR=1 keeps the original path even on AMD.
+        // *_sr variants replace the shared-memory 5-barrier tail reduction with
+        // subgroup xor-shuffles — equivalent within each aligned 16-lane cluster
+        // on sg16/32/64 (verified +1.7% on NVIDIA sg32, +2.8-4.9% on Intel sg16,
+        // +2-8% on AMD wave64). Only requirement: subgroup >= 16 lanes and the
+        // SHUFFLE op in compute — a <16-lane subgroup would straddle clusters.
+        // HYMT_VK_NOSR=1 keeps the original path; HYMT_VK_SR=1 forces it on.
+        const uint SubgroupShuffle = 0x10u, StageCompute = 0x20u;
         bool useSr = Environment.GetEnvironmentVariable("HYMT_VK_NOSR") != "1"
-            && (isAmd || Environment.GetEnvironmentVariable("HYMT_VK_SR") == "1");
+            && ((_dev.SubgroupSize >= 16
+                 && (_dev.SubgroupOps & SubgroupShuffle) != 0
+                 && (_dev.SubgroupStages & StageCompute) != 0)
+                || Environment.GetEnvironmentVariable("HYMT_VK_SR") == "1");
         string Sr(string name) => useSr ? name + "_sr" : name;
         _pGemv4 = Mk(Sr("q4k_gemv3"), bindings: 3, pushBytes: 8);
         _pGemv6 = Mk(Sr("q6k_gemv2"), bindings: 3, pushBytes: 8);
@@ -127,7 +133,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         _pEmbed8 = Mk("dec_embed_q8", bindings: 3, pushBytes: 4);
         _pRms = Mk("dec_rmsnorm", bindings: 3, pushBytes: 8);
         _pAttn2 = Mk("dec_attn2", bindings: 11, pushBytes: 32);
-        _pFfnGu = Mk("dec_ffngu", bindings: 4, pushBytes: 16);
+        _pFfnGu = Mk(Sr("dec_ffngu"), bindings: 4, pushBytes: 16);
         _pPreKv = Mk(Sr("dec_prekv"), bindings: 8, pushBytes: 28);
         _pGemvAdd4 = Mk(Sr("dec_gemvadd_q4k"), bindings: 3, pushBytes: 8);
         _pGemvAdd6 = Mk(Sr("dec_gemvadd_q6k"), bindings: 3, pushBytes: 8);

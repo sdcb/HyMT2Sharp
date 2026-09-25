@@ -49,11 +49,11 @@ rem (Radeon 880M measured; auto-selected by VulkanBackend on vendorId 0x1002).
 "%GLSLANG%" -V --target-env vulkan1.1 -S comp "%DIR%\pf_fa32.comp" -o "%DIR%\pf_fa32.spv" || exit /b 1
 "%GLSLANG%" -V --target-env vulkan1.1 -S comp "%DIR%\pf_addrms16.comp" -o "%DIR%\pf_addrms16.spv" || exit /b 1
 
-rem *_sr decode variants (AMD default): same .comp sources with -DSR_RED,
-rem replacing the 5-barrier shared-memory tail reduction with subgroup
-rem xor-shuffles (exact within each aligned 16-lane cluster, sg32/sg64 safe).
-rem Auto-selected on vendorId 0x1002; HYMT_VK_SR=1 forces, HYMT_VK_NOSR=1 off.
-for %%f in (dec_prekv dec_preffn dec_gemvadd_q4k dec_gemvadd_q6k dec_gemvadd_q8 dec_gemvadd_q2c dec_gemvadd_stq q4k_gemv3 q6k_gemv2 q8_gemv) do (
+rem *_sr decode variants: same .comp sources with -DSR_RED, replacing the
+rem 5-barrier shared-memory tail reduction with subgroup xor-shuffles (exact
+rem within each aligned 16-lane cluster, sg16/sg32/sg64 safe). Default on any
+rem device with subgroupSize>=16 + SHUFFLE op; HYMT_VK_NOSR=1 off, _SR=1 forces.
+for %%f in (dec_prekv dec_preffn dec_ffngu dec_gemvadd_q4k dec_gemvadd_q6k dec_gemvadd_q8 dec_gemvadd_q2c dec_gemvadd_stq q4k_gemv3 q6k_gemv2 q8_gemv) do (
     echo glslang %%~nxf_sr
     "%GLSLANG%" -V --target-env vulkan1.1 -S comp -DSR_RED "%DIR%\%%f.comp" -o "%DIR%\%%f_sr.spv" || exit /b 1
 )

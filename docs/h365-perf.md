@@ -93,11 +93,11 @@
 
 ### 5.3 Vulkan 调优后（AMD 专属默认路径）
 
-改动（全部按 `vendorId == 0x1002` 分发，NVIDIA 路径逐字节不变；`HYMT_VK_NOSR=1` / `HYMT_VK_T32` 可回退）：
+改动（tile 按 `vendorId == 0x1002` 分发；`_sr` 按 subgroup 能力分发——`subgroupSize>=16 && SHUFFLE 运算` 即默认启用，三家实测均正确且更快；`HYMT_VK_NOSR=1` / `HYMT_VK_T32` 可回退）：
 
-1. **prefill GEMM 分角色选 tile**：sg32 下 GU/DOWN（大 N）改用 `pf_gemm_t32_64x128_32x32`，QKV/WO 保持 `64x64_32x32`。880M 实测 tile 扫描 11 个变体后得出的最优组合——RDNA 上 fat-N tile（每 WG 更多 accum 寄存器压力被 wave64 摊薄）优于加 WG 数。
+1. **prefill GEMM 分角色选 tile**（AMD only）：sg32 下 GU/DOWN（大 N）改用 `pf_gemm_t32_64x128_32x32`，QKV/WO 保持 `64x64_32x32`。880M 实测 tile 扫描 11 个变体后得出的最优组合——RDNA 上 fat-N tile（每 WG 更多 accum 寄存器压力被 wave64 摊薄）优于加 WG 数。
 2. **Q8_0 例外**：64x128 对 Q8 反而回退（gu GEMM 276ms vs 208ms @64x64），按主量化类型自动保持 64x64。
-3. **decode GEMV 尾部归约改为 subgroup xor-shuffle**（`*_sr.spv`，`-DSR_RED`）：原实现为 5 次 barrier 的 shared-mem 树形归约（256 线程），改为 4 次 `subgroupShuffleXor`——在每个对齐的 16-lane 簇内数学等价，sg32/sg64 均正确。AMD 设备自动启用。
+3. **decode GEMV 尾部归约改为 subgroup xor-shuffle**（`*_sr.spv`，`-DSR_RED`，11 个 decode shader 全量）：原实现为 5 次 barrier 的 shared-mem 树形归约（256 线程），改为 4 次 `subgroupShuffleXor`——在每个对齐的 16-lane 簇内数学等价，sg16/sg32/sg64 均正确。实测收益：AMD sg64 +2–8%、Intel sg16 +2.8–4.9%、NVIDIA sg32 +1.7%（3080 Ti 复测）。
 
 同日 A/B（orig = `HYMT_VK_NOSR=1` + `HYMT_VK_T32=64x64_32x32`，即调优前语义）：
 

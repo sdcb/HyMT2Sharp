@@ -11,6 +11,9 @@ internal unsafe sealed class VkDevice : IDisposable
     public IntPtr Instance, PhysDevice, Device, Queue;
     public string DeviceName = "";
     public uint VendorId;
+    public uint SubgroupSize;         // actual subgroup size (lanes)
+    public uint SubgroupOps;          // VkSubgroupFeatureFlags (SHUFFLE = 0x10)
+    public uint SubgroupStages;       // VkShaderStageFlags (COMPUTE = 0x20)
     public uint QueueFamily;
     public Vk.VkPhysicalDeviceMemoryProperties MemProps;
     public bool CoherentDeviceLocal;   // DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT exists (ReBAR)
@@ -136,12 +139,16 @@ internal unsafe sealed class VkDevice : IDisposable
             SType = VkConst.StPhysicalDeviceCooperativeMatrixFeaturesKHR,
             CooperativeMatrix = d.CoopMatrix ? 1u : 0u,
         };
-        if (hasSgc)
         {
+            Vk.VkPhysicalDeviceSubgroupProperties sgP = new() { SType = VkConst.StPhysicalDeviceSubgroupProperties };
             Vk.VkPhysicalDeviceSubgroupSizeControlProperties sgcP = new() { SType = VkConst.StPhysicalDeviceSubgroupSizeControlPropertiesEXT };
-            Vk.VkPhysicalDeviceProperties2 p2 = new() { SType = VkConst.StPhysicalDeviceProperties2, PNext = &sgcP };
+            if (hasSgc) sgP.PNext = &sgcP;
+            Vk.VkPhysicalDeviceProperties2 p2 = new() { SType = VkConst.StPhysicalDeviceProperties2, PNext = &sgP };
             Vk.vkGetPhysicalDeviceProperties2(d.PhysDevice, &p2);
-            d.SubgroupMin = sgcP.MinSubgroupSize; d.SubgroupMax = sgcP.MaxSubgroupSize;
+            d.SubgroupSize = sgP.SubgroupSize;
+            d.SubgroupOps = sgP.SupportedOperations;
+            d.SubgroupStages = sgP.SupportedStages;
+            if (hasSgc) { d.SubgroupMin = sgcP.MinSubgroupSize; d.SubgroupMax = sgcP.MaxSubgroupSize; }
         }
 
         Vk.VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgcEn = new()
