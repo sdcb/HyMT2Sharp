@@ -120,6 +120,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         _pPfEmbed = Mk("pf_embed", bindings: 3, pushBytes: 4);
         _pPfRms = Mk("pf_rms", bindings: 3, pushBytes: 16);
         bool useCm = _dev.CoopMatrix && _dev.SubgroupSizeControl
+            && _dev.SubgroupMin <= 16 && _dev.SubgroupMax >= 16
             && Environment.GetEnvironmentVariable("HYMT_VK_NOCM") != "1";
         string cmVar = Environment.GetEnvironmentVariable("HYMT_VK_GEMMV") ?? "g28";
         _gVar = useCm && cmVar.StartsWith("g");

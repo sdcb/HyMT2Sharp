@@ -448,8 +448,8 @@ internal static class VkConst
     public const uint StPhysicalDevice16BitStorageFeatures = 1000083000u;
     public const uint StPhysicalDeviceCooperativeMatrixFeaturesKHR = 1000506000u;
     public const uint StCooperativeMatrixPropertiesKHR = 1000506001u;
-    public const uint StPhysicalDeviceSubgroupSizeControlFeaturesEXT = 1000225000u;
-    public const uint StPhysicalDeviceSubgroupSizeControlPropertiesEXT = 1000225001u;
+    public const uint StPhysicalDeviceSubgroupSizeControlPropertiesEXT = 1000225000u;
+    public const uint StPhysicalDeviceSubgroupSizeControlFeaturesEXT = 1000225002u;
     public const uint StPhysicalDeviceProperties2 = 1000059000u;
     public const uint StPipelineShaderStageRequiredSubgroupSizeCreateInfo = 1000225001u;
 
