@@ -24,7 +24,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
     // Persistently dequantized fp32 weight copies for prefill GEMM (M6):
     // allocated on first use so decode-only runs pay nothing.
     private readonly Dictionary<string, IntPtr> _wfp32 = new(StringComparer.Ordinal);
-    private IntPtr _psoEmbedQ4, _psoEmbedQ6, _psoEmbedQ8, _psoRms, _psoRope, _psoKvAppend, _psoAttn, _psoSilu, _psoAdd;
+    private IntPtr _psoEmbedQ4, _psoEmbedQ6, _psoEmbedQ8, _psoRms, _psoAttn, _psoSilu, _psoAdd;
     private IntPtr _psoAttnSplit, _psoAttnMerge;
     // Max split-K chunks per head for decode attention (chunk >= kvLen/16).
     private const int MaxSplit = 16;
@@ -94,8 +94,6 @@ public sealed unsafe class MetalBackend : IComputeBackend
         _psoEmbedQ6 = NewPso(lib2, "q6k_embed_row");
         _psoEmbedQ8 = NewPso(lib2, "q8_0_embed_row");
         _psoRms = NewPso(lib2, "rmsnorm_rows");
-        _psoRope = NewPso(lib2, "rope_neox");
-        _psoKvAppend = NewPso(lib2, "kv_append_bf16");
         _psoAttn = NewPso(lib2, "attn_decode");
         _psoAttnSplit = NewPso(lib2, "attn_split");
         _psoAttnMerge = NewPso(lib2, "attn_merge");
@@ -432,7 +430,13 @@ public sealed unsafe class MetalBackend : IComputeBackend
             RopeRms(cc, l, pos);
             // attention -> ao: split-K flash-decoding past 256 positions
             // (attn_decode's serial position scan underuses the GPU).
+            // attn_split's sc[1024] caps per-chunk length at 1024: keep
+            // ceil(kvLen/split) <= 1024 or fall back to serial attn_decode.
             int split = Math.Min((kvLen + 255) / 256, MaxSplit);
+            if (kvLen > MaxSplit * 1024)
+                split = 1;
+            else if (split > 1)
+                split = Math.Max(split, (kvLen + 1023) / 1024);
             if (split <= 1)
             {
                 cc.SetPso(_psoAttn);
@@ -805,7 +809,6 @@ public sealed unsafe class MetalBackend : IComputeBackend
         c.SetBuffer(W($"blk.{l}.attn_k_norm.weight"), 0, 4);
         c.SetInt(5, heads); c.SetInt(6, dim); c.SetInt(7, _cfg.RopeDim);
         c.SetInt(8, pos); c.SetFloat(9, _cfg.RopeBase); c.SetFloat(10, _cfg.Eps);
-        c.SetInt(11, _kvStride);
         c.Dispatch((nuint)(heads + kvHeads), 1, 1, 256, 1, 1);
     }
 
@@ -891,16 +894,6 @@ public sealed unsafe class MetalBackend : IComputeBackend
         c.SetBuffer(x, 0, 0); c.SetBuffer(w, 0, 1); c.SetBuffer(y, 0, 2);
         c.SetInt(3, dim); c.SetFloat(4, _cfg.Eps);
         c.Dispatch((nuint)rows, 1, 1, 256, 1, 1);
-    }
-
-    private void Rope(CmdCtx c, IntPtr x, int heads, int headDim, int pos)
-    {
-        int half = _cfg.RopeDim / 2;
-        c.SetPso(_psoRope);
-        c.SetBuffer(x, 0, 0);
-        c.SetInt(1, headDim); c.SetInt(2, _cfg.RopeDim); c.SetInt(3, pos); c.SetFloat(4, _cfg.RopeBase);
-        c.SetInt(5, heads * half);
-        c.Dispatch((nuint)((heads * half + 255) / 256), 1, 1, 256, 1, 1);
     }
 
     private void Add(CmdCtx c, IntPtr a, IntPtr b, int n)

@@ -92,52 +92,10 @@ kernel void rmsnorm_rows(
     for (int i = (int)tid; i < dim; i += 256) yr[i] = xr[i] * scale * w[i];
 }
 
-// NeoX RoPE, in-place. grid = heads * (ropeDim/2); thread = (head, pair index)
-kernel void rope_neox(
-    device float* x [[buffer(0)]],
-    constant int& headDim [[buffer(1)]],
-    constant int& ropeDim [[buffer(2)]],
-    constant int& pos [[buffer(3)]],
-    constant float& base [[buffer(4)]],
-    constant int& n [[buffer(5)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if ((int)gid >= n) return;
-    int hd = ropeDim >> 1;
-    int h = (int)gid / hd;
-    int i = (int)gid % hd;
-    float freq = 1.0f / pow(base, float(i) / float(hd));
-    float a = float(pos) * freq;
-    float c = cos(a), s = sin(a);
-    device float* row = x + h * headDim;
-    float x0 = row[i], x1 = row[i + hd];
-    row[i] = x0 * c - x1 * s;
-    row[i + hd] = x0 * s + x1 * c;
-}
-
-// append one token's K and V (fp32) into flat bf16 caches at `pos`
 // paged KV: logical position j -> physical row via block table.
 // tab[logicalBlock] = physical block index; physical row = phys * (1<<lg) + (j % (1<<lg)).
 inline uint kv_row(device const int* tab, uint j, uint lg) {
     return ((uint)tab[j >> lg] << lg) | (j & ((1u << lg) - 1u));
-}
-
-kernel void kv_append_bf16(
-    device const float* kSrc [[buffer(0)]],
-    device const float* vSrc [[buffer(1)]],
-    device ushort* kDst [[buffer(2)]],
-    device ushort* vDst [[buffer(3)]],
-    constant int& kDim [[buffer(4)]],
-    constant int& kvStride [[buffer(5)]],
-    constant int& pos [[buffer(6)]],
-    device const int* tab [[buffer(7)]],
-    constant int& lg [[buffer(8)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if ((int)gid >= kDim) return;
-    uint prow = kv_row(tab, (uint)pos, (uint)lg);
-    kDst[prow * kvStride + (int)gid] = f32_to_bf16(kSrc[gid]);
-    vDst[prow * kvStride + (int)gid] = f32_to_bf16(vSrc[gid]);
 }
 
 // decode attention: one threadgroup per q head, 128 threads.
@@ -215,7 +173,9 @@ kernel void attn_decode(
 // partial for its contiguous chunk of positions, written to
 // part[g] = {m, l, acc[headDim]}. attn_merge combines the S partials per
 // head. Parallelizes the serial position scan that dominates attn_decode
-// at long context; sc[] is capped at 1024 entries so chunkLen <= 1024.
+// at long context.
+// INVARIANT: sc[1024] caps the per-chunk length at 1024 — the host must
+// keep ceil(kvLen/S) <= 1024 (raise S or fall back to attn_decode).
 kernel void attn_split(
     device const float* q [[buffer(0)]],
     device const ushort* K [[buffer(1)]],
@@ -1524,7 +1484,6 @@ kernel void rope_rms(
     constant int& pos [[buffer(8)]],
     constant float& base [[buffer(9)]],
     constant float& eps [[buffer(10)]],
-    constant int& kvStride [[buffer(11)]],
     uint g [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]])
 {
