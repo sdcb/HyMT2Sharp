@@ -10,6 +10,7 @@ internal unsafe sealed class VkDevice : IDisposable
 {
     public IntPtr Instance, PhysDevice, Device, Queue;
     public string DeviceName = "";
+    public uint VendorId;
     public uint QueueFamily;
     public Vk.VkPhysicalDeviceMemoryProperties MemProps;
     public bool CoherentDeviceLocal;   // DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT exists (ReBAR)
@@ -66,6 +67,7 @@ internal unsafe sealed class VkDevice : IDisposable
         Vk.VkPhysicalDeviceProperties props;
         Vk.vkGetPhysicalDeviceProperties(d.PhysDevice, &props);
         d.DeviceName = Marshal.PtrToStringAnsi((IntPtr)props.DeviceName) ?? "?";
+        d.VendorId = props.VendorID;
         d.TimestampPeriodNs = props.TimestampPeriodNs;
 
         uint nqf = 0;

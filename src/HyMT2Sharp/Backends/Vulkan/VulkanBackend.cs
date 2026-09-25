@@ -111,22 +111,30 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             return p;
         }
 
-        _pGemv4 = Mk("q4k_gemv3", bindings: 3, pushBytes: 8);
-        _pGemv6 = Mk("q6k_gemv2", bindings: 3, pushBytes: 8);
-        _pGemv8 = Mk("q8_gemv", bindings: 3, pushBytes: 8);
+        bool isAmd = _dev.VendorId == 0x1002;
+        // RDNA (wave64): *_sr variants replace the shared-memory 5-barrier tail
+        // reduction with subgroup xor-shuffles (16-lane clusters, sg32/sg64 safe).
+        // Other vendors keep the committed glslc SPV. HYMT_VK_SR=1 forces them on,
+        // HYMT_VK_NOSR=1 keeps the original path even on AMD.
+        bool useSr = Environment.GetEnvironmentVariable("HYMT_VK_NOSR") != "1"
+            && (isAmd || Environment.GetEnvironmentVariable("HYMT_VK_SR") == "1");
+        string Sr(string name) => useSr ? name + "_sr" : name;
+        _pGemv4 = Mk(Sr("q4k_gemv3"), bindings: 3, pushBytes: 8);
+        _pGemv6 = Mk(Sr("q6k_gemv2"), bindings: 3, pushBytes: 8);
+        _pGemv8 = Mk(Sr("q8_gemv"), bindings: 3, pushBytes: 8);
         _pEmbed4 = Mk("dec_embed_q4k", bindings: 3, pushBytes: 4);
         _pEmbed6 = Mk("dec_embed_q6k", bindings: 3, pushBytes: 4);
         _pEmbed8 = Mk("dec_embed_q8", bindings: 3, pushBytes: 4);
         _pRms = Mk("dec_rmsnorm", bindings: 3, pushBytes: 8);
         _pAttn2 = Mk("dec_attn2", bindings: 11, pushBytes: 32);
         _pFfnGu = Mk("dec_ffngu", bindings: 4, pushBytes: 16);
-        _pPreKv = Mk("dec_prekv", bindings: 8, pushBytes: 28);
-        _pGemvAdd4 = Mk("dec_gemvadd_q4k", bindings: 3, pushBytes: 8);
-        _pGemvAdd6 = Mk("dec_gemvadd_q6k", bindings: 3, pushBytes: 8);
-        _pGemvAdd8 = Mk("dec_gemvadd_q8", bindings: 3, pushBytes: 8);
-        _pGemvAddQ2C = Mk("dec_gemvadd_q2c", bindings: 3, pushBytes: 8);
-        _pGemvAddSTQ = Mk("dec_gemvadd_stq", bindings: 3, pushBytes: 8);
-        _pPreFfn = Mk("dec_preffn", bindings: 5, pushBytes: 20);
+        _pPreKv = Mk(Sr("dec_prekv"), bindings: 8, pushBytes: 28);
+        _pGemvAdd4 = Mk(Sr("dec_gemvadd_q4k"), bindings: 3, pushBytes: 8);
+        _pGemvAdd6 = Mk(Sr("dec_gemvadd_q6k"), bindings: 3, pushBytes: 8);
+        _pGemvAdd8 = Mk(Sr("dec_gemvadd_q8"), bindings: 3, pushBytes: 8);
+        _pGemvAddQ2C = Mk(Sr("dec_gemvadd_q2c"), bindings: 3, pushBytes: 8);
+        _pGemvAddSTQ = Mk(Sr("dec_gemvadd_stq"), bindings: 3, pushBytes: 8);
+        _pPreFfn = Mk(Sr("dec_preffn"), bindings: 5, pushBytes: 20);
         _pPfDeq4 = Mk("pf_deq_q4k", bindings: 2, pushBytes: 12);
         _pPfDeq6 = Mk("pf_deq_q6k", bindings: 2, pushBytes: 12);
         _pPfDeq8 = Mk("pf_deq_q8", bindings: 2, pushBytes: 12);
@@ -166,13 +174,22 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             if (useCm && cmSg == 32 && Environment.GetEnvironmentVariable("HYMT_VK_NOT32") != "1")
             {
                 // per-GEMM tile variants (qkv, wo, gu, down); HYMT_VK_T32[_QKV|_WO|_GU|_DOWN] override
-                string def = Environment.GetEnvironmentVariable("HYMT_VK_T32") ?? "64x64_32x32";
+                // RDNA: the big-N FFN GEMMs want a wider N tile (fewer, fatter WGs);
+                // the small-N attention GEMMs keep 64x64 (more WGs hides latency).
+                // Measured on Radeon 880M (RDNA3.5): +6-9% prefill on all quants
+                // except Q8_0, where 64x128 regresses badly — keep 64x64 there.
+                bool amdWide = isAmd
+                    && (!gguf.Tensors.TryGetValue("blk.0.ffn_gate.weight", out GgufTensorInfo fg)
+                        || fg.Type != GgmlTensorType.Q8_0);
+                string? envAll = Environment.GetEnvironmentVariable("HYMT_VK_T32");
                 string[] roles = { "QKV", "WO", "GU", "DOWN" };
                 var cache = new Dictionary<string, GemmT>();
                 _gemmT = new GemmT[4];
                 for (int i = 0; i < 4; i++)
                 {
-                    string v = Environment.GetEnvironmentVariable("HYMT_VK_T32_" + roles[i]) ?? def;
+                    string v = Environment.GetEnvironmentVariable("HYMT_VK_T32_" + roles[i])
+                        ?? envAll
+                        ?? (amdWide && roles[i] is "GU" or "DOWN" ? "64x128_32x32" : "64x64_32x32");
                     if (!cache.TryGetValue(v, out GemmT? g)) cache[v] = g = LoadGemmT(v);
                     _gemmT[i] = g;
                 }

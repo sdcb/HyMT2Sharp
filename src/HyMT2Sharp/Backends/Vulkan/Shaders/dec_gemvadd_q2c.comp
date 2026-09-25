@@ -1,6 +1,10 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#ifdef SR_RED
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
+
 
 // y[row] += Wq2c[row,:] dot xv. 16 rows/WG, 16 lanes/row (same map as q8_gemv).
 // Block = 130B per 512 weights: fp16 d @0 + 2-bit qs[128] @2.
@@ -50,6 +54,12 @@ void main()
                     dot(xv[kv + 2u], q2w(q, 16u)) + dot(xv[kv + 3u], q2w(q, 24u)));
     }
 
+#ifdef SR_RED
+    acc += subgroupShuffleXor(acc, 8u);
+    acc += subgroupShuffleXor(acc, 4u);
+    acc += subgroupShuffleXor(acc, 2u);
+    acc += subgroupShuffleXor(acc, 1u);
+#else
     red[tid] = acc;
     barrier();
     if (itid < 8u) red[tid] += red[tid + 8u];
@@ -60,5 +70,10 @@ void main()
     barrier();
     if (itid < 1u) red[tid] += red[tid + 1u];
     barrier();
+#endif
+#ifdef SR_RED
+    if (itid == 0u && valid) y[row] += acc;
+#else
     if (itid == 0u && valid) y[row] += red[tid];
+#endif
 }

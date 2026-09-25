@@ -69,3 +69,6 @@ prompt.txt
 *.orig
 *~
 ~$*
+
+# Local toolchains (e.g. source-built glslang)
+/tools/

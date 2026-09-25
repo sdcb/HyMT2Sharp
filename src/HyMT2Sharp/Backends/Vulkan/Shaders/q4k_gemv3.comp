@@ -1,5 +1,9 @@
 #version 450
 #extension GL_EXT_control_flow_attributes : require
+#ifdef SR_RED
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
+
 
 // Q4_K GEMV v5: llama.cpp mul_mat_vec thread mapping. 16 rows/WG, 16 lanes/row.
 // Lane (il=itid/4, ir=itid%4): v_im=il/2, v_in=il%2, l0=4*(2*ir+v_in).
@@ -94,6 +98,12 @@ void main()
         acc += dot(by232, vec4(smB.z) * q64h - vec4(smB.w));
     }
 
+#ifdef SR_RED
+    acc += subgroupShuffleXor(acc, 8u);
+    acc += subgroupShuffleXor(acc, 4u);
+    acc += subgroupShuffleXor(acc, 2u);
+    acc += subgroupShuffleXor(acc, 1u);
+#else
     red[tid] = acc;
     barrier();
     if (itid < 8u) red[tid] += red[tid + 8u];
@@ -104,5 +114,10 @@ void main()
     barrier();
     if (itid < 1u) red[tid] += red[tid + 1u];
     barrier();
+#endif
+#ifdef SR_RED
+    if (itid == 0u && valid) y[row] = acc;
+#else
     if (itid == 0u && valid) y[row] = red[tid];
+#endif
 }
