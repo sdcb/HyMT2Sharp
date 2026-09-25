@@ -36,6 +36,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private IntPtr _psoGemvMulti, _psoRopeRms;
     private IntPtr _psoEmbedRowsQ4, _psoEmbedRowsQ6, _psoEmbedRowsQ8, _psoRopeMulti, _psoKvAppendMulti;
     private IntPtr _psoAttnScores, _psoAttnCombine, _psoKvCopy;
+    private IntPtr _psoK2h, _psoV2f, _psoSoftmaxP;
     private IntPtr[] _kvK = null!, _kvV = null!;
     private int _kvCap;
     private int _kvStride;
@@ -122,6 +123,9 @@ public sealed unsafe class MetalBackend : IComputeBackend
                 $"attn_scores/attn_combine stage q in threadgroup float[128] — headDim {cfg.HeadDim} unsupported");
         _psoAttnScores = NewPso(lib2, "attn_scores");
         _psoAttnCombine = NewPso(lib2, "attn_combine");
+        _psoK2h = NewPso(lib2, "k2h");
+        _psoV2f = NewPso(lib2, "v2f");
+        _psoSoftmaxP = NewPso(lib2, "softmaxP");
         _psoKvCopy = NewPso(lib2, "kv_copy_block");
         _psoGemvMulti = NewPso(lib2, "gemv_multi");
         _psoRopeRms = NewPso(lib2, "rope_rms");
@@ -541,6 +545,13 @@ public sealed unsafe class MetalBackend : IComputeBackend
         IntPtr scores = _dev.NewBuffer((nuint)heads * (nuint)T * (nuint)kvLen * 4);
         // Transposed copies of the four per-layer GEMM inputs (xT[k][t]).
         int Tpad = (T + 63) & ~63;
+        // MMA attention path: qT = xT layout of q (fp32), K converted to fp16
+        // rows, V to fp32 rows, softmax'd probs as fp16 [t][kvPad].
+        int kvPad = (kvLen + 63) & ~63;
+        IntPtr qT = _dev.NewBuffer((nuint)qDim * (nuint)Tpad * 4);
+        IntPtr p16 = _dev.NewBuffer((nuint)heads * (nuint)T * (nuint)kvPad * 2);
+        IntPtr k16 = _dev.NewBuffer((nuint)kvHeads * (nuint)kvLen * (nuint)dim * 2);
+        IntPtr v32 = _dev.NewBuffer((nuint)kvPad * (nuint)kDim * 4);
         IntPtr xT1 = _dev.NewBuffer((nuint)(hidden * Tpad * 4));   // n1 (q/k/v)
         IntPtr xT2 = _dev.NewBuffer((nuint)(hidden * Tpad * 4));   // n2 (gate/up)
         IntPtr xT3 = _dev.NewBuffer((nuint)(qDim * Tpad * 4));     // ao (attn_output)
@@ -595,6 +606,52 @@ public sealed unsafe class MetalBackend : IComputeBackend
                     cc.Dispatch((nuint)heads, 1, 1, 128, 1, 1);
                 }
             }
+            else if (_psoMma != IntPtr.Zero && T % 64 == 0 &&
+                     Environment.GetEnvironmentVariable("HYMT_METAL_NOMMAATTN") != "1")
+            {
+                // scores = qT·Kᵀ via the MMA GEMM (K converted to fp16 rows),
+                // softmax into fp16 P, then outᵀ = Vᵀ·P as a second MMA GEMM
+                // whose output lands directly in xT3 — skipping the separate
+                // ao buffer and the Xt(ao) transpose entirely.
+                Xt(cc, q, qT, qDim, T, Tpad);
+                cc.SetPso(_psoK2h);
+                cc.SetBuffer(_kvK[l], 0, 0); cc.SetBuffer(k16, 0, 1); cc.SetBuffer(_kvTab, 0, 2);
+                cc.SetInt(3, BlkShift); cc.SetInt(4, _kvStride); cc.SetInt(5, kvLen);
+                cc.SetInt(6, dim); cc.SetInt(7, kvHeads);
+                cc.Dispatch((nuint)((kvLen * kvHeads * dim / 4 + 255) / 256), 1, 1, 256, 1, 1);
+                cc.SetPso(_psoV2f);
+                cc.SetBuffer(_kvV[l], 0, 0); cc.SetBuffer(v32, 0, 1); cc.SetBuffer(_kvTab, 0, 2);
+                cc.SetInt(3, BlkShift); cc.SetInt(4, _kvStride); cc.SetInt(5, kvLen);
+                cc.SetInt(6, dim); cc.SetInt(7, kvHeads);
+                cc.Dispatch((nuint)((kvPad * kvHeads * dim / 4 + 255) / 256), 1, 1, 256, 1, 1);
+                for (int hh = 0; hh < heads; hh++)
+                {
+                    int kvh = hh * kvHeads / heads;
+                    GemmRaw(cc, k16, (nuint)((ulong)kvh * (ulong)kvLen * (ulong)dim * 2),
+                            qT, (nuint)((ulong)hh * (ulong)dim * (ulong)Tpad * 4),
+                            scores, (nuint)((ulong)hh * (ulong)T * (ulong)kvLen * 4),
+                            dim, kvLen, T, Tpad);
+                }
+                cc.SetPso(_psoSoftmaxP);
+                cc.SetBuffer(scores, 0, 0); cc.SetBuffer(p16, 0, 1);
+                cc.SetInt(2, T); cc.SetInt(3, kvLen); cc.SetInt(4, kvPad);
+                cc.SetInt(5, start); cc.SetFloat(6, scale);
+                cc.Dispatch((nuint)T, (nuint)heads, 1, 128, 1, 1);
+                for (int hh = 0; hh < heads; hh++)
+                {
+                    int kvh = hh * kvHeads / heads;
+                    // outT[d][t] = Σ_j V32[j][d]·P[t][j]: the mma's "A" operand is
+                    // V32 rows (stride kDim, col-offset kvh*dim), "B" is P rows t.
+                    // y = xT3 head rows with row stride Tpad, out cols = t.
+                    cc.SetPso(_psoMma);
+                    cc.SetBuffer(p16, (nuint)((ulong)hh * (ulong)T * (ulong)kvPad * 2), 0);
+                    cc.SetBuffer(v32, (nuint)((ulong)kvh * (ulong)dim * 4), 1);
+                    cc.SetBuffer(xT3, (nuint)((ulong)hh * (ulong)dim * (ulong)Tpad * 4), 2);
+                    cc.SetInt(3, kvPad); cc.SetInt(4, Tpad);
+                    cc.SetInt(5, T); cc.SetInt(6, kDim);
+                    cc.Dispatch((nuint)(Tpad / 64), (nuint)(dim / 64), 1, 256, 1, 1);
+                }
+            }
             else
             {
                 cc.SetPso(_psoAttnScores);
@@ -610,8 +667,8 @@ public sealed unsafe class MetalBackend : IComputeBackend
                 cc.SetInt(6, _kvStride); cc.SetInt(7, kvLen); cc.SetInt(8, start); cc.SetInt(9, T);
                 cc.SetBuffer(_kvTab, 0, 10); cc.SetInt(11, BlkShift);
                 cc.Dispatch((nuint)T, (nuint)heads, 1, 128, 1, 1);
+                Xt(cc, ao, xT3, qDim, T, Tpad);
             }
-            Xt(cc, ao, xT3, qDim, T, Tpad);
             Gemm(cc, $"blk.{l}.attn_output.weight", xT3, attnOut, qDim, hidden, T, Tpad);
             Add(cc, h, attnOut, T * hidden);
 
@@ -645,7 +702,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
         // GPU is done with the scratch; newBuffer* returned +1 objects.
         foreach (IntPtr b in new[]
             { toks, h, n1, n2, q, kb, vb, ao, attnOut, gate, up, down, normed, scores,
-              xT1, xT2, xT3, xT4 })
+              qT, p16, k16, v32, xT1, xT2, xT3, xT4 })
             ObjC.Release(b);
         cc.Drain();
 
@@ -831,6 +888,46 @@ public sealed unsafe class MetalBackend : IComputeBackend
     }
 
     // x -> xT[k][t] (stride Tpad), 32x32 tiled transpose.
+    // Gemm against explicit operand buffers (no weight-scratch dequant):
+    // B = fp16 [outDim][inDim] at (b16+bOff), A = fp32 [inDim][Tpad] at
+    // (xT+xOff), y = fp32 [T][outDim] at (y+yOff). Same mma+sgemm-tail split
+    // as Gemm(); used by the MMA prefill-attention pipeline.
+    private void GemmRaw(CmdCtx c, IntPtr b16, nuint bOff, IntPtr xT, nuint xOff,
+                         IntPtr y, nuint yOff, int inDim, int outDim, int T, int Tpad)
+    {
+        int tFull = T & ~63, cFull = outDim & ~63;
+        bool useMma = _psoMma != IntPtr.Zero && inDim % 16 == 0 && tFull > 0 && cFull > 0;
+        if (useMma)
+        {
+            c.SetPso(_psoMma);
+            c.SetBuffer(b16, bOff, 0); c.SetBuffer(xT, xOff, 1); c.SetBuffer(y, yOff, 2);
+            c.SetInt(3, inDim); c.SetInt(4, outDim); c.SetInt(5, T); c.SetInt(6, Tpad);
+            c.Dispatch((nuint)(cFull / 64), (nuint)(tFull / 64), 1, 256, 1, 1);
+        }
+        int cBase = useMma ? cFull : 0;
+        if (!useMma || outDim - cFull > 0)
+        {
+            SgemmRaw(c, b16, bOff, xT, xOff, y, yOff, inDim, outDim, T, Tpad, 0, cBase,
+                (outDim - cBase + 63) / 64, Tpad / 64);
+        }
+        if (useMma && T - tFull > 0)
+        {
+            SgemmRaw(c, b16, bOff, xT, xOff, y, yOff, inDim, outDim, T, Tpad, tFull, 0,
+                cFull / 64, (T - tFull + 63) / 64);
+        }
+    }
+
+    private void SgemmRaw(CmdCtx c, IntPtr b16, nuint bOff, IntPtr xT, nuint xOff,
+                          IntPtr y, nuint yOff, int inDim, int outDim, int T, int Tpad,
+                          int tBase, int cBase, int gx, int gy)
+    {
+        c.SetPso(_psoSgemm);
+        c.SetBuffer(b16, bOff, 0); c.SetBuffer(xT, xOff, 1); c.SetBuffer(y, yOff, 2);
+        c.SetInt(3, inDim); c.SetInt(4, outDim); c.SetInt(5, T); c.SetInt(6, Tpad);
+        c.SetInt(7, tBase); c.SetInt(8, cBase);
+        c.Dispatch((nuint)gx, (nuint)gy, 1, 256, 1, 1);
+    }
+
     private void Xt(CmdCtx c, IntPtr x, IntPtr xT, int dim, int T, int Tpad)
     {
         c.SetPso(_psoXt);

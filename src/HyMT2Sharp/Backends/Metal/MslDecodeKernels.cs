@@ -633,6 +633,111 @@ kernel void attn_combine(
     }
 }
 
+// ---- prefill attention through the MMA GEMM path ----
+// Scores and probs·V are ordinary GEMMs (scores[t][j] = q_t·k_j, outT[d][t] =
+// Sum_j V[j][d]·P[t][j]); staging them through mma_gemm turns the O(T·kvLen)
+// scalar dots into tensor-core ops. These three helpers only reshape/convert
+// operands: K -> fp16 rows, V -> fp32 rows, softmax over the score rows into
+// fp16 P. Requires T % 64 == 0 (host falls back to attn_scores/attn_combine
+// otherwise). Unused when the GPU lacks simdgroup MMA.
+
+// K16[kvh][j][d] = half(K[j][kvh*headDim+d]). Flat grid over half4 packs.
+kernel void k2h(
+    device const ushort* K [[buffer(0)]],
+    device half* K16 [[buffer(1)]],
+    device const int* tab [[buffer(2)]],
+    constant int& lg [[buffer(3)]],
+    constant int& kvStride [[buffer(4)]],
+    constant int& kvLen [[buffer(5)]],
+    constant int& headDim [[buffer(6)]],
+    constant int& kvHeads [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int packs = headDim >> 2;
+    int i4 = (int)gid % packs;
+    int jkvh = (int)gid / packs;
+    int j = jkvh / kvHeads, kvh = jkvh % kvHeads;
+    if (j >= kvLen) return;
+    device const ushort* src = K + (ulong)kv_row(tab, (uint)j, (uint)lg) * kvStride
+        + kvh * headDim + i4 * 4;
+    half4 o;
+    for (int i = 0; i < 4; i++) o[i] = (half)bf16_to_f32(src[i]);
+    *(device half4*)(K16 + ((ulong)(kvh * kvLen + j) * headDim + i4 * 4)) = o;
+}
+
+// V32[j][kvh*headDim+d] = float(V[j][kvh*headDim+d]), j in [0, kvPad) — the
+// padding rows are zeroed so the P·V MMA can round in_dim up to a tile.
+// Same flat half4-pack mapping as k2h (fp32 out → float4 stores).
+kernel void v2f(
+    device const ushort* V [[buffer(0)]],
+    device float* V32 [[buffer(1)]],
+    device const int* tab [[buffer(2)]],
+    constant int& lg [[buffer(3)]],
+    constant int& kvStride [[buffer(4)]],
+    constant int& kvLen [[buffer(5)]],
+    constant int& headDim [[buffer(6)]],
+    constant int& kvHeads [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+    int packs = headDim >> 2;
+    int i4 = (int)gid % packs;
+    int jkvh = (int)gid / packs;
+    int j = jkvh / kvHeads, kvh = jkvh % kvHeads;
+    float4 o = float4(0.0f);
+    if (j < kvLen) {
+        device const ushort* src = V + (ulong)kv_row(tab, (uint)j, (uint)lg) * kvStride
+            + kvh * headDim + i4 * 4;
+        for (int i = 0; i < 4; i++) o[i] = bf16_to_f32(src[i]);
+    }
+    *(device float4*)(V32 + ((ulong)j * kvHeads * headDim + kvh * headDim + i4 * 4)) = o;
+}
+
+// P16[h][t][j] = softmax_j(scores[h][t][j] * scale) over j < kvHere(t), zero
+// to kvPad. grid (T, heads), 128 threads; kvLen <= 4096 (same bound as
+// attn_combine's threadgroup row).
+kernel void softmaxP(
+    device const float* scores [[buffer(0)]],   // [h][T][kvLen]
+    device half* P [[buffer(1)]],               // [h][T][kvPad]
+    constant int& T [[buffer(2)]],
+    constant int& kvLen [[buffer(3)]],
+    constant int& kvPad [[buffer(4)]],
+    constant int& posBase [[buffer(5)]],
+    constant float& scale [[buffer(6)]],
+    uint2 g [[threadgroup_position_in_grid]],
+    uint2 tp [[thread_position_in_threadgroup]])
+{
+    int t = (int)g.x, h = (int)g.y, tid = (int)tp.x;
+    int kvHere = posBase + t + 1;
+    if (kvHere > kvLen) kvHere = kvLen;
+    threadgroup float sc[4096];
+    threadgroup float red[128];
+    device const float* srow = scores + ((ulong)h * T + t) * kvLen;
+    for (int j = tid; j < kvHere; j += 128)
+        sc[j] = srow[j] * scale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mx = -3.4e38f;
+    for (int j = tid; j < kvHere; j += 128) mx = max(mx, sc[j]);
+    red[tid] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    mx = red[0];
+    float sm = 0.0f;
+    for (int j = tid; j < kvHere; j += 128) { sc[j] = exp(sc[j] - mx); sm += sc[j]; }
+    red[tid] = sm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 64; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rs = 1.0f / red[0];
+    device half* prow = P + ((ulong)h * T + t) * kvPad;
+    for (int j = tid; j < kvPad; j += 128)
+        prow[j] = j < kvHere ? (half)(sc[j] * rs) : (half)0.0f;
+}
+
 // append T tokens' K/V (fp32, [T x kDim]) into paged bf16 caches (block table) starting at posBase.
 kernel void kv_append_multi(
     device const float* kSrc [[buffer(0)]],
