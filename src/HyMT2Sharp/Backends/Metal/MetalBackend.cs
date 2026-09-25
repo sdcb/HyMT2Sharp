@@ -606,7 +606,8 @@ public sealed unsafe class MetalBackend : IComputeBackend
                     cc.Dispatch((nuint)heads, 1, 1, 128, 1, 1);
                 }
             }
-            else if (_psoMma != IntPtr.Zero && T % 64 == 0 &&
+            else if (_psoMma != IntPtr.Zero && T % 64 == 0 && kvLen % 4 == 0 &&
+                     dim % 64 == 0 &&
                      Environment.GetEnvironmentVariable("HYMT_METAL_NOMMAATTN") != "1")
             {
                 // scores = qT·Kᵀ via the MMA GEMM (K converted to fp16 rows),
@@ -809,7 +810,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
         c.SetBuffer(x, 0, 0);
         int[] ncols = new int[4], types = new int[4];
         int flags = accIn != IntPtr.Zero ? 1 : 0;
-        if (nrm != IntPtr.Zero) flags |= 16;
+        if (nrm != IntPtr.Zero) flags |= 32;
         for (int s = 0; s < 3; s++)
         {
             GSec? g = s < secs.Length ? secs[s] : null;
@@ -860,7 +861,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
         c.SetInt(8, inDim);
         c.SetInt4(9, cols, cols, 0, 0);
         c.SetInt4(10, t0, t1, 0, 0);
-        c.SetInt(11, nrm != IntPtr.Zero ? 2 | 16 : 2);  // pair-silu + optional rms
+        c.SetInt(11, nrm != IntPtr.Zero ? 2 | 32 : 2);  // pair-silu + optional rms
         c.SetBuffer(nrm != IntPtr.Zero ? nrm : x, 0, 12);
         c.SetFloat(13, _cfg.Eps);
         c.Dispatch((nuint)((cols + 3) / 4), 1, 1, 256, 1, 1);

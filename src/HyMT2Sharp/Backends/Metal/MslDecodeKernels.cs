@@ -1324,10 +1324,10 @@ kernel void stq_deq(
 // on that section's quant type — q/k/v or gate+up pairs with mixed quant
 // types (e.g. q4k + q6k) fuse without a per-type kernel.
 // types: 0=Q4_K 1=Q6_K 2=Q8_0 3=Q2_0C 4=STQ1_0.
-// flags: bit0 accumulate (y = acc + dot), bit1 pair-silu
-// (y0[i] = silu(dot0)·dot1), bits 2/3/4 = per-section bf16 output,
-// bit4 = rmsnorm: the threadgroup computes rms(x)·nrm once (the four
-// subgroups share it) and applies it inside the dots — removes the
+// flags: bit0 accumulate (y = acc + dot), bit1 pair-silu (y0[i] =
+// silu(dot0)·dot1), bits 2..4 per-section bf16 output (sec s -> bit 2+s),
+// bit5 fused-rmsnorm of x: the threadgroup computes rms(x)·nrm once (the
+// four subgroups share it) and applies it inside the dots — removes the
 // standalone rms dispatch. Only worth it for small col counts: the
 // redundant normalize scales with ncols (each group re-reads all of x
 // through L2), so the host only sets this for sections with few cols.
@@ -1601,7 +1601,7 @@ kernel void gemv_multi(
     float rms = 1.0f;
     device const float* nrm = nullptr;
     threadgroup float rmsRed[256];
-    if ((flags & 16) != 0) {
+    if ((flags & 32) != 0) {
         float ss = 0.0f;
         for (int i = (int)tid; i < in_dim; i += 256) ss += x[i] * x[i];
         rmsRed[tid] = ss;
