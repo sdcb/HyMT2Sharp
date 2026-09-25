@@ -181,11 +181,15 @@ public sealed class CpuThreadPool : IDisposable
     /// rounds scale into SMT siblings, which the bandwidth-bound decode and
     /// lockstep GEMM cannot use). On VMs or when topology detection failed,
     /// reported core counts are untrustworthy, so the probe locates the
-    /// oversubscription cliff instead.
+    /// oversubscription cliff instead. <c>HYMT2SHARP_CALIBRATION=force</c>
+    /// probes anyway — e.g. a bare-metal container whose cgroup cpuset lands
+    /// on SMT siblings, where host-reported topology still oversubscribes.
     /// </summary>
     public static int AutoThreadCount()
     {
-        if (Environment.GetEnvironmentVariable("HYMT2SHARP_CALIBRATION") != "0"
+        string? calibration = Environment.GetEnvironmentVariable("HYMT2SHARP_CALIBRATION");
+        if (calibration != "0"
+            && calibration != "force"
             && !CpuTopology.IsVirtualMachine
             && CpuTopology.PhysicalCoreCount > 0)
             return CpuTopology.PreferPCoreCount;
@@ -198,8 +202,8 @@ public sealed class CpuThreadPool : IDisposable
     /// keeps the fastest, preferring fewer workers inside 3%. A noisy host can
     /// unfairly penalize large probes, so the result is floored at
     /// logical/4. Result is memoized per process;
-    /// <c>HYMT2SHARP_CALIBRATION=0</c> falls back to
-    /// <see cref="CpuTopology.PreferPCoreCount"/>. Costs a few hundred ms once.
+    /// <c>HYMT2SHARP_CALIBRATION=0</c> skips the probe and returns
+    /// <paramref name="maxThreads"/>. Costs a few hundred ms once.
     /// </summary>
     public static int CalibrateThreadCount(int maxThreads)
     {
