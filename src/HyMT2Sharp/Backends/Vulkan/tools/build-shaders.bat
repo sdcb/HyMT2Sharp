@@ -13,7 +13,9 @@ if not exist "%GLSLC%" (
 )
 set "DIR=%~dp0..\Shaders"
 for %%f in ("%DIR%\*.comp") do (
-    if /i not "%%~nxf"=="pf_gemm_cm_sg32.comp" (
+    set "SKIP="
+    for %%s in (pf_gemm_cm_sg32.comp pf_gemm_t32.comp pf_fa32.comp pf_addrms16.comp) do if /i "%%~nxf"=="%%s" set "SKIP=1"
+    if not defined SKIP (
         echo glslc %%~nxf
         "%GLSLC%" -O --target-env=vulkan1.1 "%%f" -o "%%~dpnf.spv" || exit /b 1
     )
@@ -35,4 +37,12 @@ for %%f in (pf_rms16 pf_kvprep pf_attn16 pf_silumul16) do (
     echo glslang %%~nxf_sg32
     "%GLSLANG%" -V --target-env vulkan1.1 -S comp "%DIR%\%%f.comp" -o "%DIR%\%%f_sg32.spv" || exit /b 1
 )
+rem sg32 tensor-core prefill (NVIDIA): pf_gemm_t32 = 16x16x16 coopmat GEMM with
+rem double-buffered shared tiles, SwiGLU epilogue and split-K partials; variant
+rem name pf_gemm_t32_{BM}x{BN}_{WM}x{WN}[_k{BK}] (HYMT_VK_T32[_QKV|_WO|_GU|_DOWN]).
+rem pf_fa32 = GQA-grouped two-pass causal attention; pf_addrms16 = split-K
+rem partial fold + rmsnorm. glslang only (same fp16+subgroup glslc issue).
+"%GLSLANG%" -V --target-env vulkan1.1 -S comp -DBM=64 -DBN=64 -DWM=32 -DWN=32 -DBK=32 "%DIR%\pf_gemm_t32.comp" -o "%DIR%\pf_gemm_t32_64x64_32x32.spv" || exit /b 1
+"%GLSLANG%" -V --target-env vulkan1.1 -S comp "%DIR%\pf_fa32.comp" -o "%DIR%\pf_fa32.spv" || exit /b 1
+"%GLSLANG%" -V --target-env vulkan1.1 -S comp "%DIR%\pf_addrms16.comp" -o "%DIR%\pf_addrms16.spv" || exit /b 1
 echo done.

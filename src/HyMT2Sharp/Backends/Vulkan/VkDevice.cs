@@ -547,6 +547,7 @@ internal unsafe sealed class VkDevice : IDisposable
 internal sealed class VkPipeline
 {
     public IntPtr Pipeline, Layout, SetLayout;
+    public string Name = "";
 }
 
 internal unsafe sealed class VkBuffer
