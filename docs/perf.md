@@ -9,6 +9,7 @@
 | 项         | 值                                                                   |
 | ---------- | -------------------------------------------------------------------- |
 | CPU        | AMD Ryzen 7 5800X，8 核 / 16 线程，Zen 3                              |
+| GPU        | NVIDIA GeForce RTX 3080 Ti 12GB（sm_86，Vulkan 1.1，驱动 581.80）       |
 | OS         | Windows，Release 构建，`net10.0`                                      |
 | 线程       | 8（worker 绑在 8 个物理核上，不占 SMT）                                |
 | SIMD       | AVX2=True，AVX-VNNI=False，无 AVX-512                                 |
@@ -97,7 +98,23 @@ Prefill 领先 llama.cpp 约 1.7–2.9 倍；decode 同量级、慢约 7–16%�
 - 5800X 连续满载时频率与温度会漂；相邻两次运行 decode 可差 10–20%，上表是单次代表性值，排序与倍数关系在多次复测中稳定。
 - 不要把带 `--profile` 的结果写进这些表。
 
-## 7. 复现
+## 7. GPU：Vulkan 后端 @ RTX 3080 Ti
+
+同一台机器（5800X + 3080 Ti）上 Vulkan 后端的实测，第 1 节环境表新增 GPU 行。`--backend vulkan`，同样 8 线程（host 侧），prefill 走 cooperative matrix tensor core（16x16x16 fp16→fp32，subgroup 32），decode 走直接读量化块的 GEMV。权重支持 Q4_K/Q6_K/Q8_0（+F32）；STQ1_0/Q2_0C 无 GPU kernel，`LoadModel` 显式回落 CPU。
+
+| 量化   | Vulkan pp512 / tg128 | llama.cpp CUDA pp / tg | prefill 比值 | decode 比值 | 同机 CPU（第 2 节） |
+| ------ | -------------------: | ---------------------: | -----------: | ----------: | ------------------: |
+| Q4_K_M |    **15,834 / 277**  |      14,378 / 336      |    **1.10×** |      0.82×  |      423.99 / 26.55 |
+| Q6_K   |    **15,830 / 260**  |      13,421 / 278      |    **1.18×** |      0.94×  |      403.25 / 22.96 |
+| Q8_0   |    **15,504 / 229**  |      14,928 / 255      |    **1.04×** |      0.90×  |      319.81 / 16.60 |
+
+- Prefill 已反超同机 llama.cpp CUDA（int8 MMQ 路线）：sg32 专用 tensor-core 管线（`pf_gemm_t32` 寄存器预取流水 + `pf_fa32` 融合 flash attention + SwiGLU/残差/rmsnorm epilogue 融合 + split-K），gu GEMM 单步约 63 TFLOPS ≈ fp32-累加峰值的 80–90%。相对 CPU 是 ~37× prefill、~10× decode。
+- Decode 为量化 GEMV（读 Q4_K/Q6_K/Q8_0 原始块，fp16 KV），贴显存带宽墙；与 llama.cpp 的差距 6–18%，其 int8 点积 kernel 更贴近 roofline，列为后续调优项。
+- 正确性：Q4_K_M verify-decode 8/8 与 CPU top1 一致，verify-prefill 批式与逐行 max-abs=0。
+- GPU 时钟在 1695–1980 MHz 间抖动（同 spv 两次可差 ±10%），对比时取 reps 最小值或同刻 A/B 交替。
+- 对比用的 llama.cpp 是 CUDA 后端（`llama-bench -m <gguf> -p 512 -n 128 -t 8 -ngl 99`），第 3 节的纯 CPU 对照不受影响。
+
+## 8. 复现
 
 ```powershell
 dotnet run --project src/HyMT2Sharp.Benchmark -c Release -- `
@@ -109,6 +126,14 @@ llama-bench.exe -m "D:\_\model\Hy-MT2-1.8B-Q4_K_M.gguf" -p 512 -n 128 -t 8 -ngl 
 $env:HYMT2SHARP_FORCE_PORTABLE = "1"
 dotnet run --project src/HyMT2Sharp.Benchmark -c Release -- `
   --model "D:\_\model\Hy-MT2-1.8B-Q4_K_M.gguf" --bench-prefill 512 --bench-decode 128 --threads 8
+```
+
+```powershell
+# Vulkan GPU 后端（3080 Ti）
+dotnet run --project src/HyMT2Sharp.Benchmark -c Release -- `
+  --model "D:\_\model\Hy-MT2-1.8B-Q4_K_M.gguf" --backend vulkan --bench-prefill 512 --bench-decode 128 --threads 8
+
+llama-bench.exe -m "D:\_\model\Hy-MT2-1.8B-Q4_K_M.gguf" -p 512 -n 128 -t 8 -ngl 99
 ```
 
 其余量化换 `--model` 路径即可。`--micro-q8` 输出 packed GEMV 与只读带宽微基准；`--micro-vec-q4`（可配 `--micro-in/--micro-out/--micro-tokens/--threads`）输出 portable 档 Q4_K prefill GEMM 的 GFLOP/s 与 decode GEMV 的 GB/s；`--profile` 输出逐 op 分项耗时。
