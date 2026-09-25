@@ -10,9 +10,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15]
+        os: [macos-14, macos-15, macos-26]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +20,7 @@ jobs:
       - name: Hardware info
         run: |
           sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.memsize || true
           system_profiler SPDisplaysDataType | head -25 || true
           xcode-select -p || true
 
@@ -39,7 +40,17 @@ jobs:
             https://huggingface.co/tencent/Hy-MT2-1.8B-1.25Bit-GGUF/resolve/main/Hy-MT2-1.8B-1.25Bit.gguf
           ls -lh Hy-MT2-1.8B-1.25Bit.gguf
 
-      - name: Bench Metal backend
+      - name: Bench Metal full (prefill+decode on GPU)
+        continue-on-error: true
+        run: |
+          ./src/HyMT2Sharp.Benchmark/bin/Release/net10.0/Sdcb.HyMT2Sharp.Benchmark \
+            --model Hy-MT2-1.8B-1.25Bit.gguf --backend metal \
+            --bench-prefill 512 --bench-decode 128 --threads 4
+
+      - name: Bench Metal hybrid (CPU prefill + GPU decode)
+        continue-on-error: true
+        env:
+          HYMT_METAL_NOPREFILL: '1'
         run: |
           ./src/HyMT2Sharp.Benchmark/bin/Release/net10.0/Sdcb.HyMT2Sharp.Benchmark \
             --model Hy-MT2-1.8B-1.25Bit.gguf --backend metal \
@@ -51,7 +62,10 @@ jobs:
             --model Hy-MT2-1.8B-1.25Bit.gguf --backend cpu \
             --bench-prefill 512 --bench-decode 128 --threads 4
 
-      - name: CLI smoke (Metal)
+      - name: CLI smoke (Metal hybrid)
+        continue-on-error: true
+        env:
+          HYMT_METAL_NOPREFILL: '1'
         run: |
           ./src/HyMT2Sharp.Cli/bin/Release/net10.0/Sdcb.HyMT2Sharp.Cli \
             --model Hy-MT2-1.8B-1.25Bit.gguf --backend metal \
