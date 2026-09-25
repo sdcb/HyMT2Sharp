@@ -123,6 +123,7 @@ if (backendName is not null and not "cpu")
 Console.WriteLine($"backend={backend?.Name ?? "cpu"}");
 
 using HunyuanDenseModel model = new(modelPath, threads, backend: backend);
+Console.WriteLine($"workers={model.ThreadCount}{(threads <= 0 ? $"  hint={model.ThreadAutoHint}" : "")}");
 Console.WriteLine($"arch={model.Config.Architecture} layers={model.Config.NumLayers} hidden={model.Config.HiddenSize} heads={model.Config.NumHeads}/{model.Config.NumKvHeads} vocab={model.Config.VocabSize}");
 
 if (args.Contains("--verify-prefill"))

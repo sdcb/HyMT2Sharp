@@ -30,7 +30,7 @@ public sealed class CpuThreadPool : IDisposable
     public CpuThreadPool(int threadCount = 0)
     {
         if (threadCount <= 0)
-            threadCount = CalibrateThreadCount(CpuTopology.LogicalCount);
+            threadCount = AutoThreadCount();
         ThreadCount = Math.Max(1, threadCount);
         _threads = new Thread[ThreadCount];
         _starts = new AutoResetEvent[ThreadCount];
@@ -176,13 +176,34 @@ public sealed class CpuThreadPool : IDisposable
     }
 
     /// <summary>
+    /// Default worker count: bare metal with enumerated topology uses
+    /// <see cref="CpuTopology.PreferPCoreCount"/> (the probe's synthetic
+    /// rounds scale into SMT siblings, which the bandwidth-bound decode and
+    /// lockstep GEMM cannot use). On VMs or when topology detection failed,
+    /// reported core counts are untrustworthy, so the probe locates the
+    /// oversubscription cliff instead. <c>HYMT2SHARP_CALIBRATION=force</c>
+    /// probes anyway — e.g. a bare-metal container whose cgroup cpuset lands
+    /// on SMT siblings, where host-reported topology still oversubscribes.
+    /// </summary>
+    public static int AutoThreadCount()
+    {
+        string? calibration = Environment.GetEnvironmentVariable("HYMT2SHARP_CALIBRATION");
+        if (calibration != "0"
+            && calibration != "force"
+            && !CpuTopology.IsVirtualMachine
+            && CpuTopology.PhysicalCoreCount > 0)
+            return CpuTopology.PreferPCoreCount;
+        return CalibrateThreadCount(CpuTopology.LogicalCount);
+    }
+
+    /// <summary>
     /// Measured worker count for <c>threads = 0</c>: probes barrier-heavy rounds
     /// (the decode regime) at every size up to <paramref name="maxThreads"/> and
     /// keeps the fastest, preferring fewer workers inside 3%. A noisy host can
     /// unfairly penalize large probes, so the result is floored at
     /// logical/4. Result is memoized per process;
-    /// <c>HYMT2SHARP_CALIBRATION=0</c> falls back to
-    /// <see cref="CpuTopology.PreferPCoreCount"/>. Costs a few hundred ms once.
+    /// <c>HYMT2SHARP_CALIBRATION=0</c> skips the probe and returns
+    /// <paramref name="maxThreads"/>. Costs a few hundred ms once.
     /// </summary>
     public static int CalibrateThreadCount(int maxThreads)
     {
