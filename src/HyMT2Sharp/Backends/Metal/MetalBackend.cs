@@ -21,9 +21,13 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private readonly Dictionary<string, GgmlTensorType> _wtype = new(StringComparer.Ordinal);
     private IntPtr _psoGemv, _psoGemvQ6, _psoGemvQ8, _psoGemvQ2, _psoGemvStq;
     private IntPtr _psoSgemm, _psoMma, _psoXt, _psoDeqQ4, _psoDeqQ6, _psoDeqQ8, _psoDeqQ2, _psoDeqStq;
-    // Persistently dequantized fp32 weight copies for prefill GEMM (M6):
-    // allocated on first use so decode-only runs pay nothing.
-    private readonly Dictionary<string, IntPtr> _wfp32 = new(StringComparer.Ordinal);
+    // Prefill GEMM weights are dequantized into this single scratch buffer
+    // (sized to the largest tensor) instead of a persistent fp32 copy per
+    // tensor — the command buffer runs ops in order, so one scratch serves
+    // every weight. Keeps unified-memory footprint ~quantized+scratch
+    // (~1.4GB here) instead of ~7.3GB of resident fp32 weights.
+    private IntPtr _wScratch = IntPtr.Zero;
+    private long _wScratchElems;
     private IntPtr _psoEmbedQ4, _psoEmbedQ6, _psoEmbedQ8, _psoRms, _psoAttn, _psoSilu, _psoAdd;
     private IntPtr _psoAttnSplit, _psoAttnMerge;
     // Max split-K chunks per head for decode attention (chunk >= kvLen/16).
@@ -138,6 +142,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
             byte* data = gguf.DataBase + (long)info.Offset;
             _w[name] = _dev.NewBufferBytes(data, (nuint)bytes);
             _wtype[name] = info.Type;
+            _wScratchElems = Math.Max(_wScratchElems, (long)info.NumElements);
         }
 
         _embd = W("token_embd.weight");
@@ -821,13 +826,18 @@ public sealed unsafe class MetalBackend : IComputeBackend
         c.Dispatch((nuint)((dim + 31) / 32), (nuint)(Tpad / 32), 1, 256, 1, 1);
     }
 
-    // Lazily dequantize a weight tensor into a persistent fp32 buffer
-    // ([out][in] rows) and return it; later calls reuse the cached copy.
+    // Dequantize a weight tensor into the shared fp32 scratch ([out][in]
+    // rows) and return it. Each Gemm consumes the scratch before the next
+    // dequant overwrites it; re-dequant cost is <1% of the GEMM work.
     private IntPtr WFp32(CmdCtx c, string name, int inDim, int outDim)
     {
-        if (_wfp32.TryGetValue(name, out IntPtr buf)) return buf;
-        buf = _dev.NewBuffer((nuint)inDim * (nuint)outDim * 4);
-        _wfp32[name] = buf;
+        // _wScratchElems already covers the model's largest tensor, so the
+        // scratch is allocated once and never resized — resizing here would
+        // free storage that dispatches encoded earlier in this command
+        // buffer may still be reading.
+        if (_wScratch == IntPtr.Zero)
+            _wScratch = _dev.NewBuffer((nuint)_wScratchElems * 4);
+        IntPtr buf = _wScratch;
         IntPtr w = W(name);
         c.SetPso(PsoFor(name, inDim, (_psoDeqQ4, _psoDeqQ6, _psoDeqQ8, _psoDeqQ2, _psoDeqStq)));
         c.SetBuffer(w, 0, 0); c.SetBuffer(buf, 0, 1);
@@ -914,7 +924,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
 
     public void Dispose()
     {
-        foreach (IntPtr b in _wfp32.Values) ObjC.Release(b);
+        if (_wScratch != IntPtr.Zero) ObjC.Release(_wScratch);
         /* TODO(M2): release device/queue/buffers on the real backend lifecycle */
     }
 }
