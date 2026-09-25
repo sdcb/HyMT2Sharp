@@ -65,6 +65,21 @@ internal static unsafe partial class Vk
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    public struct VkPhysicalDeviceProperties2
+    {
+        public uint SType; public void* PNext;
+        public VkPhysicalDeviceProperties Properties;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkPhysicalDeviceSubgroupSizeControlProperties
+    {
+        public uint SType; public void* PNext;
+        public uint MinSubgroupSize, MaxSubgroupSize;
+        public uint MaxComputeWorkgroupSubgroups, RequiredSubgroupSizeStages;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct VkMemoryType { public uint PropertyFlags; public uint HeapIndex; }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -315,6 +330,7 @@ internal static unsafe partial class Vk
     [LibraryImport(LibName)] public static partial void vkDestroyInstance(IntPtr instance, void* alloc);
     [LibraryImport(LibName)] public static partial VkResult vkEnumeratePhysicalDevices(IntPtr instance, uint* count, IntPtr* devices);
     [LibraryImport(LibName)] public static partial void vkGetPhysicalDeviceProperties(IntPtr device, VkPhysicalDeviceProperties* props);
+    [LibraryImport(LibName)] public static partial void vkGetPhysicalDeviceProperties2(IntPtr device, VkPhysicalDeviceProperties2* props);
     [LibraryImport(LibName)] public static partial void vkGetPhysicalDeviceMemoryProperties(IntPtr device, VkPhysicalDeviceMemoryProperties* props);
     [LibraryImport(LibName)] public static partial void vkGetPhysicalDeviceQueueFamilyProperties(IntPtr device, uint* count, VkQueueFamilyProperties* props);
     [LibraryImport(LibName)] public static partial void vkGetPhysicalDeviceFeatures2(IntPtr device, VkPhysicalDeviceFeatures2* features);
@@ -433,12 +449,15 @@ internal static class VkConst
     public const uint StPhysicalDeviceCooperativeMatrixFeaturesKHR = 1000506000u;
     public const uint StCooperativeMatrixPropertiesKHR = 1000506001u;
     public const uint StPhysicalDeviceSubgroupSizeControlFeaturesEXT = 1000225000u;
+    public const uint StPhysicalDeviceSubgroupSizeControlPropertiesEXT = 1000225001u;
+    public const uint StPhysicalDeviceProperties2 = 1000059000u;
     public const uint StPipelineShaderStageRequiredSubgroupSizeCreateInfo = 1000225001u;
 
     // VkPhysicalDeviceType
     public const uint PhysDeviceIntegrated = 1;
     public const uint PhysDeviceDiscrete = 2;
-    public const uint PhysDeviceCpu = 3;
+    public const uint PhysDeviceVirtualGpu = 3;
+    public const uint PhysDeviceCpu = 4;
 
     // VkQueueFlagBits
     public const uint QueueGraphics = 0x1;

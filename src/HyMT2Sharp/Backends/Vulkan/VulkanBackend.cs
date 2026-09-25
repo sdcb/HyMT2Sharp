@@ -19,9 +19,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend
     private readonly Dictionary<string, VkBuffer> _w = new(StringComparer.Ordinal);
     private readonly Dictionary<string, GgmlTensorType> _wtype = new(StringComparer.Ordinal);
     private VkPipeline _pGemv4 = null!, _pGemv6 = null!, _pEmbed4 = null!, _pEmbed6 = null!,
-        _pRms = null!, _pKvApp = null!, _pAttn = null!, _pSilu = null!,
-        _pPreKv = null!, _pKvPrep = null!, _pGemvAdd4 = null!, _pGemvAdd6 = null!, _pPreFfn = null!,
-        _pAttn2 = null!, _pFfnGu = null!, _pQkvPrep = null!;
+        _pRms = null!,
+        _pPreKv = null!, _pGemvAdd4 = null!, _pGemvAdd6 = null!, _pPreFfn = null!,
+        _pAttn2 = null!, _pFfnGu = null!;
     private VkPipeline _pPfDeq4 = null!, _pPfDeq6 = null!, _pPfEmbed = null!, _pPfRms = null!,
         _pPfGemm = null!, _pPfKvPrep = null!, _pPfAttn = null!, _pPfSilu = null!, _pPfRmsX = null!,
         _pPfQprep = null!, _pPfQk = null!, _pPfSoft = null!, _pPfPv = null!;
@@ -103,20 +103,15 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         VkPipeline Mk(string spv, int bindings, int pushBytes)
             => _dev.NewPipeline(_dev.NewShaderModule(LoadSpv(spv)), bindings, pushBytes);
 
-        _pGemv4 = Mk("q4k_gemv3", bindings: 4, pushBytes: 8);
+        _pGemv4 = Mk("q4k_gemv3", bindings: 3, pushBytes: 8);
         _pGemv6 = Mk("q6k_gemv2", bindings: 3, pushBytes: 8);
         _pEmbed4 = Mk("dec_embed_q4k", bindings: 3, pushBytes: 4);
         _pEmbed6 = Mk("dec_embed_q6k", bindings: 3, pushBytes: 4);
         _pRms = Mk("dec_rmsnorm", bindings: 3, pushBytes: 8);
         _kvF32 = Environment.GetEnvironmentVariable("HYMT_VK_KVF32") == "1";
-        _pKvApp = Mk(_kvF32 ? "dec_kv_append_f32" : "dec_kv_append", bindings: 5, pushBytes: 8);
-        _pAttn = Mk(_kvF32 ? "dec_attn_f32" : "dec_attn", bindings: 5, pushBytes: 20);
         _pAttn2 = Mk("dec_attn2", bindings: 11, pushBytes: 32);
-        _pQkvPrep = Mk("dec_qkvprep", bindings: 11, pushBytes: 44);
         _pFfnGu = Mk("dec_ffngu", bindings: 4, pushBytes: 16);
-        _pSilu = Mk("dec_silu", bindings: 2, pushBytes: 4);
         _pPreKv = Mk("dec_prekv", bindings: 8, pushBytes: 28);
-        _pKvPrep = Mk("dec_kvprep", bindings: 8, pushBytes: 28);
         _pGemvAdd4 = Mk("dec_gemvadd_q4k", bindings: 3, pushBytes: 8);
         _pGemvAdd6 = Mk("dec_gemvadd_q6k", bindings: 3, pushBytes: 8);
         _pPreFfn = Mk("dec_preffn", bindings: 5, pushBytes: 20);
@@ -134,23 +129,39 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         _pfGemmTN = useCm
             ? (int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_GEMMTN"), out int tn) ? tn : 64)
             : 128;
-        _pPfGemm = useCm
-            ? _dev.NewPipeline(_dev.NewShaderModule(LoadSpv(
-                Environment.GetEnvironmentVariable("HYMT_VK_F16ACC") == "1" ? "pf_gemm_cm_f16"
-                : "pf_gemm_cm_" + cmVar)),
-                4, 16, requiredSubgroupSize: 16)
-            : Mk("pf_gemm", bindings: 4, pushBytes: 16);
-        _pPfRmsX = _gVar ? Mk("pf_rms16", bindings: 3, pushBytes: 16) : _pPfRms;
-        _pPfKvPrep = Mk("pf_kvprep", bindings: 5, pushBytes: 32);
-        _pPfAttn = Mk(_gVar ? "pf_attn16" : "pf_attn", bindings: 6, pushBytes: 36);
-        _pPfSilu = Mk(_gVar ? "pf_silumul16" : "pf_silumul", bindings: 2, pushBytes: 8);
-        _pfFastAttn = _gVar && useCm && Environment.GetEnvironmentVariable("HYMT_VK_NOFASTATTN") != "1";
-        if (_pfFastAttn)
+        try
         {
-            _pPfQprep = Mk("pf_qprep", bindings: 4, pushBytes: 24);
-            _pPfQk = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv("pf_qk")), 3, 28, requiredSubgroupSize: 16);
-            _pPfSoft = Mk("pf_soft", bindings: 3, pushBytes: 16);
-            _pPfPv = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv("pf_pv")), 3, 32, requiredSubgroupSize: 16);
+            _pPfGemm = useCm
+                ? _dev.NewPipeline(_dev.NewShaderModule(LoadSpv(
+                    Environment.GetEnvironmentVariable("HYMT_VK_F16ACC") == "1" ? "pf_gemm_cm_f16"
+                    : "pf_gemm_cm_" + cmVar)),
+                    4, 16, requiredSubgroupSize: 16)
+                : Mk("pf_gemm", bindings: 4, pushBytes: 16);
+            _pPfRmsX = _gVar ? Mk("pf_rms16", bindings: 3, pushBytes: 16) : _pPfRms;
+            _pPfKvPrep = Mk("pf_kvprep", bindings: 5, pushBytes: 32);
+            _pPfAttn = Mk(_gVar ? "pf_attn16" : "pf_attn", bindings: 6, pushBytes: 36);
+            _pPfSilu = Mk(_gVar ? "pf_silumul16" : "pf_silumul", bindings: 2, pushBytes: 8);
+            _pfFastAttn = _gVar && useCm && Environment.GetEnvironmentVariable("HYMT_VK_NOFASTATTN") != "1";
+            if (_pfFastAttn)
+            {
+                _pPfQprep = Mk("pf_qprep", bindings: 4, pushBytes: 24);
+                _pPfQk = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv("pf_qk")), 3, 28, requiredSubgroupSize: 16);
+                _pPfSoft = Mk("pf_soft", bindings: 3, pushBytes: 16);
+                _pPfPv = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv("pf_pv")), 3, 32, requiredSubgroupSize: 16);
+            }
+        }
+        catch (Exception e) when (useCm)
+        {
+            // e.g. sg32 devices (NVIDIA) reject requiredSubgroupSize=16 even with
+            // VK_EXT_subgroup_size_control — fall back to the scalar GEMM path.
+            Console.Error.WriteLine($"[vk] coopmat pipeline failed ({e.Message}) — scalar pf_gemm fallback");
+            useCm = false; _gVar = false; _pfFastAttn = false;
+            _pfGemmTM = _pfGemmTN = 128;
+            _pPfGemm = Mk("pf_gemm", bindings: 4, pushBytes: 16);
+            _pPfRmsX = _pPfRms;
+            _pPfKvPrep = Mk("pf_kvprep", bindings: 5, pushBytes: 32);
+            _pPfAttn = Mk("pf_attn", bindings: 6, pushBytes: 36);
+            _pPfSilu = Mk("pf_silumul", bindings: 2, pushBytes: 8);
         }
 
         foreach ((string name, GgufTensorInfo info) in gguf.Tensors)
@@ -845,6 +856,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             _prmPtr[3] = _seq++;
             _prm.Flush(0, 16);
             _dev.Submit(_cmd, _fence);
+            if (i < reps - 1)
+            {
+                _dev.WaitFence(_fence);
+                IntPtr f0 = _fence;
+                Vk.vkResetFences(_dev.Device, 1, &f0);
+            }
         }
         _dev.WaitFence(_fence);
         IntPtr f = _fence;

@@ -26,8 +26,16 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     private int _cacheCap;
     private readonly KvBlockStore? _blockStore;
     private readonly IComputeBackend? _backend;
-    private static readonly int _debugLayerLimit =
-        int.TryParse(Environment.GetEnvironmentVariable("HYMT_DEBUG_LAYERS"), out int dll) ? dll : -1;
+    private static readonly int _debugLayerLimit = InitDebugLayerLimit();
+    private static int InitDebugLayerLimit()
+    {
+        if (int.TryParse(Environment.GetEnvironmentVariable("HYMT_DEBUG_LAYERS"), out int n))
+        {
+            Console.Error.WriteLine($"[warn] HYMT_DEBUG_LAYERS={n}: truncating to {n} layers — output is garbage, debug only");
+            return n;
+        }
+        return -1;
+    }
     private int _kvDirtyFrom = int.MaxValue;  // device KV positions < this must be re-uploaded
     private float[]? _logits;
 

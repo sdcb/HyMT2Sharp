@@ -15,6 +15,7 @@ internal unsafe sealed class VkDevice : IDisposable
     public bool CoherentDeviceLocal;   // DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT exists (ReBAR)
     public bool CoopMatrix;            // VK_KHR_cooperative_matrix (feature + ext enabled)
     public bool SubgroupSizeControl;   // VK_EXT_subgroup_size_control
+    public uint SubgroupMin = 1, SubgroupMax = 128;
     public int CoopM, CoopN, CoopK;    // best fp16->fp32 subgroup coopmat config
     public bool Storage16Bit;          // storageBuffer16BitAccess + shaderInt16 enabled
     public uint DeviceLocalHostVisibleType = uint.MaxValue;
@@ -124,6 +125,14 @@ internal unsafe sealed class VkDevice : IDisposable
             SType = VkConst.StPhysicalDeviceCooperativeMatrixFeaturesKHR,
             CooperativeMatrix = d.CoopMatrix ? 1u : 0u,
         };
+        if (hasSgc)
+        {
+            Vk.VkPhysicalDeviceSubgroupSizeControlProperties sgcP = new() { SType = VkConst.StPhysicalDeviceSubgroupSizeControlPropertiesEXT };
+            Vk.VkPhysicalDeviceProperties2 p2 = new() { SType = VkConst.StPhysicalDeviceProperties2, PNext = &sgcP };
+            Vk.vkGetPhysicalDeviceProperties2(d.PhysDevice, &p2);
+            d.SubgroupMin = sgcP.MinSubgroupSize; d.SubgroupMax = sgcP.MaxSubgroupSize;
+        }
+
         Vk.VkPhysicalDeviceSubgroupSizeControlFeaturesEXT sgcEn = new()
         {
             SType = VkConst.StPhysicalDeviceSubgroupSizeControlFeaturesEXT,
@@ -157,7 +166,7 @@ internal unsafe sealed class VkDevice : IDisposable
             PpEnabledExtensionNames = nExt > 0 ? extsToEnable : null,
         };
         if (Environment.GetEnvironmentVariable("HYMT_VK_VERBOSE") == "1")
-            Console.Error.WriteLine($"[vk] devext push={hasPush} coop={d.CoopMatrix} sgc={hasSgc}");
+            Console.Error.WriteLine($"[vk] devext push={hasPush} coop={d.CoopMatrix} sgc={hasSgc} sgRange={d.SubgroupMin}-{d.SubgroupMax}");
         Vk.Check(Vk.vkCreateDevice(d.PhysDevice, &dci, null, out d.Device), "vkCreateDevice");
         Vk.vkGetDeviceQueue(d.Device, d.QueueFamily, 0, out d.Queue);
         if (d.CoopMatrix)
