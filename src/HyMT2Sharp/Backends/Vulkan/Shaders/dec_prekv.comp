@@ -8,7 +8,7 @@
 // fused: xs = rmsnorm(h)*wn (redundant per WG, kept in shared); then
 // gemv xs over 3 weights -> q[qDim], k[kDim], v[kDim]. Row -> matrix:
 // row < qDim -> WQ/tq, < qDim+kDim -> WK/tk, else WV/tv.
-// dtype flags: 0 = Q4_K (144B/blk), 1 = Q6_K (210B/blk). Weights read via u16 view.
+// dtype flags: 0 = Q4_K (144B/blk), 1 = Q6_K (210B/blk), 2 = Q8_0 (34B/blk). Weights read via u16 view.
 // Scales pre-decoded into sf[16*64] like q4k_gemv3/q6k_gemv2 (verified on B580):
 //   q4k row: sf[rl*64+g] = vec2(d*sc, dmin*mn) for 32-elem group g
 //   q6k row: sf[rl*64 + blk*8 + s2] = vec2(d*scale[blk*16+2*s2], d*scale[blk*16+2*s2+1])
@@ -124,6 +124,9 @@ shared float red[256];
     accOut = _acc; \
 }
 
+
+#define GEMV_Q8(arr, rl, rlRow, bpr, itid, accOut) {     uint blk8 = (itid) >> 1;     uint half8 = ((itid) & 1u) << 4;     uint xoff = (blk8 << 3) + (half8 >> 2);     float _acc = 0.0f;     uint _rb = (rlRow) * (bpr) * 272u;     for (uint blk = 0u; blk < (bpr); blk++) {         uint bb = _rb + blk * 272u + blk8 * 34u;         float d = unpackHalf2x16(R16(arr, bb)).x;         uint qb = bb + 2u + half8;         uint q0 = R32(arr, qb), q1 = R32(arr, qb + 4u), q2 = R32(arr, qb + 8u), q3 = R32(arr, qb + 12u);         vec4 v0 = vec4(float(int(q0 << 24) >> 24), float(int(q0 << 16) >> 24), float(int(q0 << 8) >> 24), float(int(q0) >> 24));         vec4 v1 = vec4(float(int(q1 << 24) >> 24), float(int(q1 << 16) >> 24), float(int(q1 << 8) >> 24), float(int(q1) >> 24));         vec4 v2 = vec4(float(int(q2 << 24) >> 24), float(int(q2 << 16) >> 24), float(int(q2 << 8) >> 24), float(int(q2) >> 24));         vec4 v3 = vec4(float(int(q3 << 24) >> 24), float(int(q3 << 16) >> 24), float(int(q3 << 8) >> 24), float(int(q3) >> 24));         uint kv = (blk << 6) + xoff;         _acc += d * (dot(X4(kv), v0) + dot(X4(kv + 1u), v1) + dot(X4(kv + 2u), v2) + dot(X4(kv + 3u), v3));     }     accOut = _acc; }
+
 void main()
 {
     uint tid = gl_LocalInvocationID.x;
@@ -151,19 +154,22 @@ void main()
     uint row = gl_WorkGroupID.x * 16u + rowLane;
     float acc = 0.0f;
     if (row < pc.qDim) {
-        if (pc.tq == 0u) GEMV_Q4K(wq, rowLane, row, bpr, itid, acc)
-        else            GEMV_Q6K(wq, rowLane, row, bpr, itid, acc)
+        if (pc.tq == 0u)      GEMV_Q4K(wq, rowLane, row, bpr, itid, acc)
+        else if (pc.tq == 1u) GEMV_Q6K(wq, rowLane, row, bpr, itid, acc)
+        else                  GEMV_Q8(wq, rowLane, row, bpr, itid, acc)
     }
     else if (row < pc.qDim + pc.kDim) {
         uint rl = row - pc.qDim;
-        if (pc.tk == 0u) GEMV_Q4K(wk, rowLane, rl, bpr, itid, acc)
-        else            GEMV_Q6K(wk, rowLane, rl, bpr, itid, acc)
+        if (pc.tk == 0u)      GEMV_Q4K(wk, rowLane, rl, bpr, itid, acc)
+        else if (pc.tk == 1u) GEMV_Q6K(wk, rowLane, rl, bpr, itid, acc)
+        else                  GEMV_Q8(wk, rowLane, rl, bpr, itid, acc)
     }
     else {
         uint rl = row - pc.qDim - pc.kDim;
         if (rl < pc.kDim) {
-            if (pc.tv == 0u) GEMV_Q4K(wv, rowLane, rl, bpr, itid, acc)
-            else            GEMV_Q6K(wv, rowLane, rl, bpr, itid, acc)
+            if (pc.tv == 0u)      GEMV_Q4K(wv, rowLane, rl, bpr, itid, acc)
+            else if (pc.tv == 1u) GEMV_Q6K(wv, rowLane, rl, bpr, itid, acc)
+            else                  GEMV_Q8(wv, rowLane, rl, bpr, itid, acc)
         }
     }
 

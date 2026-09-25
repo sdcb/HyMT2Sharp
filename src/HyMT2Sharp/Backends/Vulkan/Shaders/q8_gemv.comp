@@ -1,0 +1,65 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q8_0 GEMV: llama.cpp mul_mat_vec mapping. 16 rows/WG, 16 lanes/row.
+// Block = 34B: d fp16 @0, qs int8[32] @2. 2B aligned -> u16 view reads.
+// Lane l covers block l>>1, elems (l&1)*16..+16 (4 vec4 dots, one scale).
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W16 { uint16_t w16[]; };
+layout(set = 0, binding = 1) readonly buffer XV { vec4 xv[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC { uint in_dim; uint out_dim; } p;
+
+shared float red[256];
+
+uint16_t rd16(uint byteOff) { return w16[byteOff >> 1]; }
+uint rd32(uint byteOff) { return uint(rd16(byteOff)) | (uint(rd16(byteOff + 2u)) << 16); }
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint bpr = p.in_dim >> 8;          // 256-elem superblocks per row
+
+    uint rowLane = tid >> 4;
+    uint itid = tid & 15u;
+    uint row = gl_WorkGroupID.x * 16u + rowLane;
+    bool valid = row < p.out_dim;
+    uint rowBytes = (valid ? row : 0u) * bpr * 272u;
+
+    uint blk8 = itid >> 1;             // 0..7: block within superblock
+    uint half8 = (itid & 1u) << 4;     // 0 or 16: elem offset within block
+    uint xoff = (blk8 << 3) + (half8 >> 2); // x vec4 base within superblock
+
+    float acc = 0.0f;
+    for (uint blk = 0u; blk < bpr; blk++) {
+        uint bb = rowBytes + blk * 272u + blk8 * 34u;
+        float d = unpackHalf2x16(uint(rd16(bb))).x;
+        uint qb = bb + 2u + half8;
+        uint q0 = rd32(qb), q1 = rd32(qb + 4u), q2 = rd32(qb + 8u), q3 = rd32(qb + 12u);
+        // int8 sign-extend
+        vec4 v0 = vec4(float(int(q0 << 24) >> 24), float((int(q0 << 16) >> 24)), float((int(q0 << 8) >> 24)), float(int(q0) >> 24));
+        vec4 v1 = vec4(float(int(q1 << 24) >> 24), float((int(q1 << 16) >> 24)), float((int(q1 << 8) >> 24)), float(int(q1) >> 24));
+        vec4 v2 = vec4(float(int(q2 << 24) >> 24), float((int(q2 << 16) >> 24)), float((int(q2 << 8) >> 24)), float(int(q2) >> 24));
+        vec4 v3 = vec4(float(int(q3 << 24) >> 24), float((int(q3 << 16) >> 24)), float((int(q3 << 8) >> 24)), float(int(q3) >> 24));
+        uint kv = (blk << 6) + xoff;
+        acc += d * dot(xv[kv],      v0);
+        acc += d * dot(xv[kv + 1u], v1);
+        acc += d * dot(xv[kv + 2u], v2);
+        acc += d * dot(xv[kv + 3u], v3);
+    }
+
+    red[tid] = acc;
+    barrier();
+    if (itid < 8u) red[tid] += red[tid + 8u];
+    barrier();
+    if (itid < 4u) red[tid] += red[tid + 4u];
+    barrier();
+    if (itid < 2u) red[tid] += red[tid + 2u];
+    barrier();
+    if (itid < 1u) red[tid] += red[tid + 1u];
+    barrier();
+    if (itid == 0u && valid) y[row] = red[tid];
+}

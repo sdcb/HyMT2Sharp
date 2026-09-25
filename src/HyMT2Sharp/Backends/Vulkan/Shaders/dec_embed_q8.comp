@@ -1,0 +1,25 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+// embed gather for Q8_0 token_embd: y[i] = dequant_q8(row tokenId, i).
+// 34B blocks are 2B aligned -> u16 buffer view.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W16 { uint16_t w16[]; };
+layout(set = 0, binding = 1) readonly buffer P { int tokenId; int pos; int kvLen; } prm;
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC { uint in_dim; } pc;
+
+uint rd8(uint byteOff) { return (uint(w16[byteOff >> 1]) >> ((byteOff & 1u) << 3)) & 0xFFu; }
+int rd8s(uint byteOff) { int b = int(rd8(byteOff)); return (b << 24) >> 24; }
+float fp16(uint byteOff) { return unpackHalf2x16(uint(w16[byteOff >> 1])).x; }
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.in_dim) return;
+    uint blk = uint(prm.tokenId) * (pc.in_dim >> 5) + (i >> 5);
+    uint bb = blk * 34u;
+    y[i] = fp16(bb) * float(rd8s(bb + 2u + (i & 31u)));
+}

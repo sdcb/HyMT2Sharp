@@ -18,11 +18,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend
     private ModelConfig _cfg = null!;
     private readonly Dictionary<string, VkBuffer> _w = new(StringComparer.Ordinal);
     private readonly Dictionary<string, GgmlTensorType> _wtype = new(StringComparer.Ordinal);
-    private VkPipeline _pGemv4 = null!, _pGemv6 = null!, _pEmbed4 = null!, _pEmbed6 = null!,
+    private VkPipeline _pGemv4 = null!, _pGemv6 = null!, _pGemv8 = null!, _pEmbed4 = null!, _pEmbed6 = null!, _pEmbed8 = null!,
         _pRms = null!,
-        _pPreKv = null!, _pGemvAdd4 = null!, _pGemvAdd6 = null!, _pPreFfn = null!,
+        _pPreKv = null!, _pGemvAdd4 = null!, _pGemvAdd6 = null!, _pGemvAdd8 = null!, _pPreFfn = null!,
         _pAttn2 = null!, _pFfnGu = null!;
-    private VkPipeline _pPfDeq4 = null!, _pPfDeq6 = null!, _pPfEmbed = null!, _pPfRms = null!,
+    private VkPipeline _pPfDeq4 = null!, _pPfDeq6 = null!, _pPfDeq8 = null!, _pPfEmbed = null!, _pPfRms = null!,
         _pPfGemm = null!, _pPfKvPrep = null!, _pPfAttn = null!, _pPfSilu = null!, _pPfRmsX = null!,
         _pPfQprep = null!, _pPfQk = null!, _pPfSoft = null!, _pPfPv = null!;
     private VkBuffer[] _kvK = null!, _kvV = null!;
@@ -104,17 +104,21 @@ public sealed unsafe class VulkanBackend : IComputeBackend
 
         _pGemv4 = Mk("q4k_gemv3", bindings: 3, pushBytes: 8);
         _pGemv6 = Mk("q6k_gemv2", bindings: 3, pushBytes: 8);
+        _pGemv8 = Mk("q8_gemv", bindings: 3, pushBytes: 8);
         _pEmbed4 = Mk("dec_embed_q4k", bindings: 3, pushBytes: 4);
         _pEmbed6 = Mk("dec_embed_q6k", bindings: 3, pushBytes: 4);
+        _pEmbed8 = Mk("dec_embed_q8", bindings: 3, pushBytes: 4);
         _pRms = Mk("dec_rmsnorm", bindings: 3, pushBytes: 8);
         _pAttn2 = Mk("dec_attn2", bindings: 11, pushBytes: 32);
         _pFfnGu = Mk("dec_ffngu", bindings: 4, pushBytes: 16);
         _pPreKv = Mk("dec_prekv", bindings: 8, pushBytes: 28);
         _pGemvAdd4 = Mk("dec_gemvadd_q4k", bindings: 3, pushBytes: 8);
         _pGemvAdd6 = Mk("dec_gemvadd_q6k", bindings: 3, pushBytes: 8);
+        _pGemvAdd8 = Mk("dec_gemvadd_q8", bindings: 3, pushBytes: 8);
         _pPreFfn = Mk("dec_preffn", bindings: 5, pushBytes: 20);
         _pPfDeq4 = Mk("pf_deq_q4k", bindings: 2, pushBytes: 12);
         _pPfDeq6 = Mk("pf_deq_q6k", bindings: 2, pushBytes: 12);
+        _pPfDeq8 = Mk("pf_deq_q8", bindings: 2, pushBytes: 12);
         _pPfEmbed = Mk("pf_embed", bindings: 3, pushBytes: 4);
         _pPfRms = Mk("pf_rms", bindings: 3, pushBytes: 16);
         bool useCm = _dev.CoopMatrix && _dev.SubgroupSizeControl
@@ -170,8 +174,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend
                 GgmlTensorType.F32 => info.NumElements * sizeof(float),
                 GgmlTensorType.Q4_K => info.NumElements / 256 * (ulong)144,
                 GgmlTensorType.Q6_K => info.NumElements / 256 * (ulong)210,
+                GgmlTensorType.Q8_0 => info.NumElements / 32 * (ulong)34,
                 _ => throw new NotSupportedException(
-                    $"Vulkan backend (M2) supports F32/Q4_K/Q6_K only; {name} is {info.Type} — use --backend cpu"),
+                    $"Vulkan backend supports F32/Q4_K/Q6_K/Q8_0 only; {name} is {info.Type} — use --backend cpu"),
             };
             VkBuffer b = _dev.NewStorageBuffer(bytes, hostVisible: _dev.CoherentDeviceLocal);
             _dev.Upload(b, gguf.DataBase + (long)info.Offset, bytes);
@@ -299,6 +304,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             GgmlTensorType t = _wtype[name];
             VkPipeline p = t == GgmlTensorType.Q4_K ? _pGemv4
                 : t == GgmlTensorType.Q6_K ? _pGemv6
+                : t == GgmlTensorType.Q8_0 ? _pGemv8
                 : throw new NotSupportedException($"gemv {name}: {t} unsupported on Vulkan — use --backend cpu");
             var s = t == GgmlTensorType.Q4_K
                 ? Set(p, W(name), x, y, W(name))
@@ -316,7 +322,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend
 
         // embed h = dequant(embd[tokenId])
         {
-            VkPipeline p = _wtype["token_embd.weight"] == GgmlTensorType.Q6_K ? _pEmbed6 : _pEmbed4;
+            VkPipeline p = _wtype["token_embd.weight"] switch
+            {
+                GgmlTensorType.Q6_K => _pEmbed6,
+                GgmlTensorType.Q8_0 => _pEmbed8,
+                _ => _pEmbed4,
+            };
             var s = Set(p, _embd, _prm, _h);
             pcs[0] = (uint)hidden;
             Run(p, s, pcs, 4, (uint)((hidden + 255) / 256), _h);
@@ -331,7 +342,15 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         {
             GgmlTensorType.Q4_K => 0u,
             GgmlTensorType.Q6_K => 1u,
-            var t => throw new NotSupportedException($"vulkan decode: {name} is {t} — only Q4_K/Q6_K supported"),
+            GgmlTensorType.Q8_0 => 2u,
+            var t => throw new NotSupportedException($"vulkan decode: {name} is {t} — only Q4_K/Q6_K/Q8_0 supported"),
+        };
+
+        VkPipeline GaPipe(string name) => _wtype[name] switch
+        {
+            GgmlTensorType.Q6_K => _pGemvAdd6,
+            GgmlTensorType.Q8_0 => _pGemvAdd8,
+            _ => _pGemvAdd4,
         };
 
         // gemv accumulating into a residual buffer: h[row] += W*x
@@ -372,7 +391,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             if (l == layers - 1) Vk.vkCmdWriteTimestamp(_cmd, VkConst.PipelineStageBottomOfPipe, _qpool, 6);
             if (l == layers - 1) Vk.vkCmdWriteTimestamp(_cmd, VkConst.PipelineStageBottomOfPipe, _qpool, 7);
             // 4) h += attn_output * ao
-            GemvAdd(_wtype[$"blk.{l}.attn_output.weight"] == GgmlTensorType.Q6_K ? _pGemvAdd6 : _pGemvAdd4,
+            GemvAdd(GaPipe($"blk.{l}.attn_output.weight"),
                 $"blk.{l}.attn_output.weight", _ao, _h, qDim, hidden);
             if (l == layers - 1) Vk.vkCmdWriteTimestamp(_cmd, VkConst.PipelineStageBottomOfPipe, _qpool, 8);
             // 5) rms(h,ffn_norm) -> xs; out = silu(gate(xs)) * up(xs) -> _gate
@@ -396,7 +415,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             }
             if (l == layers - 1) Vk.vkCmdWriteTimestamp(_cmd, VkConst.PipelineStageBottomOfPipe, _qpool, 9);
             // 6) h += ffn_down * gate
-            GemvAdd(_wtype[$"blk.{l}.ffn_down.weight"] == GgmlTensorType.Q6_K ? _pGemvAdd6 : _pGemvAdd4,
+            GemvAdd(GaPipe($"blk.{l}.ffn_down.weight"),
                 $"blk.{l}.ffn_down.weight", _gate, _h, c.FfnSize, hidden);
             if (l == layers - 1) Vk.vkCmdWriteTimestamp(_cmd, VkConst.PipelineStageBottomOfPipe, _qpool, 10);
         }
@@ -481,6 +500,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             GgmlTensorType t = _wtype[name];
             VkPipeline p = t == GgmlTensorType.Q4_K ? _pPfDeq4
                 : t == GgmlTensorType.Q6_K ? _pPfDeq6
+                : t == GgmlTensorType.Q8_0 ? _pPfDeq8
                 : throw new NotSupportedException($"prefill dequant {name}: {t} unsupported on Vulkan");
             var s = Set(p, W(name), dst);
             long nblk = _welems[name] / 256;
@@ -646,7 +666,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         }
         {   // logits = normed @ output^T — the quant gemv (same kernel as decode)
             GgmlTensorType t = _wtype["output.weight"];
-            VkPipeline p = t == GgmlTensorType.Q4_K ? _pGemv4 : _pGemv6;
+            VkPipeline p = t == GgmlTensorType.Q4_K ? _pGemv4
+                : t == GgmlTensorType.Q8_0 ? _pGemv8
+                : _pGemv6;
             var s = t == GgmlTensorType.Q4_K
                 ? PfSet(p, W("output.weight"), _normed, _logitsBuf, W("output.weight"))
                 : PfSet(p, W("output.weight"), _normed, _logitsBuf);

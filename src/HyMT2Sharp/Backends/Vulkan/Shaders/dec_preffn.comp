@@ -8,7 +8,7 @@
 // fused: xs = rmsnorm(h)*wn (per-WG, in shared); each WG computes 16 gate rows
 // AND 16 up rows, then writes out[row] = silu(g)*u. One dispatch replaces
 // rms + gate-gemv + up-gemv + silu.
-// dtype flags: 0 = Q4_K (144B/blk), 1 = Q6_K (210B/blk). Weights via u16 view.
+// dtype flags: 0 = Q4_K (144B/blk), 1 = Q6_K (210B/blk), 2 = Q8_0 (34B/blk). Weights via u16 view.
 // Scales pre-decoded into sf[16*64] vec4: .xy = gate slot, .zw = up slot,
 // same packing as dec_prekv (q4k: vec2(dsc,dmn); q6k: vec2(d*s[2i],d*s[2i+1])).
 
@@ -134,6 +134,8 @@ shared float gu[512];
     barrier(); \
 }
 
+#define GEMV_Q8(arr, rl, rlRow, bpr, itid, comp, accOut) {     uint blk8 = (itid) >> 1;     uint half8 = ((itid) & 1u) << 4;     uint xoff = (blk8 << 3) + (half8 >> 2);     float _acc = 0.0f;     uint _rb = (rlRow) * (bpr) * 272u;     uint _sfb = (rl) * 64u;     for (uint blk = 0u; blk < (bpr); blk++) {         uint bb = _rb + blk * 272u + blk8 * 34u;         float d = unpackHalf2x16(R16(arr, bb)).x;         uint qb = bb + 2u + half8;         uint q0 = R32(arr, qb), q1 = R32(arr, qb + 4u), q2 = R32(arr, qb + 8u), q3 = R32(arr, qb + 12u);         vec4 v0 = vec4(float(int(q0 << 24) >> 24), float(int(q0 << 16) >> 24), float(int(q0 << 8) >> 24), float(int(q0) >> 24));         vec4 v1 = vec4(float(int(q1 << 24) >> 24), float(int(q1 << 16) >> 24), float(int(q1 << 8) >> 24), float(int(q1) >> 24));         vec4 v2 = vec4(float(int(q2 << 24) >> 24), float(int(q2 << 16) >> 24), float(int(q2 << 8) >> 24), float(int(q2) >> 24));         vec4 v3 = vec4(float(int(q3 << 24) >> 24), float(int(q3 << 16) >> 24), float(int(q3 << 8) >> 24), float(int(q3) >> 24));         uint kv = (blk << 6) + xoff;         _acc += d * (dot(X4(kv), v0) + dot(X4(kv + 1u), v1) + dot(X4(kv + 2u), v2) + dot(X4(kv + 3u), v3));     }     accOut = _acc; }
+
 void main()
 {
     uint tid = gl_LocalInvocationID.x;
@@ -161,10 +163,12 @@ void main()
     uint r = valid ? row : 0u;
 
     float accG = 0.0f, accU = 0.0f;
-    if (pc.tg == 0u) GEMV_Q4K(wg, rowLane, r, bpr, itid, xy, accG)
-    else            GEMV_Q6K(wg, rowLane, r, bpr, itid, xy, accG)
-    if (pc.tu == 0u) GEMV_Q4K(wu, rowLane, r, bpr, itid, zw, accU)
-    else            GEMV_Q6K(wu, rowLane, r, bpr, itid, zw, accU)
+    if (pc.tg == 0u)      GEMV_Q4K(wg, rowLane, r, bpr, itid, xy, accG)
+    else if (pc.tg == 1u) GEMV_Q6K(wg, rowLane, r, bpr, itid, xy, accG)
+    else                  GEMV_Q8(wg, rowLane, r, bpr, itid, xy, accG)
+    if (pc.tu == 0u)      GEMV_Q4K(wu, rowLane, r, bpr, itid, zw, accU)
+    else if (pc.tu == 1u) GEMV_Q6K(wu, rowLane, r, bpr, itid, zw, accU)
+    else                  GEMV_Q8(wu, rowLane, r, bpr, itid, zw, accU)
 
     red[tid] = accG;
     gu[tid] = accU;
