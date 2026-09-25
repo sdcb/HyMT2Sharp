@@ -1,0 +1,51 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// x[row,:] += sum_s part[s][row,:] (split-K GEMM partials), then
+// xs[row,:] = fp16(rmsnorm(x[row,:]) * wn). One WG per row (8 subgroups of
+// 32), dim % 4 == 0 and dim <= 2048 (at most 2 vec4 per thread).
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) buffer X { vec4 x[]; };
+layout(set = 0, binding = 1) readonly buffer WN { vec4 wn[]; };
+layout(set = 0, binding = 2) writeonly buffer XS { f16vec4 xs[]; };
+layout(set = 0, binding = 3) readonly buffer PT { vec4 part[]; };
+
+layout(push_constant) uniform PC { uint dim; uint nPart; uint sliceStride; float eps; } p;
+
+shared float red[8];
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint d4 = p.dim >> 2;
+    uint base = gl_WorkGroupID.x * d4;
+    uint ss4 = p.sliceStride >> 2;
+    vec4 v[2];
+    float acc = 0.0f;
+    for (uint k = 0u; k < 2u; k++) {
+        uint i = tid + k * 256u;
+        v[k] = vec4(0.0f);
+        if (i < d4) {
+            vec4 t = x[base + i];
+            for (uint s = 0u; s < p.nPart; s++) t += part[s * ss4 + base + i];
+            if (p.nPart > 0u) x[base + i] = t;
+            v[k] = t;
+            acc += dot(t, t);
+        }
+    }
+    float t = subgroupAdd(acc);
+    if (subgroupElect()) red[gl_SubgroupID] = t;
+    barrier();
+    float tot = 0.0f;
+    for (uint i = 0u; i < 8u; i++) tot += red[i];
+    float rstd = 1.0f / sqrt(tot / float(p.dim) + p.eps);
+    for (uint k = 0u; k < 2u; k++) {
+        uint i = tid + k * 256u;
+        if (i < d4) xs[base + i] = f16vec4(v[k] * rstd * wn[i]);
+    }
+}

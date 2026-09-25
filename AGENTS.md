@@ -12,4 +12,5 @@
 - End to end: `Sdcb.HyMT2Sharp.Benchmark.exe --model <gguf> --bench-prefill 512 --bench-decode 128 --threads 8` (add `--profile` for per-op split; never put profile numbers in docs).
 - Portable Q4_K micro: `--micro-vec-q4 [--micro-in N --micro-out N --micro-tokens N --threads N]` → GEMM GFLOP/s and GEMV GB/s.
 - JIT codegen check: `DOTNET_JitDisasm="<MethodName>"` on the Release exe.
+- Vulkan prefill per-op GPU split: `HYMT_VK_PFPROF=1` (timestamps after every prefill dispatch, aggregated per kernel). NVIDIA (sg32) prefill uses `pf_gemm_t32` / `pf_fa32` / `pf_addrms16` (glslang-built, see `Backends/Vulkan/tools/build-shaders.bat`); knobs `HYMT_VK_NOT32`, `HYMT_VK_NOFA`, `HYMT_VK_NOSWIGLU`, `HYMT_VK_T32[_QKV|_WO|_GU|_DOWN]`, `HYMT_VK_SPLITK_WO/DOWN`. RTX 3080 Ti GPU clock swings 1695–1980 MHz, so compare min-of-reps.
 - The dev box has background load; 8-thread numbers swing ±10%. Compare A/B interleaved, or build the baseline in a `git worktree` and alternate runs. Decode after `--bench-prefill 512` runs at a longer context than decode alone, so only compare like with like.

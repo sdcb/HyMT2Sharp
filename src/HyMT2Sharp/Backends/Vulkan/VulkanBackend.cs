@@ -42,6 +42,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         _pfQkv = null!, _pfAo = null!, _pfGu = null!, _pfH = null!;
     private int* _pfTokPtr;
     private IntPtr _cmdPf;
+    private long _pfRecKey = -1;            // (pos,seq) the prefill CB was last recorded for
     private readonly List<IntPtr> _pfSetCache = new();
     private int _pfSetIdx;
     private const int PfCap = 1024;
@@ -67,6 +68,10 @@ public sealed unsafe class VulkanBackend : IComputeBackend
     private double _gpuMs; private int _n;
     private double[] _segMs = new double[4];
     private double[] _opMs = new double[6];
+    private readonly bool _pfProf = Environment.GetEnvironmentVariable("HYMT_VK_PFPROF") == "1";
+    private const uint PfProfCap = 1024;
+    private IntPtr _pfProfPool;
+    private readonly List<string> _pfProfNames = new();
 
     public string Name => "vulkan";
     // pf kernels assume the fp16 KV layout (device KV is always fp16).
@@ -100,7 +105,11 @@ public sealed unsafe class VulkanBackend : IComputeBackend
     {
         _cfg = cfg;
         VkPipeline Mk(string spv, int bindings, int pushBytes)
-            => _dev.NewPipeline(_dev.NewShaderModule(LoadSpv(spv)), bindings, pushBytes);
+        {
+            VkPipeline p = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv(spv)), bindings, pushBytes);
+            p.Name = spv;
+            return p;
+        }
 
         _pGemv4 = Mk("q4k_gemv3", bindings: 3, pushBytes: 8);
         _pGemv6 = Mk("q6k_gemv2", bindings: 3, pushBytes: 8);
@@ -149,6 +158,33 @@ public sealed unsafe class VulkanBackend : IComputeBackend
                     : "pf_gemm_cm_" + cmVar)),
                     4, 16, requiredSubgroupSize: (uint)cmSg)
                 : Mk("pf_gemm", bindings: 4, pushBytes: 16);
+            _pPfGemm.Name = "gemm";
+            if (useCm && cmSg == 32 && Environment.GetEnvironmentVariable("HYMT_VK_NOT32") != "1")
+            {
+                // per-GEMM tile variants (qkv, wo, gu, down); HYMT_VK_T32[_QKV|_WO|_GU|_DOWN] override
+                string def = Environment.GetEnvironmentVariable("HYMT_VK_T32") ?? "64x64_32x32";
+                string[] roles = { "QKV", "WO", "GU", "DOWN" };
+                var cache = new Dictionary<string, GemmT>();
+                _gemmT = new GemmT[4];
+                for (int i = 0; i < 4; i++)
+                {
+                    string v = Environment.GetEnvironmentVariable("HYMT_VK_T32_" + roles[i]) ?? def;
+                    if (!cache.TryGetValue(v, out GemmT? g)) cache[v] = g = LoadGemmT(v);
+                    _gemmT[i] = g;
+                }
+                if (cfg.HiddenSize <= 2048 && cfg.HiddenSize % 4 == 0)
+                {
+                    _pPfAddRms = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv("pf_addrms16")), 4, 16, requiredSubgroupSize: 32);
+                    _pPfAddRms.Name = "pf_addrms16";
+                    _splitKWo = int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_SPLITK_WO"), out int sw) ? sw : 1;
+                    _splitKDown = int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_SPLITK_DOWN"), out int sd) ? sd : 2;
+                }
+                if (cfg.HeadDim == 128 && cfg.RopeDim == 128 && cfg.NumHeads == 4 * cfg.NumKvHeads && Environment.GetEnvironmentVariable("HYMT_VK_NOFA") != "1")
+                {
+                    _pPfFa = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv("pf_fa32")), 6, 36, requiredSubgroupSize: 32);
+                    _pPfFa.Name = "pf_fa32";
+                }
+            }
             // sg32 (NVIDIA/AMD): glslc-compiled fp16+subgroup shaders produce no
             // output there — the *_sg32 variants are the same sources rebuilt
             // with glslang. Intel sg16 keeps the committed glslc SPIR-V.
@@ -171,7 +207,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             // Unsupported requiredSubgroupSize, missing SPV variant, or rejected
             // coopmat shapes — fall back to the scalar GEMM path.
             Console.Error.WriteLine($"[vk] coopmat pipeline failed ({e.Message}) — scalar pf_gemm fallback");
-            useCm = false; _gVar = false; _pfFastAttn = false;
+            useCm = false; _gVar = false; _pfFastAttn = false; _gemmT = null; _pPfFa = null; _pPfAddRms = null;
             _pfGemmTM = _pfGemmTN = 128;
             _pPfGemm = Mk("pf_gemm", bindings: 4, pushBytes: 16);
             _pPfRmsX = _pPfRms;
@@ -212,13 +248,22 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         _kvV = new VkBuffer[cfg.NumLayers];
         _kvKHost = new ushort*[cfg.NumLayers];
         _kvVHost = new ushort*[cfg.NumLayers];
+        // Rows rounded up to 32 and zero-filled: pf_fa32 reads whole 32-row KV
+        // tiles straight from the cache, so the tail past kvLen must be finite.
+        ulong kvBytes = (ulong)((_kvCap + 31) / 32 * 32 * _kvStride * 2);
         for (int l = 0; l < cfg.NumLayers; l++)
         {
-            _kvK[l] = _dev.NewStorageBuffer((ulong)(_kvCap * _kvStride * 2), hostVisible: true);
-            _kvV[l] = _dev.NewStorageBuffer((ulong)(_kvCap * _kvStride * 2), hostVisible: true);
+            _kvK[l] = _dev.NewStorageBuffer(kvBytes, hostVisible: true);
+            _kvV[l] = _dev.NewStorageBuffer(kvBytes, hostVisible: true);
             _kvKHost[l] = (ushort*)_kvK[l].Map();
             _kvVHost[l] = (ushort*)_kvV[l].Map();
+            NativeMemory.Clear(_kvKHost[l], (nuint)kvBytes);
+            NativeMemory.Clear(_kvVHost[l], (nuint)kvBytes);
+            _kvK[l].Flush(0, kvBytes);
+            _kvV[l].Flush(0, kvBytes);
         }
+        if (Environment.GetEnvironmentVariable("HYMT_VK_VERBOSE") == "1")
+            Console.Error.WriteLine($"[vk] kv mem flags=0x{_kvK[0].Flags:X} (last layer 0x{_kvK[cfg.NumLayers - 1].Flags:X}) weights flags=0x{_embd.Flags:X}");
 
         int hidden = cfg.HiddenSize, ffn = cfg.FfnSize;
         int qDim = cfg.NumHeads * cfg.HeadDim, kDim = _kvStride;
@@ -243,8 +288,33 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         _fence = _dev.NewFence();
         Vk.VkQueryPoolCreateInfo qpci = new() { SType = 11, QueryType = 2, QueryCount = 16 };
         Vk.Check(Vk.vkCreateQueryPool(_dev.Device, &qpci, null, out _qpool), "vkCreateQueryPool");
+        if (_pfProf)
+        {
+            Vk.VkQueryPoolCreateInfo ppci = new() { SType = 11, QueryType = 2, QueryCount = PfProfCap };
+            Vk.Check(Vk.vkCreateQueryPool(_dev.Device, &ppci, null, out _pfProfPool), "vkCreateQueryPool");
+        }
         RecordDecodeGraph();
         if (SupportsPrefill) InitPrefill();
+    }
+
+    // sg32 tensor-core GEMM variants: pf_gemm_t32_{BM}x{BN}_{WM}x{WN}[_k{BK}].spv
+    private sealed record GemmT(VkPipeline P, int BM, int BN, int BK, int WN);
+    private GemmT[]? _gemmT;                // indexed by GEMM role: 0 qkv, 1 wo, 2 gu, 3 down
+    private bool _swiglu;                   // gu GEMM writes h = silu(g)*u directly (Wgu rows interleaved in 16-row gate/up groups)
+    private VkPipeline? _pPfFa;             // sg32 tensor-core causal attention (16 rows x 4 GQA heads / WG)
+    private VkPipeline? _pPfAddRms;         // x += split-K partials; xs = rmsnorm(x)
+    private int _splitKWo = 1, _splitKDown = 1;
+    private VkBuffer _pfPart = null!;       // split-K partial slices [(splitK-1)][PfCap][hidden] fp32
+    private long _pfPartElems;
+
+    private GemmT LoadGemmT(string v)
+    {
+        string[] parts = v.Split('_');
+        string[] t = parts[0].Split('x');
+        VkPipeline p = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv("pf_gemm_t32_" + v)), 4, 16, requiredSubgroupSize: 32);
+        p.Name = "gemm_t" + v;
+        int k = parts.Length == 3 ? int.Parse(parts[2][1..]) : 32;
+        return new GemmT(p, int.Parse(t[0]), int.Parse(t[1]), k, int.Parse(parts[1].Split('x')[1]));
     }
 
     // ---- descriptor-set helpers ----
@@ -262,6 +332,9 @@ public sealed unsafe class VulkanBackend : IComputeBackend
 
     /// <summary>Record one compute dispatch + write->read barrier into `cmd`.</summary>
     private void CmdRun(IntPtr cmd, VkPipeline p, (IntPtr set, VkBuffer[] bufs) d, void* pc, uint pcBytes, uint gx, uint gy, params VkBuffer[] written)
+        => CmdRun(cmd, p, d, pc, pcBytes, gx, gy, 1, written);
+
+    private void CmdRun(IntPtr cmd, VkPipeline p, (IntPtr set, VkBuffer[] bufs) d, void* pc, uint pcBytes, uint gx, uint gy, uint gz, params VkBuffer[] written)
     {
         Vk.vkCmdBindPipeline(cmd, VkConst.BindPointCompute, p.Pipeline);
         if (_dev.PushDescriptors && !_noPush)
@@ -287,7 +360,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             Vk.vkCmdBindDescriptorSets(cmd, VkConst.BindPointCompute, p.Layout, 0, 1, &set, 0, null);
         }
         if (pcBytes > 0) Vk.vkCmdPushConstants(cmd, p.Layout, VkConst.StageComputeShader, 0, pcBytes, pc);
-        Vk.vkCmdDispatch(cmd, gx, gy, 1);
+        Vk.vkCmdDispatch(cmd, gx, gy, gz);
         if (!_noBarrier && written.Length > 0)
             _dev.CmdBufferBarrier(cmd, written);
     }
@@ -492,8 +565,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         _pfXs2 = PfA((long)PfCap * hidden);
         _pfQkv = PfF((long)PfCap * qkvDim);
         _pfAo = PfA((long)PfCap * qDim);
-        _pfGu = PfF((long)PfCap * 2 * ffn);
+        _swiglu = _gemmT?[2] is { } t && t.WN % 32 == 0 && 2 * ffn % t.BN == 0 && ffn % 16 == 0 && hidden % t.BK == 0
+            && Environment.GetEnvironmentVariable("HYMT_VK_NOSWIGLU") != "1";
+        _pfGu = _swiglu ? _pfQkv : PfF((long)PfCap * 2 * ffn);
         _pfH = PfA((long)PfCap * ffn);
+        _pfPartElems = (long)(Math.Max(_splitKWo, _splitKDown) - 1) * PfCap * hidden;
+        _pfPart = _pfPartElems > 0 ? PfF(_pfPartElems) : _pfX;
         if (_pfFastAttn)
         {
             _pfQ16 = _dev.NewStorageBuffer((ulong)(PfCap * c.NumHeads * dim * 2), hostVisible: _dump);
@@ -521,20 +598,53 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             pc[0] = (uint)outOff; pc[1] = gx; pc[2] = (uint)nblk;
             CmdRun(cmd, p, s, pc, 12, gx, (uint)((nblk + gx - 1) / gx), dst);
         }
+        // SwiGLU-fused gu GEMM wants gate/up rows interleaved in 16-row groups:
+        // dequant into a scratch copy, then scatter with one multi-region copy.
+        VkBuffer? guTmp = _swiglu ? F16(2L * ffn * hidden) : null;
+        Vk.VkBufferCopy[] regs = new Vk.VkBufferCopy[_swiglu ? 2 * ffn / 16 : 0];
+        for (int g = 0; g < regs.Length / 2; g++)
+        {
+            ulong grp = (ulong)(16 * hidden * 2);
+            regs[2 * g] = new Vk.VkBufferCopy { SrcOffset = (ulong)g * grp, DstOffset = (ulong)(2 * g) * grp, Size = grp };
+            regs[2 * g + 1] = new Vk.VkBufferCopy { SrcOffset = (ulong)(ffn / 16 + g) * grp, DstOffset = (ulong)(2 * g + 1) * grp, Size = grp };
+        }
+        void AllBarrier()
+        {
+            Vk.VkMemoryBarrier mb = new()
+            {
+                SType = VkConst.StMemoryBarrier,
+                SrcAccessMask = VkConst.AccessShaderWrite | VkConst.AccessTransferWrite,
+                DstAccessMask = VkConst.AccessShaderRead | VkConst.AccessShaderWrite | VkConst.AccessTransferRead | VkConst.AccessTransferWrite,
+            };
+            uint st = VkConst.PipelineStageComputeShader | VkConst.PipelineStageTransfer;
+            Vk.vkCmdPipelineBarrier(cmd, st, st, 0, 1, &mb, 0, null, 0, null);
+        }
         for (int l = 0; l < c.NumLayers; l++)
         {
             Deq($"blk.{l}.attn_q.weight", _wq16[l], 0);
             Deq($"blk.{l}.attn_k.weight", _wq16[l], (long)qDim * hidden);
             Deq($"blk.{l}.attn_v.weight", _wq16[l], (long)(qDim + kDim) * hidden);
             Deq($"blk.{l}.attn_output.weight", _wo16[l], 0);
-            Deq($"blk.{l}.ffn_gate.weight", _wgu16[l], 0);
-            Deq($"blk.{l}.ffn_up.weight", _wgu16[l], (long)ffn * hidden);
+            Deq($"blk.{l}.ffn_gate.weight", guTmp ?? _wgu16[l], 0);
+            Deq($"blk.{l}.ffn_up.weight", guTmp ?? _wgu16[l], (long)ffn * hidden);
+            if (guTmp != null)
+            {
+                AllBarrier();
+                fixed (Vk.VkBufferCopy* r = regs)
+                    Vk.vkCmdCopyBuffer(cmd, guTmp.Buffer, _wgu16[l].Buffer, (uint)regs.Length, r);
+                AllBarrier();
+            }
             Deq($"blk.{l}.ffn_down.weight", _wd16[l], 0);
         }
         Deq("token_embd.weight", _embd16, 0);
         Vk.Check(Vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
         _dev.Submit(cmd, fence);
         _dev.WaitFence(fence);
+        if (guTmp != null)
+        {
+            Vk.vkDestroyBuffer(_dev.Device, guTmp.Buffer, null);
+            Vk.vkFreeMemory(_dev.Device, guTmp.Memory, null);
+        }
     }
 
     private void RecordPrefill(int seq, int pos)
@@ -568,10 +678,60 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             }
             return (s, bufs);
         }
+        if (_pfProf)
+        {
+            _pfProfNames.Clear();
+            Vk.vkCmdResetQueryPool(_cmdPf, _pfProfPool, 0, PfProfCap);
+            Vk.vkCmdWriteTimestamp(_cmdPf, VkConst.PipelineStageBottomOfPipe, _pfProfPool, 0);
+        }
+        void RunZ(VkPipeline p, (IntPtr set, VkBuffer[] bufs) d, void* pc, uint pcBytes, uint gx, uint gy, uint gz, params VkBuffer[] written)
+        {
+            CmdRun(_cmdPf, p, d, pc, pcBytes, gx, gy, gz, written);
+            if (_pfProf && _pfProfNames.Count + 1 < PfProfCap)
+            {
+                _pfProfNames.Add(p.Name.StartsWith("gemm") ? $"{p.Name}[{((uint*)pc)[1]}x{((uint*)pc)[2]}{(gz > 1 ? $"/{gz}" : "")}]" : p.Name);
+                Vk.vkCmdWriteTimestamp(_cmdPf, VkConst.PipelineStageBottomOfPipe, _pfProfPool, (uint)_pfProfNames.Count);
+            }
+        }
         void Run(VkPipeline p, (IntPtr set, VkBuffer[] bufs) d, void* pc, uint pcBytes, uint gx, uint gy, params VkBuffer[] written)
-            => CmdRun(_cmdPf, p, d, pc, pcBytes, gx, gy, written);
+            => RunZ(p, d, pc, pcBytes, gx, gy, 1, written);
 
         uint* pc = stackalloc uint[10];
+        // out[M,N] (+)= xin[M,K] @ w[N,K]^T. splitK > 1 (tensor-core path only):
+        // slices 1.. write raw partials to _pfPart for pf_addrms16 to fold in.
+        // Returns the split count actually used.
+        int Gemm(int role, VkBuffer xin, VkBuffer w, VkBuffer outp, int n, int k, bool add, bool swiglu = false, int splitK = 1)
+        {
+            GemmT? t = _gemmT?[role];
+            bool useT = t != null && n % t.BN == 0 && k % t.BK == 0;
+            VkPipeline p = useT ? t!.P : _pPfGemm;
+            int tm = useT ? t!.BM : _pfGemmTM, tn = useT ? t!.BN : _pfGemmTN;
+            if (!useT || k / t!.BK < splitK || (long)(splitK - 1) * M * n > _pfPartElems) splitK = 1;
+            var s = PfSet(p, xin, w, splitK > 1 ? _pfPart : _pfX, outp);
+            pc[0] = M; pc[1] = (uint)n; pc[2] = (uint)k; pc[3] = (add ? 1u : 0u) | (swiglu ? 2u : 0u);
+            if (splitK > 1)
+                RunZ(p, s, pc, 16, (uint)((M + tm - 1) / tm), (uint)((n + tn - 1) / tn), (uint)splitK, outp, _pfPart);
+            else
+                Run(p, s, pc, 16, (uint)((M + tm - 1) / tm), (uint)((n + tn - 1) / tn), outp);
+            return splitK;
+        }
+        // xs = rmsnorm(x (+ split-K partials)) * wn
+        void Rms(VkBuffer wn, VkBuffer xs, int parts)
+        {
+            if (_pPfAddRms != null)
+            {
+                var s = PfSet(_pPfAddRms!, _pfX, wn, xs, _pfPart);
+                pc[0] = (uint)hidden; pc[1] = (uint)(parts - 1); pc[2] = M * (uint)hidden; pc[3] = BitConverter.SingleToUInt32Bits(c.Eps);
+                if (parts > 1) Run(_pPfAddRms!, s, pc, 16, M, 1, _pfX, xs);
+                else Run(_pPfAddRms!, s, pc, 16, M, 1, xs);
+            }
+            else
+            {
+                var s = PfSet(_pPfRmsX, _pfX, wn, xs);
+                pc[0] = (uint)hidden; pc[1] = 0; pc[2] = 0; pc[3] = BitConverter.SingleToUInt32Bits(c.Eps);
+                Run(_pPfRmsX, s, pc, 16, M, 1, xs);
+            }
+        }
         uint epsB = BitConverter.SingleToUInt32Bits(c.Eps);
         int pfLayers = int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_PFLAYERS"), out int pfl)
             ? Math.Min(pfl, c.NumLayers) : c.NumLayers;
@@ -583,18 +743,14 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         }
 
         if (_timing) { Vk.vkCmdResetQueryPool(_cmdPf, _qpool, 0, 16); Vk.vkCmdWriteTimestamp(_cmdPf, VkConst.PipelineStageTopOfPipe, _qpool, 12); }
+        // split-K slices for the residual GEMMs (wo, down); partials are folded
+        // into x by the following rms (pf_addrms16), so the last layer's down stays whole.
+        int skWo = _noSmall || _pPfAddRms == null ? 1 : _splitKWo, skDown = _noSmall || _pPfAddRms == null ? 1 : _splitKDown;
+        int parts = 1;
         for (int l = 0; l < pfLayers; l++)
         {
-            if (!_noSmall) {   // xs = rmsnorm(x) * attn_norm
-                var s = PfSet(_pPfRmsX, _pfX, W($"blk.{l}.attn_norm.weight"), _pfXs);
-                pc[0] = (uint)hidden; pc[1] = 0; pc[2] = 0; pc[3] = epsB;
-                Run(_pPfRmsX, s, pc, 16, M, 1, _pfXs);
-            }
-            {   // qkv = xs @ (wq|wk|wv)^T
-                var s = PfSet(_pPfGemm, _pfXs, _wq16[l], _pfX, _pfQkv);
-                pc[0] = M; pc[1] = (uint)qkvDim; pc[2] = (uint)hidden; pc[3] = 0;
-                Run(_pPfGemm, s, pc, 16, (uint)((M + _pfGemmTM - 1) / _pfGemmTM), (uint)((qkvDim + _pfGemmTN - 1) / _pfGemmTN), _pfQkv);
-            }
+            if (!_noSmall) Rms(W($"blk.{l}.attn_norm.weight"), _pfXs, parts);   // xs = rmsnorm(x) * attn_norm
+            Gemm(0, _pfXs, _wq16[l], _pfQkv, qkvDim, hidden, false);   // qkv = xs @ (wq|wk|wv)^T
             if (!_noSmall) {   // rope+rmsnorm k rows -> fp16 K; v rows -> fp16 V
                 var s = PfSet(_pPfKvPrep, _pfQkv, _kvK[l], _kvV[l], W($"blk.{l}.attn_k_norm.weight"), _prm);
                 pc[0] = (uint)dim; pc[1] = (uint)c.RopeDim; pc[2] = (uint)_kvStride; pc[3] = (uint)qkvDim;
@@ -604,7 +760,16 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             }
             if (!(_noSmall || _noAttn))
             {
-                if (_pfFastAttn)
+                if (_pPfFa != null)
+                {
+                    var s = PfSet(_pPfFa, _pfQkv, _kvK[l], _kvV[l], W($"blk.{l}.attn_q_norm.weight"), _prm, _pfAo);
+                    pc[0] = (uint)heads; pc[1] = (uint)kvHeads; pc[2] = (uint)dim; pc[3] = (uint)c.RopeDim;
+                    pc[4] = (uint)_kvStride; pc[5] = (uint)qkvDim;
+                    pc[6] = BitConverter.SingleToUInt32Bits(scale);
+                    pc[7] = BitConverter.SingleToUInt32Bits(c.RopeBase); pc[8] = epsB;
+                    Run(_pPfFa, s, pc, 36, (uint)kvHeads, (M + 15) / 16, _pfAo);
+                }
+                else if (_pfFastAttn)
                 {
                     {   // q16[m][h*headDim+d] = rmsnorm(rope(q row)) in fp16
                         var s = PfSet(_pPfQprep, _pfQkv, W($"blk.{l}.attn_q_norm.weight"), _prm, _pfQ16);
@@ -643,32 +808,19 @@ public sealed unsafe class VulkanBackend : IComputeBackend
                     Run(_pPfAttn, s, pc, 36, (uint)heads, M, _pfAo);
                 }
             }
-            {   // x += ao @ wo^T
-                var s = PfSet(_pPfGemm, _pfAo, _wo16[l], _pfX, _pfX);
-                pc[0] = M; pc[1] = (uint)hidden; pc[2] = (uint)qDim; pc[3] = 1;
-                Run(_pPfGemm, s, pc, 16, (uint)((M + _pfGemmTM - 1) / _pfGemmTM), (uint)((hidden + _pfGemmTN - 1) / _pfGemmTN), _pfX);
-            }
-            if (!_noSmall) {   // xs = rmsnorm(x) * ffn_norm
-                var s = PfSet(_pPfRmsX, _pfX, W($"blk.{l}.ffn_norm.weight"), _pfXs2);
-                pc[0] = (uint)hidden; pc[1] = 0; pc[2] = 0; pc[3] = epsB;
-                Run(_pPfRmsX, s, pc, 16, M, 1, _pfXs2);
-            }
-            {   // gu = xs @ (gate|up)^T
-                var s = PfSet(_pPfGemm, _pfXs2, _wgu16[l], _pfX, _pfGu);
-                pc[0] = M; pc[1] = (uint)(2 * ffn); pc[2] = (uint)hidden; pc[3] = 0;
-                Run(_pPfGemm, s, pc, 16, (uint)((M + _pfGemmTM - 1) / _pfGemmTM), (uint)((2 * ffn + _pfGemmTN - 1) / _pfGemmTN), _pfGu);
-            }
-            if (!_noSmall) {   // h = silu(gate) * up
+            parts = Gemm(1, _pfAo, _wo16[l], _pfX, hidden, qDim, true, splitK: skWo);   // x += ao @ wo^T
+            if (!_noSmall) Rms(W($"blk.{l}.ffn_norm.weight"), _pfXs2, parts);   // xs = rmsnorm(x) * ffn_norm
+            if (_swiglu)
+                Gemm(2, _pfXs2, _wgu16[l], _pfH, 2 * ffn, hidden, false, swiglu: true);   // h = silu(xs@Wg^T) * (xs@Wu^T)
+            else
+                Gemm(2, _pfXs2, _wgu16[l], _pfGu, 2 * ffn, hidden, false);   // gu = xs @ (gate|up)^T
+            if (!_noSmall && !_swiglu) {   // h = silu(gate) * up
                 var s = PfSet(_pPfSilu, _pfGu, _pfH);
                 uint total = (uint)(seq * ffn);
                 pc[0] = (uint)ffn; pc[1] = total;
                 Run(_pPfSilu, s, pc, 8, (total + 255) / 256, 1, _pfH);
             }
-            {   // x += h @ ffn_down^T
-                var s = PfSet(_pPfGemm, _pfH, _wd16[l], _pfX, _pfX);
-                pc[0] = M; pc[1] = (uint)hidden; pc[2] = (uint)ffn; pc[3] = 1;
-                Run(_pPfGemm, s, pc, 16, (uint)((M + _pfGemmTM - 1) / _pfGemmTM), (uint)((hidden + _pfGemmTN - 1) / _pfGemmTN), _pfX);
-            }
+            parts = Gemm(3, _pfH, _wd16[l], _pfX, hidden, ffn, true, splitK: l + 1 < pfLayers ? skDown : 1);   // x += h @ ffn_down^T
         }
 
         if (_timing) Vk.vkCmdWriteTimestamp(_cmdPf, VkConst.PipelineStageBottomOfPipe, _qpool, 13);
@@ -794,7 +946,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         else BinRow("pfxs", _pfXs, last * hidden, hidden);
         BinRow("pfqkv", _pfQkv, last * qkvDim, qkvDim);
         BinRow("pfao", _pfAo, last * qDim, qDim);
-        BinRow("pfgu", _pfGu, last * 2 * ffn, 2 * ffn);
+        if (!_swiglu) BinRow("pfgu", _pfGu, last * 2 * ffn, 2 * ffn);
         BinRow("pfh", _pfH, last * ffn, ffn);
         // whole-tensor dumps for stage isolation (first rows too)
         BinRow("pfx0", _pfX, 0, hidden);
@@ -843,7 +995,15 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         _prm.Flush(0, 16);
 
         _sw.Restart();
-        RecordPrefill(seq, pos);
+        // The graph depends only on seq (pos/kvLen flow through _prm), except the
+        // Intel fast-attn path which bakes pos into push constants.
+        long key = _pfFastAttn ? ((long)pos << 32) | (uint)seq : seq;
+        if (key != _pfRecKey)
+        {
+            RecordPrefill(seq, pos);
+            _pfRecKey = key;
+        }
+        if (_pfProf) Console.WriteLine($"[vk-prof] record={_sw.Elapsed.TotalMilliseconds:F2}ms");
         _dev.Submit(_cmdPf, _fence);
         _dev.WaitFence(_fence);
         IntPtr f = _fence;
@@ -857,6 +1017,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             Console.WriteLine($"[vk] pf-seg qr={qr} layers={(ts[13] - ts[12]) * per:F2}ms outgemv={(ts[14] - ts[13]) * per:F2}ms");
         }
         if (_dump) DumpPrefill(seq);
+        if (_pfProf) { Console.WriteLine($"[vk-prof] record+submit+wait={_sw.Elapsed.TotalMilliseconds:F2}ms"); PrintPfProf(seq); }
 
         if (Environment.GetEnvironmentVariable("HYMT_VK_NOREAD") != "1")
         {
@@ -865,6 +1026,26 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             _logitsStage.Unmap();
         }
         return _logitsHost;
+    }
+
+    private void PrintPfProf(int seq)
+    {
+        int n = _pfProfNames.Count + 1;
+        ulong[] ts = new ulong[n];
+        fixed (ulong* p = ts)
+            Vk.vkGetQueryPoolResults(_dev.Device, _pfProfPool, 0, (uint)n, (nuint)(n * 8), p, 8, 1u | 2u);
+        double per = _dev.TimestampPeriodNs * 1e-6;
+        var agg = new Dictionary<string, (double ms, int cnt)>();
+        for (int i = 1; i < n; i++)
+        {
+            string k = _pfProfNames[i - 1];
+            agg.TryGetValue(k, out var a);
+            agg[k] = (a.ms + (ts[i] - ts[i - 1]) * per, a.cnt + 1);
+        }
+        double tot = (ts[n - 1] - ts[0]) * per;
+        Console.WriteLine($"[vk-prof] seq={seq} total={tot:F2}ms");
+        foreach (var kv in agg.OrderByDescending(x => x.Value.ms))
+            Console.WriteLine($"[vk-prof] {kv.Key,-36} {kv.Value.ms,8:F2}ms {kv.Value.ms / tot * 100,5:F1}%  n={kv.Value.cnt} avg={kv.Value.ms / kv.Value.cnt * 1000:F0}us");
     }
 
     public float[] ForwardStep(ReadOnlySpan<int> tokens, int pos)

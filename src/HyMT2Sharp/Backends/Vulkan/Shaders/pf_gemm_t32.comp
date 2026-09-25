@@ -1,0 +1,192 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+
+// C[M,N] = X[M,K](fp16) * W[N,K](fp16)^T (+ C when flags&1), fp32 accumulate.
+// Tensor-core GEMM for subgroup-32 devices (NVIDIA): 16x16x16 coopmat, each
+// subgroup owns a WM x WN warp tile (FM x FN accumulators) of the BM x BN
+// workgroup tile. K is walked in BK chunks through double-buffered shared
+// tiles (rows padded by 16B so 8-row fragment loads are bank-conflict free);
+// the next chunk is fetched global->registers before the current chunk's MMAs
+// and parked into the other bank after them — one barrier per chunk.
+// Requires N % BN == 0 and K % BK == 0 (host checks); M is guarded.
+// flags: 1 = accumulate into C, 2 = SwiGLU epilogue (fp16 out, see below).
+// Split-K: gl_NumWorkGroups.z slices of K; slice 0 writes C (with the flags&1
+// residual), slice z > 0 writes its raw partial to R[(z-1)*M*N ...] for the
+// consumer (pf_addrms16) to fold in.
+#ifndef BM
+#define BM 128
+#endif
+#ifndef BN
+#define BN 128
+#endif
+#ifndef BK
+#define BK 32
+#endif
+#ifndef WM
+#define WM 64
+#endif
+#ifndef WN
+#define WN 32
+#endif
+
+const uint WGM = BM / WM, WGN = BN / WN;
+const uint NSG = WGM * WGN;
+const uint NTHR = NSG * 32u;
+const uint FM = WM / 16u, FN = WN / 16u;
+
+layout(local_size_x = NTHR) in;
+
+layout(set = 0, binding = 0) readonly buffer X { uvec4 x[]; };
+layout(set = 0, binding = 1) readonly buffer W { uvec4 w[]; };
+layout(set = 0, binding = 2) buffer R { float r[]; };        // split-K partials (z > 0)
+layout(set = 0, binding = 3) buffer C { float c[]; };
+layout(set = 0, binding = 3) buffer C16 { float16_t c16[]; };
+
+layout(push_constant) uniform PC { uint mDim; uint nDim; uint kDim; uint flags; } p;
+
+const uint BK8 = BK / 8u;               // uvec4 (8 x f16) per tile row per chunk
+const uint SROW = BK8 + 1u;             // padded shared row stride, uvec4 units
+const uint AS = BM * SROW, BS = BN * SROW;
+const uint ALD = BM * BK8 / NTHR;       // uvec4 per thread per chunk
+const uint BLD = BN * BK8 / NTHR;
+
+shared uvec4 sh[2u * (AS + BS)];
+
+// Ragged M tile: stage one 16x16 fragment through this subgroup's slice of
+// shared (row-major floats packed 4 per uvec4) and write the rows < M.
+// mode 0: c = v, 1: c += v, 2: c16 = fp16(v), 3: r = v.
+void storeRagged(coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> v, uint row0, uint col0, uint ld, uint mode)
+{
+    uint lane = gl_SubgroupInvocationID;
+    uint stg = gl_SubgroupID * 64u;
+    coopMatStore(v, sh, stg, 4u, gl_CooperativeMatrixLayoutRowMajor);
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    [[unroll]] for (uint e = 0u; e < 8u; e++) {
+        uint idx = lane + e * 32u;
+        uint gm = row0 + (idx >> 4);
+        if (gm < p.mDim) {
+            uint o = gm * ld + col0 + (idx & 15u);
+            float f = uintBitsToFloat(sh[stg + (idx >> 2)][idx & 3u]);
+            if (mode == 2u) c16[o] = float16_t(f);
+            else if (mode == 3u) r[o] = f;
+            else c[o] = mode == 1u ? c[o] + f : f;
+        }
+    }
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+}
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint wm = sg % WGM, wn = sg / WGM;
+    uint m0 = gl_WorkGroupID.x * BM;
+    uint n0 = gl_WorkGroupID.y * BN;
+    uint M = p.mDim, N = p.nDim;
+    uint kv = p.kDim >> 3;
+    uint z = gl_WorkGroupID.z, nz = gl_NumWorkGroups.z;
+    uint kc0 = z * (p.kDim / BK) / nz;
+    uint nk = (z + 1u) * (p.kDim / BK) / nz - kc0;
+    bool full = m0 + BM <= M;
+    bool addC = (p.flags & 1u) != 0u && z == 0u;
+    uint rOff = (z - 1u) * M * N;           // partial slice base (z > 0)
+
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> acc[FM][FN];
+    [[unroll]] for (uint i = 0u; i < FM; i++)
+        [[unroll]] for (uint j = 0u; j < FN; j++) {
+            if (addC && full)
+                coopMatLoad(acc[i][j], c, (m0 + wm * WM + i * 16u) * N + n0 + wn * WN + j * 16u, N, gl_CooperativeMatrixLayoutRowMajor);
+            else
+                acc[i][j] = coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0f);
+        }
+
+    // per-thread load slots (fixed across chunks)
+    uint aOff[ALD]; uint aSh[ALD]; bool aOk[ALD];
+    [[unroll]] for (uint i = 0u; i < ALD; i++) {
+        uint s = tid + i * NTHR;
+        uint row = s / BK8, col = s % BK8;
+        aOk[i] = m0 + row < M;
+        aOff[i] = (m0 + row) * kv + kc0 * BK8 + col;
+        aSh[i] = row * SROW + col;
+    }
+    uint bOff[BLD]; uint bSh[BLD];
+    [[unroll]] for (uint i = 0u; i < BLD; i++) {
+        uint s = tid + i * NTHR;
+        uint row = s / BK8, col = s % BK8;
+        bOff[i] = (n0 + row) * kv + kc0 * BK8 + col;
+        bSh[i] = AS + row * SROW + col;
+    }
+
+    uvec4 ra[ALD]; uvec4 rb[BLD];
+    [[unroll]] for (uint i = 0u; i < ALD; i++) ra[i] = aOk[i] ? x[aOff[i]] : uvec4(0u);
+    [[unroll]] for (uint i = 0u; i < BLD; i++) rb[i] = w[bOff[i]];
+    [[unroll]] for (uint i = 0u; i < ALD; i++) sh[aSh[i]] = ra[i];
+    [[unroll]] for (uint i = 0u; i < BLD; i++) sh[bSh[i]] = rb[i];
+    barrier();
+
+    uint aBase = (wm * WM) * SROW;
+    uint bBase = AS + (wn * WN) * SROW;
+    for (uint kc = 0u; kc < nk; kc++) {
+        uint cur = (kc & 1u) * (AS + BS);
+        bool more = kc + 1u < nk;
+        if (more) {
+            uint ko = (kc + 1u) * BK8;
+            [[unroll]] for (uint i = 0u; i < ALD; i++) ra[i] = aOk[i] ? x[aOff[i] + ko] : uvec4(0u);
+            [[unroll]] for (uint i = 0u; i < BLD; i++) rb[i] = w[bOff[i] + ko];
+        }
+        [[unroll]] for (uint kk = 0u; kk < BK8; kk += 2u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> fa[FM];
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> fb[FN];
+            [[unroll]] for (uint i = 0u; i < FM; i++)
+                coopMatLoad(fa[i], sh, cur + aBase + i * 16u * SROW + kk, SROW, gl_CooperativeMatrixLayoutRowMajor);
+            [[unroll]] for (uint j = 0u; j < FN; j++)
+                coopMatLoad(fb[j], sh, cur + bBase + j * 16u * SROW + kk, SROW, gl_CooperativeMatrixLayoutColumnMajor);
+            [[unroll]] for (uint i = 0u; i < FM; i++)
+                [[unroll]] for (uint j = 0u; j < FN; j++)
+                    acc[i][j] = coopMatMulAdd(fa[i], fb[j], acc[i][j]);
+        }
+        if (more) {
+            uint nxt = (AS + BS) - cur;
+            [[unroll]] for (uint i = 0u; i < ALD; i++) sh[nxt + aSh[i]] = ra[i];
+            [[unroll]] for (uint i = 0u; i < BLD; i++) sh[nxt + bSh[i]] = rb[i];
+        }
+        barrier();
+    }
+
+    if ((p.flags & 2u) != 0u) {
+        // SwiGLU epilogue: W rows are interleaved in 16-row groups
+        // [gate f..f+15 | up f..f+15], so accumulator pair (2q, 2q+1) holds
+        // gate/up of the same 16 features; write h = silu(g)*u as fp16 [M, N/2].
+        uint hN = N >> 1;
+        [[unroll]] for (uint i = 0u; i < FM; i++)
+            [[unroll]] for (uint q = 0u; q < FN / 2u; q++) {
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> g = acc[i][2u * q];
+                coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> u = acc[i][2u * q + 1u];
+                for (int e = 0; e < g.length(); e++) g[e] = (g[e] / (1.0f + exp(-g[e]))) * u[e];
+                uint row = m0 + wm * WM + i * 16u, col = ((n0 + wn * WN) >> 1) + q * 16u;
+                if (full) {
+                    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> h16 =
+                        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(g);
+                    coopMatStore(h16, c16, row * hN + col, hN, gl_CooperativeMatrixLayoutRowMajor);
+                } else storeRagged(g, row, col, hN, 2u);
+            }
+        return;
+    }
+    [[unroll]] for (uint i = 0u; i < FM; i++)
+        [[unroll]] for (uint j = 0u; j < FN; j++) {
+            uint row = m0 + wm * WM + i * 16u, col = n0 + wn * WN + j * 16u;
+            if (z > 0u) {
+                if (full) coopMatStore(acc[i][j], r, rOff + row * N + col, N, gl_CooperativeMatrixLayoutRowMajor);
+                else storeRagged(acc[i][j], row, col + rOff, N, 3u);
+            } else if (full) coopMatStore(acc[i][j], c, row * N + col, N, gl_CooperativeMatrixLayoutRowMajor);
+            else storeRagged(acc[i][j], row, col, N, addC ? 1u : 0u);
+        }
+}
