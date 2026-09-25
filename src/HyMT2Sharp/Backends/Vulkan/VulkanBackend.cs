@@ -123,10 +123,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             ? (_dev.SubgroupMin <= 16 && _dev.SubgroupMax >= 16 ? 16
             : _dev.SubgroupMin <= 32 && _dev.SubgroupMax >= 32 ? 32 : 0)
             : 0;
-        // sg32 coopmat (NVIDIA/AMD) works but is not yet faster than the scalar
-        // path (~2450 vs ~2760 tok/s pp512 on 3080 Ti) — opt-in via HYMT_VK_CM32.
-        bool useCm = cmSg != 0 && Environment.GetEnvironmentVariable("HYMT_VK_NOCM") != "1"
-            && (cmSg == 16 || Environment.GetEnvironmentVariable("HYMT_VK_CM32") == "1");
+        bool useCm = cmSg != 0 && Environment.GetEnvironmentVariable("HYMT_VK_NOCM") != "1";
         if (Environment.GetEnvironmentVariable("HYMT_VK_DEBUG") == "1")
             Console.Error.WriteLine($"vk-dbg cmSg={cmSg} useCm={useCm} coop={_dev.CoopMatrix} sgc={_dev.SubgroupSizeControl} sgMin={_dev.SubgroupMin} sgMax={_dev.SubgroupMax}");
         string cmVar = cmSg == 32
@@ -134,10 +131,10 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             : (Environment.GetEnvironmentVariable("HYMT_VK_GEMMV") ?? "g28");
         _gVar = useCm && (cmSg == 32 || cmVar.StartsWith("g"));
         _pfGemmTM = useCm
-            ? (int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_GEMMTM"), out int tm) ? tm : (cmSg == 32 ? 128 : 512))
+            ? (int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_GEMMTM"), out int tm) ? tm : (cmSg == 32 ? 64 : 512))
             : 128;
         _pfGemmTN = useCm
-            ? (int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_GEMMTN"), out int tn) ? tn : (cmSg == 32 ? 128 : 64))
+            ? (int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_GEMMTN"), out int tn) ? tn : (cmSg == 32 ? 64 : 64))
             : 128;
         try
         {
