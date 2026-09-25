@@ -512,6 +512,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
         {
             cc.EndEnc(); cc.Commit(); cc.Wait();
             DumpF(h, T * hidden, "h_early");
+            cc.Drain();  // release this ctx's autorelease pool before abandoning it
             cc = CmdCtx.Begin(_dev.Queue);
         }
 
@@ -700,6 +701,10 @@ public sealed unsafe class MetalBackend : IComputeBackend
     // [T x inDim] · W^T -> [T x outDim] via sgemm4x4 on fp32 weights + xT.
     private void Gemm(CmdCtx c, string name, IntPtr xT, IntPtr y, int inDim, int outDim, int T, int Tpad)
     {
+        // sgemm4x4 writes y rows as float4 when c+3 < out_dim — requires out_dim % 4 == 0
+        // so every row stays 16B-aligned (this model: 2048/512/6144/3072 all qualify).
+        if (outDim % 4 != 0)
+            throw new NotSupportedException($"gemm {name}: out_dim {outDim} not a multiple of 4 — use --backend cpu");
         IntPtr w32 = WFp32(c, name, inDim, outDim);
         c.SetPso(_psoSgemm);
         c.SetBuffer(w32, 0, 0); c.SetBuffer(xT, 0, 1); c.SetBuffer(y, 0, 2);
