@@ -117,42 +117,55 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         _pPfDeq6 = Mk("pf_deq_q6k", bindings: 2, pushBytes: 12);
         _pPfEmbed = Mk("pf_embed", bindings: 3, pushBytes: 4);
         _pPfRms = Mk("pf_rms", bindings: 3, pushBytes: 16);
-        bool useCm = _dev.CoopMatrix && _dev.SubgroupSizeControl
-            && _dev.SubgroupMin <= 16 && _dev.SubgroupMax >= 16
-            && Environment.GetEnvironmentVariable("HYMT_VK_NOCM") != "1";
-        string cmVar = Environment.GetEnvironmentVariable("HYMT_VK_GEMMV") ?? "g28";
-        _gVar = useCm && cmVar.StartsWith("g");
+        // Cooperative-matrix subgroup size the device can guarantee: sg16 (Intel
+        // Xe) or sg32 (NVIDIA/AMD); requiredSubgroupSize must lie in [min, max].
+        int cmSg = _dev.CoopMatrix && _dev.SubgroupSizeControl
+            ? (_dev.SubgroupMin <= 16 && _dev.SubgroupMax >= 16 ? 16
+            : _dev.SubgroupMin <= 32 && _dev.SubgroupMax >= 32 ? 32 : 0)
+            : 0;
+        bool useCm = cmSg != 0 && Environment.GetEnvironmentVariable("HYMT_VK_NOCM") != "1";
+        if (Environment.GetEnvironmentVariable("HYMT_VK_DEBUG") == "1")
+            Console.Error.WriteLine($"vk-dbg cmSg={cmSg} useCm={useCm} coop={_dev.CoopMatrix} sgc={_dev.SubgroupSizeControl} sgMin={_dev.SubgroupMin} sgMax={_dev.SubgroupMax}");
+        string cmVar = cmSg == 32
+            ? (Environment.GetEnvironmentVariable("HYMT_VK_GEMMV32") ?? "sg32")
+            : (Environment.GetEnvironmentVariable("HYMT_VK_GEMMV") ?? "g28");
+        _gVar = useCm && (cmSg == 32 || cmVar.StartsWith("g"));
         _pfGemmTM = useCm
-            ? (int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_GEMMTM"), out int tm) ? tm : 512)
+            ? (int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_GEMMTM"), out int tm) ? tm : (cmSg == 32 ? 64 : 512))
             : 128;
         _pfGemmTN = useCm
-            ? (int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_GEMMTN"), out int tn) ? tn : 64)
+            ? (int.TryParse(Environment.GetEnvironmentVariable("HYMT_VK_GEMMTN"), out int tn) ? tn : (cmSg == 32 ? 64 : 64))
             : 128;
         try
         {
             _pPfGemm = useCm
                 ? _dev.NewPipeline(_dev.NewShaderModule(LoadSpv(
-                    Environment.GetEnvironmentVariable("HYMT_VK_F16ACC") == "1" ? "pf_gemm_cm_f16"
+                    cmSg == 32 ? "pf_gemm_cm_" + cmVar
+                    : Environment.GetEnvironmentVariable("HYMT_VK_F16ACC") == "1" ? "pf_gemm_cm_f16"
                     : "pf_gemm_cm_" + cmVar)),
-                    4, 16, requiredSubgroupSize: 16)
+                    4, 16, requiredSubgroupSize: (uint)cmSg)
                 : Mk("pf_gemm", bindings: 4, pushBytes: 16);
-            _pPfRmsX = _gVar ? Mk("pf_rms16", bindings: 3, pushBytes: 16) : _pPfRms;
-            _pPfKvPrep = Mk("pf_kvprep", bindings: 5, pushBytes: 32);
-            _pPfAttn = Mk(_gVar ? "pf_attn16" : "pf_attn", bindings: 6, pushBytes: 36);
-            _pPfSilu = Mk(_gVar ? "pf_silumul16" : "pf_silumul", bindings: 2, pushBytes: 8);
-            _pfFastAttn = _gVar && useCm && Environment.GetEnvironmentVariable("HYMT_VK_NOFASTATTN") != "1";
+            // sg32 (NVIDIA/AMD): glslc-compiled fp16+subgroup shaders produce no
+            // output there — the *_sg32 variants are the same sources rebuilt
+            // with glslang. Intel sg16 keeps the committed glslc SPIR-V.
+            _pPfRmsX = _gVar ? Mk(cmSg == 32 ? "pf_rms16_sg32" : "pf_rms16", bindings: 3, pushBytes: 16) : _pPfRms;
+            _pPfKvPrep = Mk(_gVar && cmSg == 32 ? "pf_kvprep_sg32" : "pf_kvprep", bindings: 5, pushBytes: 32);
+            _pPfAttn = Mk(_gVar ? (cmSg == 32 ? "pf_attn16_sg32" : "pf_attn16") : "pf_attn", bindings: 6, pushBytes: 36);
+            _pPfSilu = Mk(_gVar ? (cmSg == 32 ? "pf_silumul16_sg32" : "pf_silumul16") : "pf_silumul", bindings: 2, pushBytes: 8);
+            // coopmat attention (qk/pv) has no sg32 variant yet — scalar attn16 path.
+            _pfFastAttn = _gVar && useCm && cmSg != 32 && Environment.GetEnvironmentVariable("HYMT_VK_NOFASTATTN") != "1";
             if (_pfFastAttn)
             {
                 _pPfQprep = Mk("pf_qprep", bindings: 4, pushBytes: 24);
-                _pPfQk = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv("pf_qk")), 3, 28, requiredSubgroupSize: 16);
+                _pPfQk = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv("pf_qk")), 3, 28, requiredSubgroupSize: (uint)cmSg);
                 _pPfSoft = Mk("pf_soft", bindings: 3, pushBytes: 16);
-                _pPfPv = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv("pf_pv")), 3, 32, requiredSubgroupSize: 16);
+                _pPfPv = _dev.NewPipeline(_dev.NewShaderModule(LoadSpv("pf_pv")), 3, 32, requiredSubgroupSize: (uint)cmSg);
             }
         }
         catch (Exception e) when (useCm)
         {
-            // e.g. sg32 devices (NVIDIA) reject requiredSubgroupSize=16 even with
-            // VK_EXT_subgroup_size_control — fall back to the scalar GEMM path.
+            // Unsupported requiredSubgroupSize, missing SPV variant, or rejected
+            // coopmat shapes — fall back to the scalar GEMM path.
             Console.Error.WriteLine($"[vk] coopmat pipeline failed ({e.Message}) — scalar pf_gemm fallback");
             useCm = false; _gVar = false; _pfFastAttn = false;
             _pfGemmTM = _pfGemmTN = 128;
@@ -745,7 +758,18 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         int qkvDim = qDim + 2 * _kvStride;
         long last = seq - 1;
         BinRow("pfx", _pfX, last * hidden, hidden);
-        BinRow("pfxs", _pfXs, last * hidden, hidden);
+        if (_gVar)
+        {
+            _pfXs.Invalidate((ulong)(last * hidden * 2), (ulong)(hidden * 2));
+            ushort* h16 = (ushort*)_pfXs.Map() + last * hidden;
+            using (var fs = File.Create("vk_pfxs.bin"))
+            using (var bw = new BinaryWriter(fs))
+            {
+                for (int i = 0; i < hidden; i++) bw.Write((float)BitConverter.UInt16BitsToHalf(h16[i]));
+            }
+            _pfXs.Unmap();
+        }
+        else BinRow("pfxs", _pfXs, last * hidden, hidden);
         BinRow("pfqkv", _pfQkv, last * qkvDim, qkvDim);
         BinRow("pfao", _pfAo, last * qDim, qDim);
         BinRow("pfgu", _pfGu, last * 2 * ffn, 2 * ffn);

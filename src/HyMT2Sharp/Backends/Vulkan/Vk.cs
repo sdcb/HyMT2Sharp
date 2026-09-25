@@ -111,12 +111,12 @@ internal static unsafe partial class Vk
         public uint MinImageTransferGranularityX, MinImageTransferGranularityY, MinImageTransferGranularityZ;
     }
 
-    /// <summary>VkPhysicalDeviceFeatures as raw uint[61]; shaderInt16 is index 48.</summary>
+    /// <summary>VkPhysicalDeviceFeatures as raw uint[55]; shaderInt16 is index 41.</summary>
     [StructLayout(LayoutKind.Sequential)]
     public struct VkPhysicalDeviceFeatures
     {
-        public fixed uint F[61];
-        public uint ShaderInt16 { get => F[48]; set => F[48] = value; }
+        public fixed uint F[55];
+        public uint ShaderInt16 { get => F[41]; set => F[41] = value; }
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -131,6 +131,14 @@ internal static unsafe partial class Vk
     {
         public uint SType; public void* PNext;
         public uint StorageBuffer16BitAccess, UniformAndStorageBuffer16BitAccess, StoragePushConstant16, StorageInputOutput16;
+    }
+
+    // VK_KHR_shader_float16_int8 (Vulkan 1.2: shaderFloat16/shaderInt8)
+    [StructLayout(LayoutKind.Sequential)]
+    public struct VkPhysicalDeviceShaderFloat16Int8Features
+    {
+        public uint SType; public void* PNext;
+        public uint ShaderFloat16, ShaderInt8;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -333,6 +341,7 @@ internal static unsafe partial class Vk
     [LibraryImport(LibName)] public static partial void vkGetPhysicalDeviceProperties2(IntPtr device, VkPhysicalDeviceProperties2* props);
     [LibraryImport(LibName)] public static partial void vkGetPhysicalDeviceMemoryProperties(IntPtr device, VkPhysicalDeviceMemoryProperties* props);
     [LibraryImport(LibName)] public static partial void vkGetPhysicalDeviceQueueFamilyProperties(IntPtr device, uint* count, VkQueueFamilyProperties* props);
+    [LibraryImport(LibName)] public static partial void vkGetPhysicalDeviceFeatures(IntPtr device, VkPhysicalDeviceFeatures* features);
     [LibraryImport(LibName)] public static partial void vkGetPhysicalDeviceFeatures2(IntPtr device, VkPhysicalDeviceFeatures2* features);
     [LibraryImport(LibName)] public static partial VkResult vkCreateDevice(IntPtr physicalDevice, VkDeviceCreateInfo* ci, void* alloc, out IntPtr device);
     [LibraryImport(LibName)] public static partial void vkDestroyDevice(IntPtr device, void* alloc);
@@ -446,6 +455,7 @@ internal static class VkConst
     public const uint QueueFamilyIgnored = 0xFFFFFFFFu;
     public const uint StPhysicalDeviceFeatures2 = 49;
     public const uint StPhysicalDevice16BitStorageFeatures = 1000083000u;
+    public const uint StPhysicalDeviceShaderFloat16Int8Features = 1000082000u;
     public const uint StPhysicalDeviceCooperativeMatrixFeaturesKHR = 1000506000u;
     public const uint StCooperativeMatrixPropertiesKHR = 1000506001u;
     public const uint StPhysicalDeviceSubgroupSizeControlPropertiesEXT = 1000225000u;
