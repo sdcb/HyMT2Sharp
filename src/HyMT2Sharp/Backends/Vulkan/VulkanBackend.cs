@@ -845,7 +845,8 @@ public sealed unsafe class VulkanBackend : IComputeBackend
             GgmlTensorType t = _wtype["output.weight"];
             VkPipeline p = t == GgmlTensorType.Q4_K ? _pGemv4
                 : t == GgmlTensorType.Q8_0 ? _pGemv8
-                : _pGemv6;
+                : t == GgmlTensorType.Q6_K ? _pGemv6
+                : throw new NotSupportedException($"logits gemv output.weight: {t} unsupported on Vulkan — use --backend cpu");
             var s = t == GgmlTensorType.Q4_K
                 ? PfSet(p, W("output.weight"), _normed, _logitsBuf, W("output.weight"))
                 : PfSet(p, W("output.weight"), _normed, _logitsBuf);
