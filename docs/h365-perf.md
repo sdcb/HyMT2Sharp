@@ -91,6 +91,35 @@
 - 与 3080 Ti 上「HyMT2Sharp prefill 反超 CUDA llama.cpp 1.04–1.18×」相反：880M 上 llama.cpp Vulkan 全面领先约 1.1–1.5×。880M 原生 subgroup=64（wave64），sg32 coopmat 管线在 RDNA 上拿不到 NVIDIA 上的收益；llama.cpp 的 coopmat kernel 按设备 warp size 自适应，更贴合 wave64。
 - Q8_0 prefill 差距最大（0.65×）：Q8 是我们管线里 unpack 成本最高的格式，wave64 下访存粒度错配被放大，列为后续调优项。
 
+### 5.3 Vulkan 调优后（AMD 专属默认路径）
+
+改动（tile 按 `vendorId == 0x1002` 分发；`_sr` 按 subgroup 能力分发——`subgroupSize>=16 && SHUFFLE 运算` 即默认启用，三家实测均正确且更快；`HYMT_VK_NOSR=1` / `HYMT_VK_T32` 可回退）：
+
+1. **prefill GEMM 分角色选 tile**（AMD only）：sg32 下 GU/DOWN（大 N）改用 `pf_gemm_t32_64x128_32x32`，QKV/WO 保持 `64x64_32x32`。880M 实测 tile 扫描 11 个变体后得出的最优组合——RDNA 上 fat-N tile（每 WG 更多 accum 寄存器压力被 wave64 摊薄）优于加 WG 数。
+2. **Q8_0 例外**：64x128 对 Q8 反而回退（gu GEMM 276ms vs 208ms @64x64），按主量化类型自动保持 64x64。
+3. **decode GEMV 尾部归约改为 subgroup xor-shuffle**（`*_sr.spv`，`-DSR_RED`，11 个 decode shader 全量）：原实现为 5 次 barrier 的 shared-mem 树形归约（256 线程），改为 4 次 `subgroupShuffleXor`——在每个对齐的 16-lane 簇内数学等价，sg16/sg32/sg64 均正确。实测收益：AMD sg64 +2–8%、Intel sg16 +2.8–4.9%、NVIDIA sg32 +1.7%（3080 Ti 复测）。
+
+同日 A/B（orig = `HYMT_VK_NOSR=1` + `HYMT_VK_T32=64x64_32x32`，即调优前语义）：
+
+| 量化              | orig pp / tg        | 调优 pp / tg         | prefill Δ | decode Δ |
+| ----------------- | ------------------: | -------------------: | --------: | -------: |
+| Q1.25 / STQ1_0    |   1257.19 / 89.94   |   **1369.76 / 90.04** |  +9.0%   |   +0.1%  |
+| Q2_0C             |   1240.50 / 85.11   |   **1315.85 / 89.64** |  +6.1%   |   +5.3%  |
+| Q4_K_M            |   1200.90 / 61.30   |   **1297.19 / 62.90** |  +8.0%   |   +2.6%  |
+| Q6_K              |   1173.35 / 44.51   |   **1240.92 / 48.28** |  +5.8%   |   +8.5%  |
+| Q8_0              |   1096.50 / 41.32   |   **1091.89 / 42.01** |  −0.4%   |   +1.7%  |
+
+对 llama.cpp Vulkan（同 5.2 节数值）：
+
+| 量化   | prefill 比值（调优前 → 后） | decode 比值（调优前 → 后） |
+| ------ | --------------------------: | -------------------------: |
+| Q4_K_M |   0.81× → **0.96×**        |   0.82× → **0.85×**        |
+| Q6_K   |   0.88× → **1.03×**        |   0.79× → **0.86×**        |
+| Q8_0   |   0.65× → **0.79×**        |   0.84× → **0.87×**        |
+
+- Prefill 已追平 llama.cpp Vulkan（Q6 反超，Q4 差距收敛到 4%）；decode 仍有 13–15% 差距，主要来自未动的 shared-mem 归约之外的访存结构，以及 output.weight GEMV（~15% decode 时间）——留作后续。
+- 880M 功耗/热约束下相邻两次运行 prefill 波动 ±8%（如 Q8 orig 1074 vs 1096），上表为同日交错 A/B 的代表值。
+
 ## 6. 复现
 
 ```powershell

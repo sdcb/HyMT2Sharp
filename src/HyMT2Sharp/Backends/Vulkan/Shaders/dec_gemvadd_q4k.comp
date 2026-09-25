@@ -1,6 +1,9 @@
 #version 450
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_16bit_storage : require
+#ifdef SR_RED
+#extension GL_KHR_shader_subgroup_shuffle : require
+#endif
 
 // y[row] += Wq4k[row,:] dot xv, 16 rows/WG, 16 lanes/row (llama.cpp q4k mapping).
 // Same body as dec_prekv's q4k branch but accumulates into a residual vector.
@@ -68,6 +71,15 @@ void main()
         acc += dot(by232, vec4(smB.z) * q64h - vec4(smB.w));
     }
 
+#ifdef SR_RED
+    // per-row sum over each aligned 16-lane group: xor-shuffles stay inside
+    // the subgroup for both sg32 and sg64 — no barrier, no shared traffic.
+    acc += subgroupShuffleXor(acc, 8u);
+    acc += subgroupShuffleXor(acc, 4u);
+    acc += subgroupShuffleXor(acc, 2u);
+    acc += subgroupShuffleXor(acc, 1u);
+    if (itid == 0u && valid) y[row] += acc;
+#else
     red[tid] = acc;
     barrier();
     if (itid < 8u) red[tid] += red[tid + 8u];
@@ -79,4 +91,5 @@ void main()
     if (itid < 1u) red[tid] += red[tid + 1u];
     barrier();
     if (itid == 0u && valid) y[row] += red[tid];
+#endif
 }

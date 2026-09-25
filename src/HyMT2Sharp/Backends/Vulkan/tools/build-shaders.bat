@@ -43,6 +43,18 @@ rem name pf_gemm_t32_{BM}x{BN}_{WM}x{WN}[_k{BK}] (HYMT_VK_T32[_QKV|_WO|_GU|_DOWN
 rem pf_fa32 = GQA-grouped two-pass causal attention; pf_addrms16 = split-K
 rem partial fold + rmsnorm. glslang only (same fp16+subgroup glslc issue).
 "%GLSLANG%" -V --target-env vulkan1.1 -S comp -DBM=64 -DBN=64 -DWM=32 -DWN=32 -DBK=32 "%DIR%\pf_gemm_t32.comp" -o "%DIR%\pf_gemm_t32_64x64_32x32.spv" || exit /b 1
+rem 64x128 tile: AMD default for the big-N FFN GEMMs (gu/down) on non-Q8 models
+rem (Radeon 880M measured; auto-selected by VulkanBackend on vendorId 0x1002).
+"%GLSLANG%" -V --target-env vulkan1.1 -S comp -DBM=64 -DBN=128 -DWM=32 -DWN=32 -DBK=32 "%DIR%\pf_gemm_t32.comp" -o "%DIR%\pf_gemm_t32_64x128_32x32.spv" || exit /b 1
 "%GLSLANG%" -V --target-env vulkan1.1 -S comp "%DIR%\pf_fa32.comp" -o "%DIR%\pf_fa32.spv" || exit /b 1
 "%GLSLANG%" -V --target-env vulkan1.1 -S comp "%DIR%\pf_addrms16.comp" -o "%DIR%\pf_addrms16.spv" || exit /b 1
+
+rem *_sr decode variants: same .comp sources with -DSR_RED, replacing the
+rem 5-barrier shared-memory tail reduction with subgroup xor-shuffles (exact
+rem within each aligned 16-lane cluster, sg16/sg32/sg64 safe). Default on any
+rem device with subgroupSize>=16 + SHUFFLE op; HYMT_VK_NOSR=1 off, _SR=1 forces.
+for %%f in (dec_prekv dec_preffn dec_ffngu dec_gemvadd_q4k dec_gemvadd_q6k dec_gemvadd_q8 dec_gemvadd_q2c dec_gemvadd_stq q4k_gemv3 q6k_gemv2 q8_gemv) do (
+    echo glslang %%~nxf_sr
+    "%GLSLANG%" -V --target-env vulkan1.1 -S comp -DSR_RED "%DIR%\%%f.comp" -o "%DIR%\%%f_sr.spv" || exit /b 1
+)
 echo done.

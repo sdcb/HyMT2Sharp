@@ -80,6 +80,16 @@ internal static unsafe partial class Vk
     }
 
     [StructLayout(LayoutKind.Sequential)]
+    public struct VkPhysicalDeviceSubgroupProperties
+    {
+        public uint SType; public void* PNext;
+        public uint SubgroupSize;
+        public uint SupportedStages;       // VkShaderStageFlags
+        public uint SupportedOperations;   // VkSubgroupFeatureFlags
+        public uint QuadOperationsInAllStages;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
     public struct VkMemoryType { public uint PropertyFlags; public uint HeapIndex; }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -458,6 +468,7 @@ internal static class VkConst
     public const uint StPhysicalDeviceShaderFloat16Int8Features = 1000082000u;
     public const uint StPhysicalDeviceCooperativeMatrixFeaturesKHR = 1000506000u;
     public const uint StCooperativeMatrixPropertiesKHR = 1000506001u;
+    public const uint StPhysicalDeviceSubgroupProperties = 1000094000u;
     public const uint StPhysicalDeviceSubgroupSizeControlPropertiesEXT = 1000225000u;
     public const uint StPhysicalDeviceSubgroupSizeControlFeaturesEXT = 1000225002u;
     public const uint StPhysicalDeviceProperties2 = 1000059000u;
