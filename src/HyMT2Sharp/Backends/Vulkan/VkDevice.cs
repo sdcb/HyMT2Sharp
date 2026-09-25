@@ -155,8 +155,8 @@ internal unsafe sealed class VkDevice : IDisposable
         };
         if (Environment.GetEnvironmentVariable("HYMT_VK_DEBUG") == "1")
             Console.Error.WriteLine($"vk-dbg coop={d.CoopMatrix} sgc={hasSgc} sgMin={d.SubgroupMin} sgMax={d.SubgroupMax} push={hasPush} f16={d.ShaderFloat16}");
-        s16en.PNext = &f16en;
         f16en.PNext = d.CoopMatrix ? &coopEn : hasSgc ? &sgcEn : null;
+        s16en.PNext = hasF16Int8 && d.ShaderFloat16 ? &f16en : f16en.PNext;
         coopEn.PNext = hasSgc ? &sgcEn : null;
         Vk.VkPhysicalDeviceFeatures feats = new();
         if (d.Storage16Bit) feats.ShaderInt16 = 1;
