@@ -45,7 +45,7 @@ jobs:
         run: |
           ./src/HyMT2Sharp.Benchmark/bin/Release/net10.0/Sdcb.HyMT2Sharp.Benchmark \
             --model Hy-MT2-1.8B-1.25Bit.gguf --backend metal \
-            --bench-prefill 512 --bench-decode 128 --threads 4
+            --bench-prefill 512 --bench-decode 128 --threads 0
 
       - name: Bench Metal hybrid (CPU prefill + GPU decode)
         continue-on-error: true
@@ -54,13 +54,13 @@ jobs:
         run: |
           ./src/HyMT2Sharp.Benchmark/bin/Release/net10.0/Sdcb.HyMT2Sharp.Benchmark \
             --model Hy-MT2-1.8B-1.25Bit.gguf --backend metal \
-            --bench-prefill 512 --bench-decode 128 --threads 4
+            --bench-prefill 512 --bench-decode 128 --threads 0
 
       - name: Bench CPU backend (comparison)
         run: |
           ./src/HyMT2Sharp.Benchmark/bin/Release/net10.0/Sdcb.HyMT2Sharp.Benchmark \
             --model Hy-MT2-1.8B-1.25Bit.gguf --backend cpu \
-            --bench-prefill 512 --bench-decode 128 --threads 4
+            --bench-prefill 512 --bench-decode 128 --threads 0
 
       - name: CLI smoke (Metal hybrid)
         continue-on-error: true
