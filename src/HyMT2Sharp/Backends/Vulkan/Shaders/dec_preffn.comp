@@ -34,6 +34,12 @@ shared float gu[512];
 #define SB(arr, off)  ((arr[(off) >> 2] >> (((off) & 3u) << 3)) & 0xFFu)
 #define S8(arr, off)  int((int((arr[(off) >> 2] >> (((off) & 3u) << 3)) & 0xFFu) << 24) >> 24)
 
+const uint STQ_CB[32] = uint[](
+    0xA9u, 0x89u, 0x29u, 0x09u, 0xA6u, 0x86u, 0x26u, 0x06u,
+    0x9Au, 0x92u, 0x1Au, 0x12u, 0x6Au, 0x62u, 0x4Au, 0x42u,
+    0x01u, 0x21u, 0x81u, 0xA1u, 0x04u, 0x24u, 0x84u, 0xA4u,
+    0x10u, 0x18u, 0x90u, 0x98u, 0x40u, 0x48u, 0x60u, 0x68u);
+
 #define X4(i) xs4[i]
 #define SX(i) (xs4[i].x + xs4[i].y + xs4[i].z + xs4[i].w)
 
@@ -136,6 +142,18 @@ shared float gu[512];
 
 #define GEMV_Q8(arr, rl, rlRow, bpr, itid, comp, accOut) {     uint blk8 = (itid) >> 1;     uint half8 = ((itid) & 1u) << 4;     uint xoff = (blk8 << 3) + (half8 >> 2);     float _acc = 0.0f;     uint _rb = (rlRow) * (bpr) * 272u;     for (uint blk = 0u; blk < (bpr); blk++) {         uint bb = _rb + blk * 272u + blk8 * 34u;         float d = unpackHalf2x16(R16(arr, bb)).x;         uint qb = bb + 2u + half8;         uint q0 = R32(arr, qb), q1 = R32(arr, qb + 4u), q2 = R32(arr, qb + 8u), q3 = R32(arr, qb + 12u);         vec4 v0 = vec4(float(int(q0 << 24) >> 24), float(int(q0 << 16) >> 24), float(int(q0 << 8) >> 24), float(int(q0) >> 24));         vec4 v1 = vec4(float(int(q1 << 24) >> 24), float(int(q1 << 16) >> 24), float(int(q1 << 8) >> 24), float(int(q1) >> 24));         vec4 v2 = vec4(float(int(q2 << 24) >> 24), float(int(q2 << 16) >> 24), float(int(q2 << 8) >> 24), float(int(q2) >> 24));         vec4 v3 = vec4(float(int(q3 << 24) >> 24), float(int(q3 << 16) >> 24), float(int(q3 << 8) >> 24), float(int(q3) >> 24));         uint kv = (blk << 6) + xoff;         _acc += d * (dot(X4(kv), v0) + dot(X4(kv + 1u), v1) + dot(X4(kv + 2u), v2) + dot(X4(kv + 3u), v3));     }     accOut = _acc; }
 
+// Q2_0C: 130B blk = fp16 d + 2-bit qs[128] per 512 weights (2 superblocks); lane l covers
+// 16 weights = qs u32 at 2 + (blk&1)*64 + l*4; code c = (u32 >> 2k)&3 -> w = c*2-3.
+#define Q2W(q, sh) vec4(float(((q >> sh) & 3u) * 2u) - 3.0f, float(((q >> (sh + 2u)) & 3u) * 2u) - 3.0f, float(((q >> (sh + 4u)) & 3u) * 2u) - 3.0f, float(((q >> (sh + 6u)) & 3u) * 2u) - 3.0f)
+
+#define GEMV_Q2C(arr, rl, rlRow, bpr, itid, comp, accOut) {     float _acc = 0.0f;     uint _rb = (rlRow) * (bpr) * 65u;     for (uint blk = 0u; blk < (bpr); blk++) {         uint bb = _rb + (blk >> 1) * 130u;         float d = unpackHalf2x16(R16(arr, bb)).x;         uint q = R32(arr, bb + 2u + (blk & 1u) * 64u + (itid) * 4u);         uint kv = (blk << 6) + (itid) * 4u;         _acc += d * (dot(X4(kv), Q2W(q, 0u)) + dot(X4(kv + 1u), Q2W(q, 8u)) + dot(X4(kv + 2u), Q2W(q, 16u)) + dot(X4(kv + 3u), Q2W(q, 24u)));     }     accOut = _acc; }
+
+// STQ1_0: 42B blk = Qs[32] + Sign[8] + fp16 d @40 per 256 weights (= one superblock).
+// Lane l covers chunk c = l>>2, groups 4*(l&3)+j (j=0..3): slot nibble j of Qs u16
+// @8c+2i4, sign bit 4i4+j of Sign u16 @32+2c; qpack = CB[(sign<<4)|slot], lanes code-1
+// at positions group + t*16 within the chunk.
+#define GEMV_STQ(arr, rl, rlRow, bpr, itid, comp, accOut) {     uint _c = (itid) >> 2;     uint _i4 = (itid) & 3u;     float _acc = 0.0f;     uint _rb = (rlRow) * (bpr) * 42u;     for (uint blk = 0u; blk < (bpr); blk++) {         uint bb = _rb + blk * 42u;         float d = unpackHalf2x16(R16(arr, bb + 40u)).x;         uint qs = R16(arr, bb + _c * 8u + _i4 * 2u);         uint sg = R16(arr, bb + 32u + _c * 2u);         uint qp0 = STQ_CB[(((sg >> (_i4 * 4u + 0u)) & 1u) << 4) | ((qs >> 0u) & 0xFu)];         uint qp1 = STQ_CB[(((sg >> (_i4 * 4u + 1u)) & 1u) << 4) | ((qs >> 4u) & 0xFu)];         uint qp2 = STQ_CB[(((sg >> (_i4 * 4u + 2u)) & 1u) << 4) | ((qs >> 8u) & 0xFu)];         uint qp3 = STQ_CB[(((sg >> (_i4 * 4u + 3u)) & 1u) << 4) | ((qs >> 12u) & 0xFu)];         uint kv = (blk << 6) + _c * 16u + _i4;         _acc += d * (dot(vec4(float(int(qp0 & 3u) - 1), float(int(qp1 & 3u) - 1), float(int(qp2 & 3u) - 1), float(int(qp3 & 3u) - 1)), X4(kv)) +                      dot(vec4(float(int((qp0 >> 2u) & 3u) - 1), float(int((qp1 >> 2u) & 3u) - 1), float(int((qp2 >> 2u) & 3u) - 1), float(int((qp3 >> 2u) & 3u) - 1)), X4(kv + 4u)) +                      dot(vec4(float(int((qp0 >> 4u) & 3u) - 1), float(int((qp1 >> 4u) & 3u) - 1), float(int((qp2 >> 4u) & 3u) - 1), float(int((qp3 >> 4u) & 3u) - 1)), X4(kv + 8u)) +                      dot(vec4(float(int((qp0 >> 6u) & 3u) - 1), float(int((qp1 >> 6u) & 3u) - 1), float(int((qp2 >> 6u) & 3u) - 1), float(int((qp3 >> 6u) & 3u) - 1)), X4(kv + 12u)));     }     accOut = _acc; }
+
 void main()
 {
     uint tid = gl_LocalInvocationID.x;
@@ -165,10 +183,14 @@ void main()
     float accG = 0.0f, accU = 0.0f;
     if (pc.tg == 0u)      GEMV_Q4K(wg, rowLane, r, bpr, itid, xy, accG)
     else if (pc.tg == 1u) GEMV_Q6K(wg, rowLane, r, bpr, itid, xy, accG)
-    else                  GEMV_Q8(wg, rowLane, r, bpr, itid, xy, accG)
+    else if (pc.tg == 2u) GEMV_Q8(wg, rowLane, r, bpr, itid, xy, accG)
+    else if (pc.tg == 3u) GEMV_Q2C(wg, rowLane, r, bpr, itid, xy, accG)
+    else                  GEMV_STQ(wg, rowLane, r, bpr, itid, xy, accG)
     if (pc.tu == 0u)      GEMV_Q4K(wu, rowLane, r, bpr, itid, zw, accU)
     else if (pc.tu == 1u) GEMV_Q6K(wu, rowLane, r, bpr, itid, zw, accU)
-    else                  GEMV_Q8(wu, rowLane, r, bpr, itid, zw, accU)
+    else if (pc.tu == 2u) GEMV_Q8(wu, rowLane, r, bpr, itid, zw, accU)
+    else if (pc.tu == 3u) GEMV_Q2C(wu, rowLane, r, bpr, itid, zw, accU)
+    else                  GEMV_STQ(wu, rowLane, r, bpr, itid, zw, accU)
 
     red[tid] = accG;
     gu[tid] = accU;
