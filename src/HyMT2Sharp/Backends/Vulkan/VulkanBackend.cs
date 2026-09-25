@@ -116,11 +116,12 @@ public sealed unsafe class VulkanBackend : IComputeBackend
         // subgroup xor-shuffles — equivalent within each aligned 16-lane cluster
         // on sg16/32/64 (verified +1.7% on NVIDIA sg32, +2.8-4.9% on Intel sg16,
         // +2-8% on AMD wave64). Only requirement: subgroup >= 16 lanes and the
-        // SHUFFLE op in compute — a <16-lane subgroup would straddle clusters.
+        // SHUFFLE op in compute — a non-multiple-of-16 subgroup would straddle
+        // clusters (all real hardware uses powers of two, so >=16 suffices).
         // HYMT_VK_NOSR=1 keeps the original path; HYMT_VK_SR=1 forces it on.
         const uint SubgroupShuffle = 0x10u, StageCompute = 0x20u;
         bool useSr = Environment.GetEnvironmentVariable("HYMT_VK_NOSR") != "1"
-            && ((_dev.SubgroupSize >= 16
+            && ((_dev.SubgroupSize >= 16 && _dev.SubgroupSize % 16 == 0
                  && (_dev.SubgroupOps & SubgroupShuffle) != 0
                  && (_dev.SubgroupStages & StageCompute) != 0)
                 || Environment.GetEnvironmentVariable("HYMT_VK_SR") == "1");
