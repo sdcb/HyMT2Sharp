@@ -1,0 +1,19 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+// x[m,:] = fp16 embed table row tok[m] -> fp32. One WG per token position.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer E { float16_t e[]; };
+layout(set = 0, binding = 1) readonly buffer T { int tok[]; };
+layout(set = 0, binding = 2) writeonly buffer X { float x[]; };
+
+layout(push_constant) uniform PC { uint hidden; } p;
+
+void main()
+{
+    uint m = gl_WorkGroupID.x;
+    uint src = uint(tok[m]) * p.hidden;
+    for (uint i = gl_LocalInvocationID.x; i < p.hidden; i += 256u)
+        x[m * p.hidden + i] = float(e[src + i]);
+}

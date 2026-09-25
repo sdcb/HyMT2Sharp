@@ -1,0 +1,86 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// C[M,N] = X[M,K](fp32) * W[N,K](fp16)^T (+ R[M,N] fp32 when flags&1).
+// WG tile 128x128, 128 threads = 8 subgroups(sg16). Each subgroup owns a
+// 16x128 strip = 2x8 accumulators of coopmat 8x16 f32.
+// Shared tiles stored as f16vec4 (vec4 index/stride units for coopMatLoad).
+// Staging: thread t stages row t (4 vec4 each side), fp32->f16 for X.
+// Variants measured on B580: scalar staging 2185, BK=64 1389, BK=32 vec4 1783,
+// double-buffer 4129, W-from-SSBO 3702, 256x128 tile 882 — this wins.
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer X { vec4 x[]; };
+layout(set = 0, binding = 1) readonly buffer W { f16vec4 w[]; };
+layout(set = 0, binding = 2) readonly buffer R { float r[]; };
+layout(set = 0, binding = 3) buffer C { float c[]; };
+
+layout(push_constant) uniform PC { uint mDim; uint nDim; uint kDim; uint flags; } p;
+
+const uint BM = 128u, BN = 128u, BK = 16u;      // BK in scalar elems
+shared f16vec4 xs[BM * (BK / 4)];  // [m][k/4]
+shared f16vec4 ws[BN * (BK / 4)];  // [n][k/4]
+shared float16_t stage[8 * 8 * 16]; // per-sg acc staging (f16 acc)
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint m0 = gl_WorkGroupID.x * BM;
+    uint n0 = gl_WorkGroupID.y * BN;
+    uint sg = gl_SubgroupID;             // real subgroup id (requiredSubgroupSize=16)
+    uint lane = gl_SubgroupInvocationID;
+
+    coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc[2][8];
+    for (uint i = 0u; i < 2u; i++)
+        for (uint j = 0u; j < 8u; j++)
+            acc[i][j] = coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0f);
+
+    uint kv = p.kDim >> 2;               // kDim in vec4 units
+    uint gm = m0 + tid, gn = n0 + tid;
+    for (uint kb = 0u; kb < kv; kb += BK / 4u) {
+        // stage: thread t -> shared row t (4 vec4 each side)
+        for (uint l = 0u; l < 4u; l++)
+            xs[tid * 4u + l] = (gm < p.mDim) ? f16vec4(x[gm * kv + kb + l]) : f16vec4(0.0);
+        for (uint l = 0u; l < 4u; l++)
+            ws[tid * 4u + l] = (gn < p.nDim) ? w[gn * kv + kb + l] : f16vec4(0.0);
+        barrier();
+
+        coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> ma[2];
+        coopMatLoad(ma[0], xs, (sg * 16u) * 4u, 4u, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(ma[1], xs, (sg * 16u + 8u) * 4u, 4u, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint j = 0u; j < 8u; j++) {
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb;
+            coopMatLoad(mb, ws, (j * 16u) * 4u, 4u, gl_CooperativeMatrixLayoutColumnMajor);
+            acc[0][j] = coopMatMulAdd(ma[0], mb, acc[0][j]);
+            acc[1][j] = coopMatMulAdd(ma[1], mb, acc[1][j]);
+        }
+        barrier();
+    }
+
+    // store: stage accs to shared, then scalar scatter with bounds + residual
+    bool hasR = (p.flags & 1u) != 0u;
+    for (uint i = 0u; i < 2u; i++) {
+        for (uint j = 0u; j < 8u; j++) {
+            coopMatStore(acc[i][j], stage, sg * 128u, 8u, gl_CooperativeMatrixLayoutColumnMajor);
+            barrier();
+            uint rm = sg * 16u + i * 8u;   // m within tile
+            uint cn = j * 16u;             // n within tile
+            for (uint l = 0u; l < 8u; l++) {           // 128 elems / 16 lanes = 8 each
+                uint e = lane * 8u + l;
+                uint mm = e >> 4, nn = e & 15u;
+                uint gmr = m0 + rm + mm;
+                uint gnc = n0 + cn + nn;
+                if (gmr < p.mDim && gnc < p.nDim) {
+                    uint idx = gmr * p.nDim + gnc;
+                    c[idx] = hasR ? (r[idx] + float(stage[sg * 128u + nn * 8u + mm])) : float(stage[sg * 128u + nn * 8u + mm]);
+                }
+            }
+            barrier();
+        }
+    }
+}

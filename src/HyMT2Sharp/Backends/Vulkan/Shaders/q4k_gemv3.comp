@@ -1,0 +1,108 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+// Q4_K GEMV v5: llama.cpp mul_mat_vec thread mapping. 16 rows/WG, 16 lanes/row.
+// Lane (il=itid/4, ir=itid%4): v_im=il/2, v_in=il%2, l0=4*(2*ir+v_in).
+// Covers quads at elems {64*v_im+l0, +32, +128, +160} — both nibbles of each
+// byte are consumed, so each qs byte is read once (half the L1 traffic of v4).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer XV { vec4 xv[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC { uint in_dim; uint out_dim; } p;
+
+shared vec2 sf[16 * 64];      // sf[rowLane][gi], gi = 32-elem group in row
+shared float red[256];
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint bpr = p.in_dim >> 8;
+
+    uint ng = p.in_dim >> 5;
+    for (uint e = tid; e < 16u * ng; e += 256u) {
+        uint rl = e / ng;
+        uint gi = e % ng;
+        uint row = gl_WorkGroupID.x * 16u + rl;
+        if (row >= p.out_dim) continue;
+        uint bp = (row * bpr + (gi >> 3)) * 36u;
+        uint gi7 = gi & 7u;
+        uint s0 = w[bp + 1u], s1 = w[bp + 2u], s2 = w[bp + 3u];
+        uint sc, mn;
+        if (gi7 < 4u) {
+            sc = (s0 >> (gi7 * 8u)) & 63u;
+            mn = (s1 >> (gi7 * 8u)) & 63u;
+        } else {
+            uint g4 = gi7 - 4u;
+            sc = ((s2 >> (g4 * 8u)) & 15u) | (((s0 >> (g4 * 8u + 6u)) & 3u) << 4u);
+            mn = ((s2 >> (g4 * 8u + 4u)) & 15u) | (((s1 >> (g4 * 8u + 6u)) & 3u) << 4u);
+        }
+        vec2 dm = unpackHalf2x16(w[bp]);
+        sf[rl * 64u + gi] = vec2(dm.x * float(sc), dm.y * float(mn));
+    }
+    barrier();
+
+    uint rowLane = tid >> 4;
+    uint itid = tid & 15u;
+    uint row = gl_WorkGroupID.x * 16u + rowLane;
+    bool valid = row < p.out_dim;
+    uint rowBase = (valid ? row : 0u) * bpr * 36u;
+
+    uint il = itid >> 2;               // 0..3
+    uint ir = itid & 3u;               // 0..3
+    uint v_im = il >> 1;               // 0..1
+    uint v_in = il & 1u;               // 0..1
+    uint l0 = ((2u * ir + v_in) << 2); // 0..60 step 4
+    uint qw  = (v_im << 5) + l0;       // qs byte offset
+    uint xbase = (v_im << 4) + (l0 >> 2); // x vec4 index offset
+    uint gA = 2u * v_im;               // group idx within block for elems 64*v_im+l0
+
+    float acc = 0.0f;
+    for (uint blk = 0; blk < bpr; blk++) {
+        uint bp = rowBase + blk * 36u;
+        uint qs0 = w[bp + 4u + (qw >> 2)];
+        uint qs64 = w[bp + 4u + (qw >> 2) + 16u];
+
+        vec4 smA = vec4(sf[rowLane * 64u + (blk << 3) + gA],
+                        sf[rowLane * 64u + (blk << 3) + gA + 1u]);
+        vec4 smB = vec4(sf[rowLane * 64u + (blk << 3) + gA + 4u],
+                        sf[rowLane * 64u + (blk << 3) + gA + 5u]);
+        // smA = (dscA, dmnA, dscB, dmnB): groups gA (y1 lo), gA+1 (y1+32 hi)
+        // smB = same for groups gA+4 (y2 lo), gA+5 (y2+32 hi)
+
+        uint kv = (blk << 6) + xbase;
+        vec4 by10  = xv[kv];
+        vec4 by132 = xv[kv + 8u];
+        vec4 by20  = xv[kv + 32u];
+        vec4 by232 = xv[kv + 40u];
+
+        vec4 q0l = vec4(float(qs0 & 15u), float((qs0 >> 8u) & 15u),
+                        float((qs0 >> 16u) & 15u), float((qs0 >> 24u) & 15u));
+        vec4 q0h = vec4(float((qs0 >> 4u) & 15u), float((qs0 >> 12u) & 15u),
+                        float((qs0 >> 20u) & 15u), float(qs0 >> 28u));
+        vec4 q64l = vec4(float(qs64 & 15u), float((qs64 >> 8u) & 15u),
+                         float((qs64 >> 16u) & 15u), float((qs64 >> 24u) & 15u));
+        vec4 q64h = vec4(float((qs64 >> 4u) & 15u), float((qs64 >> 12u) & 15u),
+                         float((qs64 >> 20u) & 15u), float(qs64 >> 28u));
+
+        acc += dot(by10,  vec4(smA.x) * q0l  - vec4(smA.y));
+        acc += dot(by132, vec4(smA.z) * q0h  - vec4(smA.w));
+        acc += dot(by20,  vec4(smB.x) * q64l - vec4(smB.y));
+        acc += dot(by232, vec4(smB.z) * q64h - vec4(smB.w));
+    }
+
+    red[tid] = acc;
+    barrier();
+    if (itid < 8u) red[tid] += red[tid + 8u];
+    barrier();
+    if (itid < 4u) red[tid] += red[tid + 4u];
+    barrier();
+    if (itid < 2u) red[tid] += red[tid + 2u];
+    barrier();
+    if (itid < 1u) red[tid] += red[tid + 1u];
+    barrier();
+    if (itid == 0u && valid) y[row] = red[tid];
+}

@@ -1,0 +1,23 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// h[m,i] = silu(gu[m,i]) * gu[m,i+ffnHalf]. Thread per element.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer GU { float gu[]; };
+layout(set = 0, binding = 1) writeonly buffer H { float16_t h[]; };
+
+layout(push_constant) uniform PC { uint ffnHalf; uint total; } p;
+
+void main()
+{
+    uint idx = gl_WorkGroupID.x * 256u + gl_LocalInvocationID.x;
+    if (idx >= p.total) return;
+    uint m = idx / p.ffnHalf;
+    uint i = idx - m * p.ffnHalf;
+    float g = gu[m * p.ffnHalf * 2u + i];
+    float u = gu[m * p.ffnHalf * 2u + p.ffnHalf + i];
+    h[idx] = float16_t((g / (1.0f + exp(-g))) * u);
+}

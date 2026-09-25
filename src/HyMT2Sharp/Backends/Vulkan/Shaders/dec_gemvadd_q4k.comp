@@ -1,0 +1,82 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// y[row] += Wq4k[row,:] dot xv, 16 rows/WG, 16 lanes/row (llama.cpp q4k mapping).
+// Same body as dec_prekv's q4k branch but accumulates into a residual vector.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W  { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer XV { vec4 xv[]; };
+layout(set = 0, binding = 2) buffer Y { float y[]; };
+
+layout(push_constant) uniform PC { uint in_dim; uint out_dim; } p;
+
+shared float red[256];
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint bpr = p.in_dim >> 8;
+
+    uint rowLane = tid >> 4;
+    uint itid = tid & 15u;
+    uint row = gl_WorkGroupID.x * 16u + rowLane;
+    bool valid = row < p.out_dim;
+    uint rowBase = (valid ? row : 0u) * bpr * 36u;
+
+    uint il = itid >> 2;               // 0..3
+    uint ir = itid & 3u;               // 0..3
+    uint v_im = il >> 1;               // 0..1
+    uint v_in = il & 1u;               // 0..1
+    uint l0 = ((2u * ir + v_in) << 2); // 0..60 step 4
+    uint qw  = (v_im << 5) + l0;       // qs byte offset
+    uint xbase = (v_im << 4) + (l0 >> 2); // x vec4 index offset
+    uint gA = 2u * v_im;               // group idx within block for elems 64*v_im+l0
+
+    float acc = 0.0f;
+    for (uint blk = 0; blk < bpr; blk++) {
+        uint bp = rowBase + blk * 36u;
+        uint qs0 = w[bp + 4u + (qw >> 2)];
+        uint qs64 = w[bp + 4u + (qw >> 2) + 16u];
+
+        uint s0 = w[bp + 1u], s1 = w[bp + 2u], s2 = w[bp + 3u];
+        uint sh0 = gA * 8u, sh1 = sh0 + 8u, sh2 = sh0 + 14u;
+        vec2 ddm = unpackHalf2x16(w[bp]);
+        vec4 smA = vec4(ddm.x * float((s0 >> sh0) & 63u), ddm.y * float((s1 >> sh0) & 63u),
+                        ddm.x * float((s0 >> sh1) & 63u), ddm.y * float((s1 >> sh1) & 63u));
+        vec4 smB = vec4(ddm.x * float(((s2 >> sh0) & 15u) | (((s0 >> (sh0 + 6u)) & 3u) << 4u)),
+                        ddm.y * float(((s2 >> (sh0 + 4u)) & 15u) | (((s1 >> (sh0 + 6u)) & 3u) << 4u)),
+                        ddm.x * float(((s2 >> sh1) & 15u) | (((s0 >> sh2) & 3u) << 4u)),
+                        ddm.y * float(((s2 >> (sh1 + 4u)) & 15u) | (((s1 >> sh2) & 3u) << 4u)));
+        uint kv = (blk << 6) + xbase;
+        vec4 by10  = xv[kv];
+        vec4 by132 = xv[kv + 8u];
+        vec4 by20  = xv[kv + 32u];
+        vec4 by232 = xv[kv + 40u];
+        vec4 q0l = vec4(float(qs0 & 15u), float((qs0 >> 8u) & 15u),
+                        float((qs0 >> 16u) & 15u), float((qs0 >> 24u) & 15u));
+        vec4 q0h = vec4(float((qs0 >> 4u) & 15u), float((qs0 >> 12u) & 15u),
+                        float((qs0 >> 20u) & 15u), float(qs0 >> 28u));
+        vec4 q64l = vec4(float(qs64 & 15u), float((qs64 >> 8u) & 15u),
+                         float((qs64 >> 16u) & 15u), float((qs64 >> 24u) & 15u));
+        vec4 q64h = vec4(float((qs64 >> 4u) & 15u), float((qs64 >> 12u) & 15u),
+                         float((qs64 >> 20u) & 15u), float(qs64 >> 28u));
+        acc += dot(by10,  vec4(smA.x) * q0l  - vec4(smA.y));
+        acc += dot(by132, vec4(smA.z) * q0h  - vec4(smA.w));
+        acc += dot(by20,  vec4(smB.x) * q64l - vec4(smB.y));
+        acc += dot(by232, vec4(smB.z) * q64h - vec4(smB.w));
+    }
+
+    red[tid] = acc;
+    barrier();
+    if (itid < 8u) red[tid] += red[tid + 8u];
+    barrier();
+    if (itid < 4u) red[tid] += red[tid + 4u];
+    barrier();
+    if (itid < 2u) red[tid] += red[tid + 2u];
+    barrier();
+    if (itid < 1u) red[tid] += red[tid + 1u];
+    barrier();
+    if (itid == 0u && valid) y[row] += red[tid];
+}

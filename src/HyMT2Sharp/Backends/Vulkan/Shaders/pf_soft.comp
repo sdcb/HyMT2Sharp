@@ -1,0 +1,64 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Per (head*seq) row: causal softmax over S fp32 -> normalized P fp16 (in place
+// semantics: reads S scratch, writes P scratch). Positions beyond the causal
+// length up to the enclosing 128-p-chunk are zeroed for the PV pass.
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer S { float s[]; };
+layout(set = 0, binding = 1) writeonly buffer P16 { float16_t p16[]; };
+layout(set = 0, binding = 2) readonly buffer P { int tokenId; int pos; int kvLen; int seq; } prm;
+
+layout(push_constant) uniform PC {
+    uint sRow; uint sHead; uint seq; float scale;
+} pc;
+
+shared float red[8];
+shared float se[4096];
+
+void main()
+{
+    uint row = gl_WorkGroupID.x;
+    uint tid = gl_LocalInvocationID.x;
+    uint h = row / pc.seq, m = row % pc.seq;
+    uint len = uint(prm.pos) + m + 1u;
+    uint pEnd = uint(prm.pos) + (((m >> 7) + 1u) << 7);
+    uint base = (h * pc.sHead + m) * pc.sRow;
+
+    float mx = -3.4e38f;
+    for (uint p = tid; p < len; p += 128u) mx = max(mx, s[base + p] * pc.scale);
+    float t = subgroupMax(mx);
+    if (subgroupElect()) red[gl_SubgroupID] = t;
+    barrier();
+    if (tid == 0u) {
+        float v = -3.4e38f;
+        for (uint i = 0u; i < gl_NumSubgroups; i++) v = max(v, red[i]);
+        red[0] = v;
+    }
+    barrier();
+    mx = red[0];
+
+    float sm = 0.0f;
+    for (uint p = tid; p < len; p += 128u) {
+        float e = exp(s[base + p] * pc.scale - mx);
+        se[p] = e;
+        sm += e;
+    }
+    float ts = subgroupAdd(sm);
+    if (subgroupElect()) red[gl_SubgroupID] = ts;
+    barrier();
+    if (tid == 0u) {
+        float v = 0.0f;
+        for (uint i = 0u; i < gl_NumSubgroups; i++) v += red[i];
+        red[0] = v;
+    }
+    barrier();
+    float inv = 1.0f / red[0];
+    for (uint p = tid; p < pEnd; p += 128u)
+        p16[base + p] = (p < len) ? float16_t(se[p] * inv) : float16_t(0.0);
+}

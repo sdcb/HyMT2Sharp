@@ -88,7 +88,7 @@ if (args.Contains("--dump"))
     return;
 }
 
-if (!bench && !args.Contains("--verify-prefill"))
+if (!bench && !args.Contains("--verify-prefill") && !args.Contains("--verify-decode"))
 {
     Console.WriteLine("HyMT2Sharp.Benchmark");
     Console.WriteLine("  --model PATH");
@@ -105,6 +105,7 @@ if (!bench && !args.Contains("--verify-prefill"))
     Console.WriteLine("  --dump-silu");
     Console.WriteLine("  --micro-q4 [--micro-in N --micro-out N --micro-tokens N --micro-reps N]");
     Console.WriteLine("  --micro-metal-q4   (macOS only: Q4_K Metal GEMV correctness + bandwidth)");
+    Console.WriteLine("  --micro-vk-q4/--micro-vk-q6  (Vulkan GEMV POC: correctness + GB/s, B580 target)");
     return;
 }
 
@@ -117,6 +118,11 @@ if (backendName is not null and not "cpu")
 {
     if (backendName == "metal" && RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
         backend = new Sdcb.HyMT2Sharp.Backends.Metal.MetalBackend();
+    else if (backendName == "vulkan")
+    {
+        try { backend = new Sdcb.HyMT2Sharp.Backends.Vulkan.VulkanBackend(); }
+        catch (Exception e) { Console.WriteLine($"backend vulkan init failed: {e.Message} — using cpu"); }
+    }
     else
         Console.WriteLine($"backend {backendName} unavailable here — using cpu");
 }
@@ -145,6 +151,38 @@ if (args.Contains("--verify-prefill"))
         sumSq += d * d;
     }
     Console.WriteLine($"verify-prefill tokens={count} max-abs={maxAbs:E3} rms={Math.Sqrt(sumSq / batched.Length):E3} batched-top={ArgMax(batched)} serial-top={ArgMax(serial)}");
+    return;
+}
+
+if (args.Contains("--verify-decode") && backend is not null)
+{
+    int steps = Math.Max(1, Args.GetInt(args, "--verify-decode", 16));
+    using HunyuanDenseModel refModel = new(modelPath, threads, backend: null);
+    int[] ids = new int[int.TryParse(Environment.GetEnvironmentVariable("HYMT_VSEQ"), out int vseq) ? vseq : 64];
+    for (int i = 0; i < ids.Length; i++) ids[i] = 1 + i % Math.Max(1, model.Config.VocabSize - 1);
+    model.ResetCache(); refModel.ResetCache();
+    float[] logits = model.Forward(ids);
+    float[] refLogits = refModel.Forward(ids);
+    {
+        float pfMaxAbs = 0; int pfMaxIdx = -1;
+        for (int i = 0; i < logits.Length; i++) { float d = MathF.Abs(logits[i] - refLogits[i]); if (d > pfMaxAbs) { pfMaxAbs = d; pfMaxIdx = i; } }
+        int tpa = ArgMax(logits), tpb = ArgMax(refLogits);
+        Console.WriteLine($"prefill seq={ids.Length}: max-abs={pfMaxAbs:E3}@{pfMaxIdx} gpu-top={tpa}({logits[tpa]:F2}) cpu-top={tpb}({refLogits[tpb]:F2}) cpu@gpu-top={refLogits[tpa]:F2}");
+    }
+    int next = ArgMax(refLogits);
+    int agree = 0;
+    for (int s = 0; s < steps; s++)
+    {
+        float[] a = model.Forward([next]);
+        float[] b = refModel.Forward([next]);
+        float maxAbs = 0; int maxIdx = -1;
+        for (int i = 0; i < a.Length; i++) { float d = MathF.Abs(a[i] - b[i]); if (d > maxAbs) { maxAbs = d; maxIdx = i; } }
+        int ta = ArgMax(a), tb = ArgMax(b);
+        agree += ta == tb ? 1 : 0;
+        Console.WriteLine($"step {s}: max-abs={maxAbs:E3}@{maxIdx} gpu-top={ta}({a[ta]:F2}) cpu-top={tb}({b[tb]:F2}) b@gpu-top={b[ta]:F2}");
+        next = tb;
+    }
+    Console.WriteLine($"verify-decode: top1 agree {agree}/{steps}");
     return;
 }
 
@@ -190,11 +228,14 @@ if (bench && (benchPrefill > 0 || benchDecode > 0 || args.Contains("--bench")))
     HunyuanDenseModel.ProfileEnabled = profile;
     HunyuanDenseModel.ResetProfile();
     sw.Restart();
+    bool printTok = Environment.GetEnvironmentVariable("HYMT_PRINT_TOKENS") == "1";
     for (int i = 0; i < tg; i++)
     {
         logits = model.Forward([next]);
         next = ArgMax(logits);
+        if (printTok) Console.Write($"{next} ");
     }
+    if (printTok) Console.WriteLine();
 
     double decodeMs = sw.Elapsed.TotalMilliseconds;
     double ppMean = 0;

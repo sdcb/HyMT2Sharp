@@ -1,0 +1,117 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// C[M,N] = X[M,K](fp32) * W[N,K](fp16)^T (+ R[M,N] fp32 when flags&1).
+// Parametric coopmat GEMM: WG tile BM x BN, KB vec4s per K-chunk,
+// TSM x TSN subgroup grid (sg16). Each sg owns a (BM/TSM) x (BN/TSN)
+// strip = AI x AJ accumulators of coopmat 8x16 f32.
+// Shared tiles stored as f16vec4 (vec4 index/stride units).
+#ifndef BM
+#define BM 128
+#endif
+#ifndef BN
+#define BN 128
+#endif
+#ifndef KB
+#define KB 4          // K-chunk in vec4 units (16 elems)
+#endif
+#ifndef TSM
+#define TSM 4
+#endif
+#ifndef TSN
+#define TSN 4
+#endif
+#ifndef NTHR
+#define NTHR 256
+#endif
+
+layout(local_size_x = NTHR) in;
+
+layout(set = 0, binding = 0) readonly buffer X { vec4 x[]; };
+layout(set = 0, binding = 1) readonly buffer W { f16vec4 w[]; };
+layout(set = 0, binding = 2) readonly buffer R { float r[]; };
+layout(set = 0, binding = 3) buffer C { float c[]; };
+
+layout(push_constant) uniform PC { uint mDim; uint nDim; uint kDim; uint flags; } p;
+
+const uint STRM = BM / TSM;          // sg strip rows
+const uint STRN = BN / TSN;          // sg strip cols
+const uint AI = STRM / 8;            // acc rows per sg
+const uint AJ = STRN / 16;           // acc cols per sg
+const uint NSG = TSM * TSN;
+
+shared f16vec4 xs[BM * KB];          // [m][k]
+shared f16vec4 ws[BN * KB];          // [n][k]
+shared float stage[NSG * 8 * 16];    // per-sg acc staging
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint m0 = gl_WorkGroupID.x * BM;
+    uint n0 = gl_WorkGroupID.y * BN;
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint sgx = sg % TSN, sgy = sg / TSN;
+
+    coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc[AI][AJ];
+    for (uint i = 0u; i < uint(AI); i++)
+        for (uint j = 0u; j < uint(AJ); j++)
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0f);
+
+    uint kv = p.kDim >> 2;             // kDim in vec4 units
+    // staging: linearized over all (BM+BN) x KB vec4 slots; thread t does slots t, t+NTHR, ...
+    const uint XSLOTS = BM * KB, WSLOTS = BN * KB;
+    for (uint kb = 0u; kb < kv; kb += KB) {
+        for (uint s = tid; s < XSLOTS; s += NTHR) {
+            uint row = s / KB, col = s % KB;
+            uint gm = m0 + row;
+            xs[s] = (gm < p.mDim) ? f16vec4(x[gm * kv + kb + col]) : f16vec4(0.0);
+        }
+        for (uint s = tid; s < WSLOTS; s += NTHR) {
+            uint row = s / KB, col = s % KB;
+            uint gn = n0 + row;
+            ws[s] = (gn < p.nDim) ? w[gn * kv + kb + col] : f16vec4(0.0);
+        }
+        barrier();
+
+        for (uint kk = 0u; kk < KB; kk += 4u) {   // 16-elem K sub-tiles per barrier
+            coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> ma[AI];
+            for (uint i = 0u; i < uint(AI); i++)
+                coopMatLoad(ma[i], xs, (sgy * STRM + i * 8u) * KB + kk, KB, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[AJ];
+            for (uint j = 0u; j < uint(AJ); j++)
+                coopMatLoad(mb[j], ws, (sgx * STRN + j * 16u) * KB + kk, KB, gl_CooperativeMatrixLayoutColumnMajor);
+            for (uint i = 0u; i < uint(AI); i++)
+                for (uint j = 0u; j < uint(AJ); j++)
+                    acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]);
+        }
+        barrier();
+    }
+
+    bool hasR = (p.flags & 1u) != 0u;
+    for (uint i = 0u; i < uint(AI); i++) {
+        for (uint j = 0u; j < uint(AJ); j++) {
+            coopMatStore(acc[i][j], stage, sg * 128u, 8u, gl_CooperativeMatrixLayoutColumnMajor);
+            barrier();
+            uint rm = sgy * STRM + i * 8u;
+            uint cn = sgx * STRN + j * 16u;
+            // 128 acc elems / 16 lanes = 8 each
+            for (uint l = 0u; l < 8u; l++) {
+                uint e = lane * 8u + l;
+                uint mm = e >> 4, nn = e & 15u;
+                uint gmr = m0 + rm + mm;
+                uint gnc = n0 + cn + nn;
+                if (gmr < p.mDim && gnc < p.nDim) {
+                    uint idx = gmr * p.nDim + gnc;
+                    c[idx] = hasR ? (r[idx] + stage[sg * 128u + nn * 8u + mm]) : stage[sg * 128u + nn * 8u + mm];
+                }
+            }
+            barrier();
+        }
+    }
+}

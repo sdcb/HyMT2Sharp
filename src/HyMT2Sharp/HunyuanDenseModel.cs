@@ -26,6 +26,8 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     private int _cacheCap;
     private readonly KvBlockStore? _blockStore;
     private readonly IComputeBackend? _backend;
+    private static readonly int _debugLayerLimit =
+        int.TryParse(Environment.GetEnvironmentVariable("HYMT_DEBUG_LAYERS"), out int dll) ? dll : -1;
     private int _kvDirtyFrom = int.MaxValue;  // device KV positions < this must be re-uploaded
     private float[]? _logits;
 
@@ -323,10 +325,12 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
                 "from a valid prefix (ResetCache/TruncateCache) before prefilling.");
 
         Embed(tokens, h);
+        if (_dbgDump && seq > 1) DbgBin("pfemb", h, seq * Config.HiddenSize);
         nuint layerMark = _scratchUsed;
+        int layerLimit = _debugLayerLimit < 0 ? Config.NumLayers : Math.Min(Config.NumLayers, _debugLayerLimit);
         if (seq == 1)
         {
-            for (int layer = 0; layer < Config.NumLayers; layer++)
+            for (int layer = 0; layer < layerLimit; layer++)
             {
                 _scratchUsed = layerMark;
                 DecodeBlock(h, layer, start);
@@ -334,7 +338,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         }
         else
         {
-            for (int layer = 0; layer < Config.NumLayers; layer++)
+            for (int layer = 0; layer < layerLimit; layer++)
             {
                 _scratchUsed = layerMark;
                 PrefillBlock(h, layer, seq, start);
@@ -344,6 +348,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         float* normed = (float*)Bump((nuint)((long)seq * hidden * sizeof(float)));
         Rms("output_norm.weight", h, normed, seq, hidden);
         float* last = normed + (seq - 1) * hidden;
+        if (_dbgDump) DbgBin("pfn", last, hidden);
 
         int vocab = Config.VocabSize > 0 ? Config.VocabSize : Tokenizer.VocabSize;
         float[] logits = _logits ??= new float[vocab];
@@ -492,6 +497,9 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     private void Rms(string name, float* x, float* y, int rows, int dim)
     {
         Weight w = _weights[name];
+        if (_dbgDump && name == "output_norm.weight") DbgBin("out_norm_w", w.F32, dim);
+        if (_dbgDump && name == "blk.0.ffn_norm.weight") DbgBin("ffn_norm_w", w.F32, dim);
+        if (_dbgDump && name == "blk.0.attn_norm.weight") DbgBin("attn_norm_w", w.F32, dim);
         long t0 = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
         Ops.RmsNorm(x, w.F32, y, rows, dim, Config.Eps, _pool);
         if (ProfileEnabled)

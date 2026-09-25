@@ -1,0 +1,23 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+// append one token's K/V (f32) into flat fp16 KV caches at pos.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer KS { float kSrc[]; };
+layout(set = 0, binding = 1) readonly buffer VS { float vSrc[]; };
+layout(set = 0, binding = 2) writeonly buffer KD { float kDst[]; };
+layout(set = 0, binding = 3) writeonly buffer VD { float vDst[]; };
+layout(set = 0, binding = 4) readonly buffer P { int tokenId; int pos; int kvLen; } prm;
+
+layout(push_constant) uniform PC { uint kDim; uint kvStride; } pc;
+
+
+void main()
+{
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.kDim) return;
+    uint off = uint(prm.pos) * pc.kvStride + gid;
+    kDst[off] = kSrc[gid];
+    vDst[off] = vSrc[gid];
+}

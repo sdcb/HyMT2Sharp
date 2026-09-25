@@ -1,0 +1,70 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+// decode attention: one WG per q head, 128 threads; fp16 KV, kvLen <= 4096.
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer Q { float q[]; };
+layout(set = 0, binding = 1) readonly buffer K { uint16_t Kk[]; };
+layout(set = 0, binding = 2) readonly buffer V { uint16_t Vv[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float o[]; };
+layout(set = 0, binding = 4) readonly buffer P { int tokenId; int pos; int kvLen; } prm;
+
+layout(push_constant) uniform PC { uint heads; uint kvHeads; uint headDim; uint kvStride; float scale; } pc;
+
+shared float sc[4096];
+shared float red[128];
+
+float h2f(uint16_t h) { return unpackHalf2x16(uint(h)).x; }
+
+void main()
+{
+    uint g = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    uint kvLen = uint(prm.kvLen);
+    uint group = pc.heads / pc.kvHeads;
+    uint kvh = g / group;
+    uint qb = g * pc.headDim;
+    uint kb = kvh * pc.headDim;
+
+    for (uint t = tid; t < kvLen; t += 128u) {
+        uint kk = kb + t * pc.kvStride;
+        float acc = 0.0f;
+        for (uint d = 0u; d < pc.headDim; d++)
+            acc += q[qb + d] * h2f(Kk[kk + d]);
+        sc[t] = acc * pc.scale;
+    }
+    barrier();
+
+    float mx = -3.4e38f;
+    for (uint t = tid; t < kvLen; t += 128u) mx = max(mx, sc[t]);
+    red[tid] = mx;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
+        barrier();
+    }
+    mx = red[0];
+    barrier();
+
+    float sm = 0.0f;
+    for (uint t = tid; t < kvLen; t += 128u) {
+        float e = exp(sc[t] - mx);
+        sc[t] = e;
+        sm += e;
+    }
+    red[tid] = sm;
+    barrier();
+    for (uint s = 64u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    sm = red[0];
+
+    uint vb = kvh * pc.headDim;
+    for (uint d = tid; d < pc.headDim; d += 128u) {
+        float acc = 0.0f;
+        for (uint t = 0u; t < kvLen; t++)
+            acc += sc[t] * h2f(Vv[vb + t * pc.kvStride + d]);
+        o[qb + d] = acc / sm;
+    }
+}
