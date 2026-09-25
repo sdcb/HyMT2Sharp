@@ -18,6 +18,7 @@ internal unsafe sealed class VkDevice : IDisposable
     public uint SubgroupMin = 1, SubgroupMax = 128;
     public int CoopM, CoopN, CoopK;    // best fp16->fp32 subgroup coopmat config
     public bool Storage16Bit;          // storageBuffer16BitAccess + shaderInt16 enabled
+    public bool ShaderFloat16;         // shaderFloat16 (VK_KHR_shader_float16_int8) enabled — required by fp16 shaders
     public uint DeviceLocalHostVisibleType = uint.MaxValue;
     public uint HostVisibleCoherentType = uint.MaxValue;
     public bool PushDescriptors;
@@ -79,11 +80,14 @@ internal unsafe sealed class VkDevice : IDisposable
 
         // Feature probe: 16-bit storage (u16 buffer views for non-4B-aligned blocks like Q6_K) + shaderInt16.
         Vk.VkPhysicalDevice16BitStorageFeatures s16query = new() { SType = VkConst.StPhysicalDevice16BitStorageFeatures };
+        Vk.VkPhysicalDeviceShaderFloat16Int8Features f16query = new() { SType = VkConst.StPhysicalDeviceShaderFloat16Int8Features };
+        s16query.PNext = &f16query;
         Vk.VkPhysicalDeviceFeatures2 f2 = new() { SType = VkConst.StPhysicalDeviceFeatures2, PNext = &s16query };
         Vk.vkGetPhysicalDeviceFeatures2(d.PhysDevice, &f2);
         Vk.VkPhysicalDeviceFeatures coreF;
         Vk.vkGetPhysicalDeviceFeatures(d.PhysDevice, &coreF);
         d.Storage16Bit = s16query.StorageBuffer16BitAccess != 0 && coreF.ShaderInt16 != 0;
+        d.ShaderFloat16 = f16query.ShaderFloat16 != 0;
         if (Environment.GetEnvironmentVariable("HYMT_VK_DEBUG") == "1")
             Console.Error.WriteLine($"vk-dbg device={d.DeviceName} api={props.ApiVersion:x8} s16={s16query.StorageBuffer16BitAccess} int16(core)={coreF.ShaderInt16} int16(f2)={f2.Features.ShaderInt16} f36core={coreF.F[36]}");
 
@@ -96,13 +100,14 @@ internal unsafe sealed class VkDevice : IDisposable
         byte* wantPush = stackalloc byte[] { (byte)'V', (byte)'K', (byte)'_', (byte)'K', (byte)'H', (byte)'R',
             (byte)'_', (byte)'p', (byte)'u', (byte)'s', (byte)'h', (byte)'_', (byte)'d', (byte)'e', (byte)'s', (byte)'c',
             (byte)'r', (byte)'i', (byte)'p', (byte)'t', (byte)'o', (byte)'r', 0 };
-        bool hasPush = false, hasCoop = false, hasSgc = false;
+        bool hasPush = false, hasCoop = false, hasSgc = false, hasF16Int8 = false;
         for (int i = 0; i < (int)next; i++)
         {
             string en = new((sbyte*)exts[i].ExtensionName);
             if (en == "VK_KHR_push_descriptor") hasPush = true;
             else if (en == "VK_KHR_cooperative_matrix") hasCoop = true;
             else if (en == "VK_EXT_subgroup_size_control") hasSgc = true;
+            else if (en == "VK_KHR_shader_float16_int8") hasF16Int8 = true;
         }
 
         Vk.VkPhysicalDeviceCooperativeMatrixFeaturesKHR coopQ = new() { SType = VkConst.StPhysicalDeviceCooperativeMatrixFeaturesKHR };
@@ -143,9 +148,15 @@ internal unsafe sealed class VkDevice : IDisposable
             SubgroupSizeControl = hasSgc ? 1u : 0u,
         };
         d.SubgroupSizeControl = hasSgc;
+        Vk.VkPhysicalDeviceShaderFloat16Int8Features f16en = new()
+        {
+            SType = VkConst.StPhysicalDeviceShaderFloat16Int8Features,
+            ShaderFloat16 = d.ShaderFloat16 ? 1u : 0u,
+        };
         if (Environment.GetEnvironmentVariable("HYMT_VK_DEBUG") == "1")
-            Console.Error.WriteLine($"vk-dbg coop={d.CoopMatrix} sgc={hasSgc} sgMin={d.SubgroupMin} sgMax={d.SubgroupMax} push={hasPush}");
-        s16en.PNext = d.CoopMatrix ? &coopEn : null;
+            Console.Error.WriteLine($"vk-dbg coop={d.CoopMatrix} sgc={hasSgc} sgMin={d.SubgroupMin} sgMax={d.SubgroupMax} push={hasPush} f16={d.ShaderFloat16}");
+        s16en.PNext = &f16en;
+        f16en.PNext = d.CoopMatrix ? &coopEn : hasSgc ? &sgcEn : null;
         coopEn.PNext = hasSgc ? &sgcEn : null;
         Vk.VkPhysicalDeviceFeatures feats = new();
         if (d.Storage16Bit) feats.ShaderInt16 = 1;
@@ -157,11 +168,16 @@ internal unsafe sealed class VkDevice : IDisposable
             (byte)'_', (byte)'s', (byte)'u', (byte)'b', (byte)'g', (byte)'r', (byte)'o', (byte)'u', (byte)'p',
             (byte)'_', (byte)'s', (byte)'i', (byte)'z', (byte)'e', (byte)'_', (byte)'c', (byte)'o', (byte)'n',
             (byte)'t', (byte)'r', (byte)'o', (byte)'l', 0 };
-        byte** extsToEnable = stackalloc byte*[3];
+        byte* wantF16 = stackalloc byte[] { (byte)'V', (byte)'K', (byte)'_', (byte)'K', (byte)'H', (byte)'R',
+            (byte)'_', (byte)'s', (byte)'h', (byte)'a', (byte)'d', (byte)'e', (byte)'r', (byte)'_', (byte)'f',
+            (byte)'l', (byte)'o', (byte)'a', (byte)'t', (byte)'1', (byte)'6', (byte)'_', (byte)'i', (byte)'n',
+            (byte)'t', (byte)'8', 0 };
+        byte** extsToEnable = stackalloc byte*[4];
         uint nExt = 0;
         if (hasPush) extsToEnable[nExt++] = wantPush;
         if (d.CoopMatrix) extsToEnable[nExt++] = wantCoop;
         if (hasSgc) extsToEnable[nExt++] = wantSgc;
+        if (hasF16Int8 && d.ShaderFloat16) extsToEnable[nExt++] = wantF16;
         Vk.VkDeviceCreateInfo dci = new()
         {
             SType = VkConst.StDeviceCreateInfo,
