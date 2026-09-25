@@ -77,8 +77,22 @@ public sealed unsafe class VulkanBackend : IComputeBackend
     {
         _dev = VkDevice.Create();
         if (!_dev.Storage16Bit)
+        {
+            _dev.Dispose();
             throw new PlatformNotSupportedException(
                 "Vulkan backend needs storageBuffer16BitAccess + shaderInt16 (fp16 KV, Q6_K views)");
+        }
+    }
+
+    /// <summary>Cheap probe: a real (non-software) Vulkan device with compute exists.</summary>
+    public static bool IsSupported()
+    {
+        try
+        {
+            using VkDevice d = VkDevice.Create();
+            return d.Storage16Bit;
+        }
+        catch { return false; }
     }
 
     private VkBuffer W(string name) => _w.TryGetValue(name, out VkBuffer? b) ? b : throw new KeyNotFoundException(name);

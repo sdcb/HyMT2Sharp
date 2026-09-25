@@ -53,7 +53,7 @@ internal unsafe sealed class VkDevice : IDisposable
             {
                 Vk.VkPhysicalDeviceProperties p;
                 Vk.vkGetPhysicalDeviceProperties(devs[i], &p);
-                bool want = pass == 0 ? p.DeviceType == VkConst.PhysDeviceDiscrete : true;
+                bool want = pass == 0 ? p.DeviceType == VkConst.PhysDeviceDiscrete : p.DeviceType != VkConst.PhysDeviceCpu;
                 if (!want) continue;
                 if (seen++ == deviceIndex) { chosen = i; break; }
             }

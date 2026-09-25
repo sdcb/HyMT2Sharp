@@ -114,18 +114,8 @@ Console.WriteLine($"threads={threads}  avx2={System.Runtime.Intrinsics.X86.Avx2.
 
 IComputeBackend? backend = null;
 string? backendName = Args.Get(args, "--backend");
-if (backendName is not null and not "cpu")
-{
-    if (backendName == "metal" && RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-        backend = new Sdcb.HyMT2Sharp.Backends.Metal.MetalBackend();
-    else if (backendName == "vulkan")
-    {
-        try { backend = new Sdcb.HyMT2Sharp.Backends.Vulkan.VulkanBackend(); }
-        catch (Exception e) { Console.WriteLine($"backend vulkan init failed: {e.Message} — using cpu"); }
-    }
-    else
-        Console.WriteLine($"backend {backendName} unavailable here — using cpu");
-}
+try { backend = Sdcb.HyMT2Sharp.Backends.BackendFactory.Create(backendName); }
+catch (Exception e) { Console.WriteLine($"backend {backendName} init failed: {e.Message} — using cpu"); }
 Console.WriteLine($"backend={backend?.Name ?? "cpu"}");
 
 using HunyuanDenseModel model = new(modelPath, threads, backend: backend);

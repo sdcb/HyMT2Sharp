@@ -438,6 +438,7 @@ internal static class VkConst
     // VkPhysicalDeviceType
     public const uint PhysDeviceIntegrated = 1;
     public const uint PhysDeviceDiscrete = 2;
+    public const uint PhysDeviceCpu = 3;
 
     // VkQueueFlagBits
     public const uint QueueGraphics = 0x1;
