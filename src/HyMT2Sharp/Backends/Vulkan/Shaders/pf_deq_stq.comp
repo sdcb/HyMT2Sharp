@@ -1,0 +1,34 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+// STQ1_0 (42B blk / 256 elems: Qs[32] @0, Sign[8] @32, D fp16 @40) -> 256 fp16
+// elements per WG, thread = one element.
+// Group g = (e>>6)*16 + (e&15): slot nibble g of Qs, sign bit g of Sign;
+// CB[(sign<<4)|slot] packs four 2-bit lane codes, value = code-1.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W16 { uint w16[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float16_t o[]; };
+
+layout(push_constant) uniform PC { uint outOff; uint gridX; uint nblk; } p;
+
+uint rd16(uint off) { return (w16[off >> 2] >> ((off & 2u) << 3)) & 0xFFFFu; }
+uint SB(uint off)   { return (rd16(off & ~1u) >> ((off & 1u) << 3)) & 0xFFu; }
+
+const uint CB[8] = uint[](0x092989A9u, 0x062686A6u, 0x121A929Au, 0x424A626Au,
+                          0xA1812101u, 0xA4842404u, 0x98901810u, 0x68604840u);
+
+void main()
+{
+    uint e = gl_LocalInvocationID.x;
+    uint blk = gl_WorkGroupID.y * p.gridX + gl_WorkGroupID.x;
+    if (blk >= p.nblk) return;
+    uint bb = blk * 42u;
+    // element e: chunk e>>6, gloc e&15, code lane e>>4 (of the 64-elem chunk)
+    uint g = ((e >> 6) << 4) + (e & 15u);
+    uint slot = (SB(bb + (g >> 1)) >> ((g & 1u) << 2)) & 0xFu;
+    uint idx = (((SB(bb + 32u + (g >> 3)) >> (g & 7u)) & 1u) << 4u) | slot;
+    uint qp = (CB[idx >> 2] >> ((idx & 3u) << 3u)) & 0xFFu;
+    float d = unpackHalf2x16(rd16(bb + 40u)).x;
+    o[p.outOff + blk * 256u + e] = float16_t(d * float(int((qp >> (((e >> 4) & 3u) << 1)) & 3u) - 1));
+}

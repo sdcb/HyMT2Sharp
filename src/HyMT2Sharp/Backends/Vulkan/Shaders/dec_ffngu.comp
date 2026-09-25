@@ -6,7 +6,8 @@
 // fused: xs = rmsnorm(h)*wn (per-WG, in shared); each WG computes 16 gate rows
 // AND 16 up rows, then writes out[row] = silu(g)*u. One dispatch replaces
 // rms + gate-gemv + up-gemv + silu.
-// dtype flags: 0 = Q4_K (144B/blk), 1 = Q6_K (210B/blk), 2 = Q8_0 (34B/blk). Weights via u16 view.
+// dtype flags: 0 = Q4_K (144B/blk), 1 = Q6_K (210B/blk), 2 = Q8_0 (34B/blk),
+// 3 = STQ1_0 (42B/blk), 4 = Q2_0C (130B/blk). Weights via u16 view.
 // Scales pre-decoded into sf[16*64] vec4: .xy = gate slot, .zw = up slot,
 // same packing as dec_prekv (q4k: vec2(dsc,dmn); q6k: vec2(d*s[2i],d*s[2i+1])).
 
@@ -29,6 +30,13 @@ shared float gu[512];
 #define R16(arr, off) (uint(arr[(off) >> 1]))
 #define SB(arr, off)  ((R16(arr, (off) & ~1u) >> (((off) & 1u) * 8u)) & 0xFFu)
 #define S8(arr, off)  (int((int(R16(arr, (off) & ~1u)) >> int((off & 1u) * 8u)) << 24) >> 24)
+
+// STQ1_0 codebook: four 2-bit ternary lanes per entry (value = code-1).
+const uint STQ_CB[8] = uint[](0x092989A9u, 0x062686A6u, 0x121A929Au, 0x424A626Au,
+                             0xA1812101u, 0xA4842404u, 0x98901810u, 0x68604840u);
+
+// Q2_0C: one packed byte -> four consecutive elems, value = 2*code-3.
+#define Q2V(b) vec4(float(((b) & 3u) * 2u) - 3.0f, float((((b) >> 2u) & 3u) * 2u) - 3.0f, float((((b) >> 4u) & 3u) * 2u) - 3.0f, float((((b) >> 6u) & 3u) * 2u) - 3.0f)
 
 #define X4(i) xv[i]
 #define SX(i) (xv[i].x + xv[i].y + xv[i].z + xv[i].w)
@@ -163,6 +171,58 @@ shared float gu[512];
     accOut = _acc; \
 }
 
+// STQ1_0 (42B blk): lane covers elems itid*16..+16 per 256-block.
+#define GEMV_STQ(arr, rl, rlRow, bpr, itid, comp, accOut) { \
+    uint _c = (itid) >> 2; \
+    uint _ln = ((itid) & 3u) << 1; \
+    float _acc = 0.0f; \
+    uint _rb = (rlRow) * (bpr) * 42u; \
+    for (uint blk = 0u; blk < (bpr); blk++) { \
+        uint bb = _rb + blk * 42u; \
+        uint qs0 = R32(arr, bb + _c * 8u); \
+        uint qs1 = R32(arr, bb + _c * 8u + 4u); \
+        uint sgn = R16(arr, bb + 32u + _c * 2u); \
+        float d = unpackHalf2x16(R16(arr, bb + 40u)).x; \
+        uint kv = (blk << 6) + ((itid) << 2); \
+        for (uint v = 0u; v < 4u; v++) { \
+            vec4 wv4; \
+            for (uint j = 0u; j < 4u; j++) { \
+                uint gl = v * 4u + j; \
+                uint w8 = gl < 8u ? qs0 : qs1; \
+                uint slot = (w8 >> ((((gl & 7u) >> 1u) << 3u) + ((gl & 1u) << 2u))) & 0xFu; \
+                uint idx = (((sgn >> gl) & 1u) << 4u) | slot; \
+                uint qp = (STQ_CB[idx >> 2] >> ((idx & 3u) << 3u)) & 0xFFu; \
+                wv4[j] = float(int((qp >> _ln) & 3u) - 1); \
+            } \
+            _acc += d * dot(X4(kv + v), wv4); \
+        } \
+    } \
+    accOut = _acc; \
+}
+
+// Q2_0C (130B blk, 512 elems): lane covers 32 consecutive elems.
+#define GEMV_Q2(arr, rl, rlRow, bpr, itid, comp, accOut) { \
+    uint _l8 = (itid) << 3; \
+    float _acc = 0.0f; \
+    uint _rb = (rlRow) * (bpr) * 130u; \
+    for (uint blk = 0u; blk < (bpr); blk++) { \
+        uint bb = _rb + blk * 130u; \
+        float d = unpackHalf2x16(R16(arr, bb)).x; \
+        uint w0 = R32(arr, bb + 2u + _l8); \
+        uint w1 = R32(arr, bb + 2u + _l8 + 4u); \
+        uint kv = (blk << 7) + ((itid) << 3); \
+        _acc += d * (dot(X4(kv),      Q2V(w0 & 0xFFu)) \
+                  + dot(X4(kv + 1u), Q2V((w0 >> 8u) & 0xFFu)) \
+                  + dot(X4(kv + 2u), Q2V((w0 >> 16u) & 0xFFu)) \
+                  + dot(X4(kv + 3u), Q2V(w0 >> 24u)) \
+                  + dot(X4(kv + 4u), Q2V(w1 & 0xFFu)) \
+                  + dot(X4(kv + 5u), Q2V((w1 >> 8u) & 0xFFu)) \
+                  + dot(X4(kv + 6u), Q2V((w1 >> 16u) & 0xFFu)) \
+                  + dot(X4(kv + 7u), Q2V(w1 >> 24u))); \
+    } \
+    accOut = _acc; \
+}
+
 // tree-reduce red[] and gu[] within each 16-lane team
 #define REDUCE16() { \
     barrier(); \
@@ -187,9 +247,11 @@ void main()
         uint row = gl_WorkGroupID.x * 16u + rl;
         vec4 v4 = vec4(0.0f);
         if (row < pc.out_dim) {
-            vec2 a2, b2;
-            FILL(wg, row, bpr, pc.tg, slot, a2)
-            FILL(wu, row, bpr, pc.tu, slot, b2)
+            vec2 a2 = vec2(0.0f), b2 = vec2(0.0f);
+            // dtype 3/4 read scales inline (single fp16 d per block) — skip sf
+            // fill entirely; FILL's else branch would index past their blocks.
+            if (pc.tg <= 2u) FILL(wg, row, bpr, pc.tg, slot, a2)
+            if (pc.tu <= 2u) FILL(wu, row, bpr, pc.tu, slot, b2)
             v4 = vec4(a2, b2);
         }
         sf[rl * 64u + slot] = v4;
@@ -205,10 +267,14 @@ void main()
     float accG = 0.0f, accU = 0.0f;
     if (pc.tg == 0u)      GEMV_Q4K(wg, rowLane, r, bpr, itid, xy, accG)
     else if (pc.tg == 1u) GEMV_Q6K(wg, rowLane, r, bpr, itid, xy, accG)
-    else                  GEMV_Q8(wg, rowLane, r, bpr, itid, xy, accG)
+    else if (pc.tg == 2u) GEMV_Q8(wg, rowLane, r, bpr, itid, xy, accG)
+    else if (pc.tg == 3u) GEMV_STQ(wg, rowLane, r, bpr, itid, xy, accG)
+    else                  GEMV_Q2(wg, rowLane, r, bpr, itid, xy, accG)
     if (pc.tu == 0u)      GEMV_Q4K(wu, rowLane, r, bpr, itid, zw, accU)
     else if (pc.tu == 1u) GEMV_Q6K(wu, rowLane, r, bpr, itid, zw, accU)
-    else                  GEMV_Q8(wu, rowLane, r, bpr, itid, zw, accU)
+    else if (pc.tu == 2u) GEMV_Q8(wu, rowLane, r, bpr, itid, zw, accU)
+    else if (pc.tu == 3u) GEMV_STQ(wu, rowLane, r, bpr, itid, zw, accU)
+    else                  GEMV_Q2(wu, rowLane, r, bpr, itid, zw, accU)
 
     red[tid] = accG;
     gu[tid] = accU;

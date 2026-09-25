@@ -1,0 +1,26 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q2_0C (130B blk / 512 elems: d fp16 @0, Qs[128] @2, four 2-bit codes per
+// byte, value = 2*code-3) -> 256 fp16 elements per WG (half a block each).
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W16 { uint w16[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float16_t o[]; };
+
+layout(push_constant) uniform PC { uint outOff; uint gridX; uint nblk; } p;
+
+uint rd16(uint off) { return (w16[off >> 2] >> ((off & 2u) << 3)) & 0xFFFFu; }
+uint SB(uint off)   { return (rd16(off & ~1u) >> ((off & 1u) << 3)) & 0xFFu; }
+
+void main()
+{
+    uint e = gl_LocalInvocationID.x;
+    uint blk = gl_WorkGroupID.y * p.gridX + gl_WorkGroupID.x;
+    if (blk >= p.nblk) return;
+    uint bb = (blk >> 1) * 130u;           // each 512-elem block = 2 units
+    uint j = ((blk & 1u) << 8) + e;        // element index within block
+    float d = unpackHalf2x16(rd16(bb)).x;
+    uint code = (SB(bb + 2u + (j >> 2)) >> ((j & 3u) << 1)) & 3u;
+    o[p.outOff + blk * 256u + e] = float16_t(d * float(int(code << 1) - 3));
+}

@@ -1,0 +1,76 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// STQ1_0 GEMV: sparse ternary (gguf type 43). 16 rows/WG, 16 lanes/row.
+// Block = 42B / 256 elems: Qs[32] @0 (64x4-bit codebook slots), Sign[8] @32
+// (one sign bit per group), D fp16 @40.
+// Group g: slot = nibble g of Qs, sign = bit g of Sign; CB[(sign<<4)|slot]
+// packs four 2-bit lane codes, value = code-1 -> {-1,0,+1}.
+// Element of (group g, lane t) = (g>>4)*64 + (g&15) + t*16; lane l covers
+// elems l*16..+16: chunk l>>2, code lane l&3.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W16 { uint16_t w16[]; };
+layout(set = 0, binding = 1) readonly buffer XV { vec4 xv[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC { uint in_dim; uint out_dim; } p;
+
+shared float red[256];
+
+uint rd16(uint byteOff) { return uint(w16[byteOff >> 1]); }
+uint rd32(uint byteOff) { return rd16(byteOff) | (rd16(byteOff + 2u) << 16); }
+
+// Four 2-bit ternary lanes per codebook entry, packed little-endian.
+const uint CB[8] = uint[](0x092989A9u, 0x062686A6u, 0x121A929Au, 0x424A626Au,
+                          0xA1812101u, 0xA4842404u, 0x98901810u, 0x68604840u);
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint bpr = p.in_dim >> 8;          // 256-elem blocks per row
+
+    uint rowLane = tid >> 4;
+    uint itid = tid & 15u;
+    uint row = gl_WorkGroupID.x * 16u + rowLane;
+    bool valid = row < p.out_dim;
+    uint rowBytes = (valid ? row : 0u) * bpr * 42u;
+
+    uint c = itid >> 2;                // 64-elem chunk within block
+    uint ln = (itid & 3u) << 1;        // code lane -> 2-bit shift
+
+    float acc = 0.0f;
+    for (uint blk = 0u; blk < bpr; blk++) {
+        uint bb = rowBytes + blk * 42u;
+        uint q0 = rd32(bb + c * 8u);
+        uint q1 = rd32(bb + c * 8u + 4u);
+        uint sgn = rd16(bb + 32u + c * 2u);
+        float d = unpackHalf2x16(rd16(bb + 40u)).x;
+        uint kv = (blk << 6) + (itid << 2);
+        for (uint v = 0u; v < 4u; v++) {
+            vec4 wv;
+            for (uint j = 0u; j < 4u; j++) {
+                uint gl = v * 4u + j;   // gloc 0..15
+                uint w = gl < 8u ? q0 : q1;
+                uint slot = (w >> ((((gl & 7u) >> 1u) << 3u) + ((gl & 1u) << 2u))) & 0xFu;
+                uint idx = (((sgn >> gl) & 1u) << 4u) | slot;
+                uint qp = (CB[idx >> 2] >> ((idx & 3u) << 3u)) & 0xFFu;
+                wv[j] = float(int((qp >> ln) & 3u) - 1);
+            }
+            acc += d * dot(xv[kv + v], wv);
+        }
+    }
+
+    red[tid] = acc;
+    barrier();
+    if (itid < 8u) red[tid] += red[tid + 8u];
+    barrier();
+    if (itid < 4u) red[tid] += red[tid + 4u];
+    barrier();
+    if (itid < 2u) red[tid] += red[tid + 2u];
+    barrier();
+    if (itid < 1u) red[tid] += red[tid + 1u];
+    barrier();
+    if (itid == 0u && valid) y[row] = red[tid];
+}

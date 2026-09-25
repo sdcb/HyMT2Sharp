@@ -1,0 +1,70 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// y[row] += W_q2[row,:] dot xv. 16 rows/WG, 16 lanes/row (same map as q2_gemv).
+// Block = 130B / 512 elems: d fp16 @0, Qs[128] @2 (four 2-bit codes/byte,
+// value = 2*code-3). Lane covers 32 consecutive elems = 8 packed bytes.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W16 { uint w16[]; };
+layout(set = 0, binding = 1) readonly buffer XV { vec4 xv[]; };
+layout(set = 0, binding = 2) buffer Y { float y[]; };
+
+layout(push_constant) uniform PC { uint in_dim; uint out_dim; } p;
+
+shared float red[256];
+
+uint rd16(uint byteOff) { return (w16[byteOff >> 2] >> ((byteOff & 2u) << 3)) & 0xFFFFu; }
+uint rd32(uint byteOff) { return rd16(byteOff) | (rd16(byteOff + 2u) << 16); }
+
+vec4 q2v(uint b)
+{
+    return vec4(float(((b & 3u) << 1)) - 3.0f,
+                float((((b >> 2u) & 3u) << 1)) - 3.0f,
+                float((((b >> 4u) & 3u) << 1)) - 3.0f,
+                float((((b >> 6u) & 3u) << 1)) - 3.0f);
+}
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint bpr = p.in_dim >> 9;
+
+    uint rowLane = tid >> 4;
+    uint itid = tid & 15u;
+    uint row = gl_WorkGroupID.x * 16u + rowLane;
+    bool valid = row < p.out_dim;
+    uint rowBytes = (valid ? row : 0u) * bpr * 130u;
+
+    uint l8 = itid << 3;
+
+    float acc = 0.0f;
+    for (uint blk = 0u; blk < bpr; blk++) {
+        uint bb = rowBytes + blk * 130u;
+        float d = unpackHalf2x16(rd16(bb)).x;
+        uint w0 = rd32(bb + 2u + l8);
+        uint w1 = rd32(bb + 2u + l8 + 4u);
+        uint kv = (blk << 7) + (itid << 3);
+        acc += d * (dot(xv[kv],      q2v(w0 & 0xFFu))
+                  + dot(xv[kv + 1u], q2v((w0 >> 8u) & 0xFFu))
+                  + dot(xv[kv + 2u], q2v((w0 >> 16u) & 0xFFu))
+                  + dot(xv[kv + 3u], q2v(w0 >> 24u))
+                  + dot(xv[kv + 4u], q2v(w1 & 0xFFu))
+                  + dot(xv[kv + 5u], q2v((w1 >> 8u) & 0xFFu))
+                  + dot(xv[kv + 6u], q2v((w1 >> 16u) & 0xFFu))
+                  + dot(xv[kv + 7u], q2v(w1 >> 24u)));
+    }
+
+    red[tid] = acc;
+    barrier();
+    if (itid < 8u) red[tid] += red[tid + 8u];
+    barrier();
+    if (itid < 4u) red[tid] += red[tid + 4u];
+    barrier();
+    if (itid < 2u) red[tid] += red[tid + 2u];
+    barrier();
+    if (itid < 1u) red[tid] += red[tid + 1u];
+    barrier();
+    if (itid == 0u && valid) y[row] += red[tid];
+}
