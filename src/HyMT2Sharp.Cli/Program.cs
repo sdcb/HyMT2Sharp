@@ -20,7 +20,9 @@ if (backendName is not null and not "cpu")
 {
     if (backendName == "metal" && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
         backend = new Sdcb.HyMT2Sharp.Backends.Metal.MetalBackend();
-    else
+    else if (backendName == "cuda")
+        backend = Sdcb.HyMT2Sharp.Backends.Cuda.CudaBackend.TryCreate();
+    if (backend is null)
         Console.WriteLine($"backend {backendName} unavailable here — using cpu");
 }
 if (backend is not null)

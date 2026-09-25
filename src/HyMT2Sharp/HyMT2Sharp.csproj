@@ -1,5 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <Description>Hy-MT2 hunyuan-dense inference: GGUF, tokenize, KV cache, CPU (SIMD) and Metal backends.</Description>
+    <Description>Hy-MT2 hunyuan-dense inference: GGUF, tokenize, KV cache, CPU (SIMD), Metal and CUDA backends.</Description>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- Committed PTX (compiled by native/cuda/build-ptx.ps1 from the vendored
+         TensorSharp kernel set + hymt_kernels.cu) loads via the driver API at
+         runtime — no CUDA toolkit required on target machines, only nvcuda. -->
+    <Content Include="..\..\native\ptx\*.ptx" Link="cuda_kernels\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
 </Project>
