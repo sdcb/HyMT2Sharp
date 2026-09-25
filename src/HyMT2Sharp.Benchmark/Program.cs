@@ -105,7 +105,6 @@ if (!bench && !args.Contains("--verify-prefill") && !args.Contains("--verify-dec
     Console.WriteLine("  --dump-silu");
     Console.WriteLine("  --micro-q4 [--micro-in N --micro-out N --micro-tokens N --micro-reps N]");
     Console.WriteLine("  --micro-metal-q4   (macOS only: Q4_K Metal GEMV correctness + bandwidth)");
-    Console.WriteLine("  --micro-vk-q4/--micro-vk-q6  (Vulkan GEMV POC: correctness + GB/s, B580 target)");
     return;
 }
 
