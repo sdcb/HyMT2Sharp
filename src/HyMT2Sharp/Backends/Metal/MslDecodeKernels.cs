@@ -92,52 +92,10 @@ kernel void rmsnorm_rows(
     for (int i = (int)tid; i < dim; i += 256) yr[i] = xr[i] * scale * w[i];
 }
 
-// NeoX RoPE, in-place. grid = heads * (ropeDim/2); thread = (head, pair index)
-kernel void rope_neox(
-    device float* x [[buffer(0)]],
-    constant int& headDim [[buffer(1)]],
-    constant int& ropeDim [[buffer(2)]],
-    constant int& pos [[buffer(3)]],
-    constant float& base [[buffer(4)]],
-    constant int& n [[buffer(5)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if ((int)gid >= n) return;
-    int hd = ropeDim >> 1;
-    int h = (int)gid / hd;
-    int i = (int)gid % hd;
-    float freq = 1.0f / pow(base, float(i) / float(hd));
-    float a = float(pos) * freq;
-    float c = cos(a), s = sin(a);
-    device float* row = x + h * headDim;
-    float x0 = row[i], x1 = row[i + hd];
-    row[i] = x0 * c - x1 * s;
-    row[i + hd] = x0 * s + x1 * c;
-}
-
-// append one token's K and V (fp32) into flat bf16 caches at `pos`
 // paged KV: logical position j -> physical row via block table.
 // tab[logicalBlock] = physical block index; physical row = phys * (1<<lg) + (j % (1<<lg)).
 inline uint kv_row(device const int* tab, uint j, uint lg) {
     return ((uint)tab[j >> lg] << lg) | (j & ((1u << lg) - 1u));
-}
-
-kernel void kv_append_bf16(
-    device const float* kSrc [[buffer(0)]],
-    device const float* vSrc [[buffer(1)]],
-    device ushort* kDst [[buffer(2)]],
-    device ushort* vDst [[buffer(3)]],
-    constant int& kDim [[buffer(4)]],
-    constant int& kvStride [[buffer(5)]],
-    constant int& pos [[buffer(6)]],
-    device const int* tab [[buffer(7)]],
-    constant int& lg [[buffer(8)]],
-    uint gid [[thread_position_in_grid]])
-{
-    if ((int)gid >= kDim) return;
-    uint prow = kv_row(tab, (uint)pos, (uint)lg);
-    kDst[prow * kvStride + (int)gid] = f32_to_bf16(kSrc[gid]);
-    vDst[prow * kvStride + (int)gid] = f32_to_bf16(vSrc[gid]);
 }
 
 // decode attention: one threadgroup per q head, 128 threads.
@@ -207,6 +165,136 @@ kernel void attn_decode(
         for (int t = 0; t < kvLen; t++)
             acc += sc[t] * bf16_to_f32(vb[(ulong)kv_row(tab, (uint)t, (uint)lg) * kvStride + d]);
         oh[d] = acc / sm;
+    }
+}
+
+// Split-K decode attention (flash-decoding): threadgroup g = head * S +
+// chunk computes softmax statistics (m, l) and the unnormalized weighted-V
+// partial for its contiguous chunk of positions, written to
+// part[g] = {m, l, acc[headDim]}. attn_merge combines the S partials per
+// head. Parallelizes the serial position scan that dominates attn_decode
+// at long context.
+// INVARIANT: sc[1024] caps the per-chunk length at 1024 — the host must
+// keep ceil(kvLen/S) <= 1024 (raise S or fall back to attn_decode).
+kernel void attn_split(
+    device const float* q [[buffer(0)]],
+    device const ushort* K [[buffer(1)]],
+    device const ushort* V [[buffer(2)]],
+    device float* part [[buffer(3)]],           // [heads*S][2 + headDim]
+    constant int& heads [[buffer(4)]],
+    constant int& kvHeads [[buffer(5)]],
+    constant int& headDim [[buffer(6)]],
+    constant int& kvStride [[buffer(7)]],
+    constant int& kvLen [[buffer(8)]],
+    constant float& scale [[buffer(9)]],
+    device const int* tab [[buffer(10)]],
+    constant int& lg [[buffer(11)]],
+    constant int& S [[buffer(12)]],
+    uint g [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    int h = (int)g / S;
+    int chunk = (int)g - h * S;
+    int group = heads / kvHeads;
+    int kvh = h / group;
+    device const float* qh = q + h * headDim;
+    device const ushort* kb = K + kvh * headDim;
+
+    int cl = (kvLen + S - 1) / S;
+    int t0 = chunk * cl;
+    int t1 = min(kvLen, t0 + cl);
+    int n = t1 - t0;
+    device float* pg = part + (ulong)g * (headDim + 2);
+    if (n <= 0) {
+        if ((int)tid == 0) { pg[0] = -3.4e38f; pg[1] = 0.0f; }
+        for (int d = (int)tid; d < headDim; d += 128) pg[2 + d] = 0.0f;
+        return;
+    }
+
+    threadgroup float sc[1024];
+    for (int t = (int)tid; t < n; t += 128) {
+        device const ushort* kk = kb + (ulong)kv_row(tab, (uint)(t0 + t), (uint)lg) * kvStride;
+        float acc = 0.0f;
+        for (int d = 0; d < headDim; d++)
+            acc += qh[d] * bf16_to_f32(kk[d]);
+        sc[t] = acc * scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    threadgroup float red[128];
+    float mx = -3.4e38f;
+    for (int t = (int)tid; t < n; t += 128) mx = max(mx, sc[t]);
+    red[tid] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 64; s > 0; s >>= 1) {
+        if ((int)tid < s) red[tid] = max(red[tid], red[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    mx = red[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float sm = 0.0f;
+    for (int t = (int)tid; t < n; t += 128) {
+        float e = exp(sc[t] - mx);
+        sc[t] = e;
+        sm += e;
+    }
+    red[tid] = sm;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 64; s > 0; s >>= 1) {
+        if ((int)tid < s) red[tid] += red[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    sm = red[0];
+
+    device const ushort* vb = V + kvh * headDim;
+    for (int d = (int)tid; d < headDim; d += 128) {
+        float acc = 0.0f;
+        for (int t = 0; t < n; t++)
+            acc += sc[t] * bf16_to_f32(vb[(ulong)kv_row(tab, (uint)(t0 + t), (uint)lg) * kvStride + d]);
+        pg[2 + d] = acc;
+    }
+    if ((int)tid == 0) { pg[0] = mx; pg[1] = sm; }
+}
+
+// out[h][d] = sum_i exp(m_i - m) * acc_i[d] / sum_i exp(m_i - m) * l_i
+kernel void attn_merge(
+    device const float* part [[buffer(0)]],    // [heads*S][2 + headDim]
+    device float* out [[buffer(1)]],
+    constant int& heads [[buffer(2)]],
+    constant int& headDim [[buffer(3)]],
+    constant int& S [[buffer(4)]],
+    uint g [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    device const float* ph = part + (ulong)g * S * (headDim + 2);
+    threadgroup float red[128];
+    float mx = -3.4e38f;
+    for (int i = (int)tid; i < S; i += 128) mx = max(mx, ph[(ulong)i * (headDim + 2)]);
+    red[tid] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 64; s > 0; s >>= 1) {
+        if ((int)tid < s) red[tid] = max(red[tid], red[tid + s]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    mx = red[0];
+
+    float den = 0.0f;
+    for (int i = (int)tid; i < S; i += 128)
+        den += exp(ph[(ulong)i * (headDim + 2)] - mx) * ph[(ulong)i * (headDim + 2) + 1];
+    red[tid] = den;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 64; s > 0; s >>= 1) {
+        if ((int)tid < s) red[tid] += red[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    den = red[0];
+
+    for (int d = (int)tid; d < headDim; d += 128) {
+        float acc = 0.0f;
+        for (int i = 0; i < S; i++)
+            acc += exp(ph[(ulong)i * (headDim + 2)] - mx) * ph[(ulong)i * (headDim + 2) + 2 + d];
+        out[g * headDim + d] = acc / den;
     }
 }
 
@@ -833,6 +921,8 @@ kernel void xtranspose(
 
 // y[t][c] = dot(x[t][:], w[c][:]). Grid: ((out+63)/64, ceil(T/64)). 256 threads:
 // (tid&15) -> 4 tokens, (tid>>4) -> 4 cols. Tail-safe on both dims.
+// tBase/cBase offset the covered region — used for the ragged edges the
+// mma_gemm tiles don't cover.
 kernel void sgemm4x4(
     device const float* w32 [[buffer(0)]],
     device const float* xT [[buffer(1)]],
@@ -841,13 +931,15 @@ kernel void sgemm4x4(
     constant int& out_dim [[buffer(4)]],
     constant int& T [[buffer(5)]],
     constant int& Tpad [[buffer(6)]],
+    constant int& tBase [[buffer(7)]],
+    constant int& cBase [[buffer(8)]],
     uint2 g [[threadgroup_position_in_grid]],
     uint2 tp [[thread_position_in_threadgroup]])
 {
     int tid = (int)tp.x;
     int ti = tid & 15, ci = tid >> 4;
-    int t = (int)g.y * 64 + 4 * ti;
-    int c = (int)g.x * 64 + 4 * ci;
+    int t = tBase + (int)g.y * 64 + 4 * ti;
+    int c = cBase + (int)g.x * 64 + 4 * ci;
 
     float4 acc0 = float4(0), acc1 = float4(0), acc2 = float4(0), acc3 = float4(0);
     device const float* a = xT + t;
@@ -887,6 +979,73 @@ kernel void sgemm4x4(
             }
         }
     }
+}
+
+// GEMM via simdgroup MMA 8x8 fragments (works on paravirt too — measured
+// ~2x the scalar-FMA path). tg tile 64t x 64c, 8 simdgroups; each simdgroup
+// computes a 16t x 32c sub-tile (2x4 fragments). k-blocks of 16 are staged
+// in threadgroup memory: tA[k][t] and tB[c][k] (B transpose-loaded into
+// [k][c] fragments). Requires in_dim % 16 == 0; the host only dispatches
+// this over full 64x64 tiles — ragged edges go to sgemm4x4.
+kernel void mma_gemm(
+    device const float* w32 [[buffer(0)]],   // [c][k]
+    device const float* xT [[buffer(1)]],    // [k][Tpad]
+    device float* y [[buffer(2)]],
+    constant int& in_dim [[buffer(3)]],
+    constant int& out_dim [[buffer(4)]],
+    constant int& T [[buffer(5)]],
+    constant int& Tpad [[buffer(6)]],
+    uint2 g [[threadgroup_position_in_grid]],
+    uint2 tp [[thread_position_in_threadgroup]])
+{
+    threadgroup float tA[16 * 64];   // [k][t]
+    threadgroup float tB[64 * 17];   // [c][k] padded +1 to dodge bank conflicts
+    int sgid = (int)tp.x >> 5, tid = (int)tp.x;
+    int st = (int)(sgid & 3) * 16;          // 4 sub-tiles of 16t
+    int sc = (int)(sgid >> 2) * 32;         // 2 sub-tiles of 32c
+    int t0 = (int)g.y * 64 + st;
+    int c0 = (int)g.x * 64 + sc;
+    int tgT = (int)g.y * 64, tgC = (int)g.x * 64;
+
+    simdgroup_float8x8 acc[2][4];
+    for (int i = 0; i < 2; i++) for (int j = 0; j < 4; j++) acc[i][j] = simdgroup_float8x8(0.0f);
+
+    // A stage: 16k x 64t = 256 float4, one per thread: k=tid>>4, t4=(tid&15)*4
+    int aK = tid >> 4, aT = (tid & 15) * 4;
+    // B stage: 64c x 16k = 256 float4, one per thread: c=tid>>2, k4=(tid&3)*4
+    int bC = tid >> 2, bK = (tid & 3) * 4;
+    device const float* aSrc = xT + tgT + aT;
+    device const float* bSrc = w32 + (ulong)(tgC + bC) * in_dim;
+
+    for (int kb = 0; kb < in_dim; kb += 16) {
+        *(threadgroup float4*)(tA + aK * 64 + aT) =
+            *(const device float4*)(aSrc + (ulong)(kb + aK) * Tpad);
+        *(threadgroup float4*)(tB + bC * 17 + bK) =
+            *(const device float4*)(bSrc + kb + bK);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int kk = 0; kk < 16; kk += 8) {
+            simdgroup_float8x8 a0, a1;
+            simdgroup_load(a0, tA + kk * 64 + st, 64, ulong2(0,0), true);
+            simdgroup_load(a1, tA + kk * 64 + st + 8, 64, ulong2(0,0), true);
+            simdgroup_float8x8 b0, b1, b2, b3;
+            simdgroup_load(b0, tB + (sc + 0) * 17 + kk, 17, ulong2(0,0), true);
+            simdgroup_load(b1, tB + (sc + 8) * 17 + kk, 17, ulong2(0,0), true);
+            simdgroup_load(b2, tB + (sc + 16) * 17 + kk, 17, ulong2(0,0), true);
+            simdgroup_load(b3, tB + (sc + 24) * 17 + kk, 17, ulong2(0,0), true);
+            simdgroup_multiply_accumulate(acc[0][0], a0, b0, acc[0][0]);
+            simdgroup_multiply_accumulate(acc[0][1], a0, b1, acc[0][1]);
+            simdgroup_multiply_accumulate(acc[0][2], a0, b2, acc[0][2]);
+            simdgroup_multiply_accumulate(acc[0][3], a0, b3, acc[0][3]);
+            simdgroup_multiply_accumulate(acc[1][0], a1, b0, acc[1][0]);
+            simdgroup_multiply_accumulate(acc[1][1], a1, b1, acc[1][1]);
+            simdgroup_multiply_accumulate(acc[1][2], a1, b2, acc[1][2]);
+            simdgroup_multiply_accumulate(acc[1][3], a1, b3, acc[1][3]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int i = 0; i < 2; i++)
+        for (int j = 0; j < 4; j++)
+            simdgroup_store(acc[i][j], y + (ulong)(t0 + i * 8) * out_dim + c0 + j * 8, (ulong)out_dim);
 }
 
 // ---- dequant -> fp32 rows [col][k]; one thread per (col, granule-group).
@@ -1043,6 +1202,326 @@ kernel void stq_deq(
             *(device float4*)(o + lane * 16 + i4 * 4) = d * float4(
                 wv[i4 * 4 + 0][lane], wv[i4 * 4 + 1][lane],
                 wv[i4 * 4 + 2][lane], wv[i4 * 4 + 3][lane]);
+}
+
+
+// ===================== M7: fused decode kernels =====================
+// gemv_multi: up to 3 weight sections in ONE dispatch. Each 4-column
+// subgroup resolves its section from the global column index and branches
+// on that section's quant type — q/k/v or gate+up pairs with mixed quant
+// types (e.g. q4k + q6k) fuse without a per-type kernel.
+// types: 0=Q4_K 1=Q6_K 2=Q8_0 3=Q2_0C 4=STQ1_0.
+// flags: bit0 accumulate (y = acc + dot), bit1 pair-silu
+// (y0[i] = silu(dot0)·dot1), bits 2/3/4 = per-section bf16 output.
+inline ulong mv_rowbytes(int t, int in_dim) {
+    switch (t) {
+        case 0: return (ulong)(in_dim >> 8) * 144;
+        case 1: return (ulong)(in_dim >> 8) * 210;
+        case 2: return (ulong)(in_dim >> 5) * 34;
+        case 3: return (ulong)(in_dim >> 9) * 130;
+        default: return (ulong)(in_dim >> 8) * 42;
+    }
+}
+
+// Scales entries a section needs in the staged table: q4k -> in_dim/32
+// groups, q6k -> in_dim/16, others stage nothing.
+inline int mv_ng(int t, int in_dim) {
+    return t == 0 ? in_dim >> 5 : (t == 1 ? in_dim >> 4 : 0);
+}
+
+// Stage per-group scales into the subgroup's sf slice (K-quants only).
+// sf has 384 float2 per subgroup — threadgroup memory is the occupancy
+// limiter on paravirt GPUs; pair mode packs sections A+B into the same
+// slice (A at [0,ngA), B at [ngA, ngA+ngB)).
+inline void mv_stage(int t, const device uchar* row, int st, int in_dim,
+                     threadgroup float2* sf) {
+    if (t == 0) {
+        int ng = in_dim >> 5;
+        for (int gi = st; gi < ng; gi += 64) {
+            const device uchar* bp = row + (gi >> 3) * 144;
+            int sc, mn;
+            get_scale_min_k4(gi & 7, bp + 4, sc, mn);
+            float d = float(*reinterpret_cast<const device half*>(bp));
+            float dm = float(*reinterpret_cast<const device half*>(bp + 2));
+            sf[gi] = float2(d * float(sc), dm * float(mn));
+        }
+    } else if (t == 1) {
+        int ng = in_dim >> 4;
+        for (int gi = st; gi < ng; gi += 64) {
+            const device uchar* bp = row + (gi >> 4) * 210;
+            float d = float(*(const device half*)(bp + 208));
+            float s = float(*(const device char*)(bp + 192 + (gi & 15)));
+            sf[gi] = float2(d * s, -32.0f * d * s);
+        }
+    }
+}
+
+// One thread's partial dot for a row — identical math to the *_gemv_fast4
+// kernels, with sf pointing at the subgroup's section slice instead of
+// a global index base.
+inline float mv_dot(int t, const device uchar* row, device const float* x,
+                    int st, int in_dim, threadgroup const float2* sf) {
+    switch (t) {
+        case 0: {  // Q4_K
+            float acc = 0.0f;
+            int nwords = in_dim >> 3;
+            for (int wi = st; wi < nwords; wi += 64) {
+                int blk = wi >> 5;
+                int wpos = wi & 31;
+                int pi = wpos >> 3;
+                int p4 = (wpos & 7) << 2;
+                const device uchar* bp = row + blk * 144;
+                uint q4 = *reinterpret_cast<const device uint*>(bp + 16 + pi * 32 + p4);
+                int g0 = pi << 1;
+                int kbase = blk * 256 + (pi << 6) + p4;
+                float2 s0 = sf[(blk << 3) + g0];
+                float2 s1 = sf[(blk << 3) + g0 + 1];
+                for (int j = 0; j < 4; j++) {
+                    uint nib = (q4 >> (j * 8)) & 0xffu;
+                    acc += x[kbase + j]      * (s0.x * float(nib & 15u) - s0.y);
+                    acc += x[kbase + 32 + j] * (s1.x * float(nib >> 4) - s1.y);
+                }
+            }
+            return acc;
+        }
+        case 1: {  // Q6_K
+            float acc = 0.0f;
+            int numUnits = in_dim >> 4;
+            for (int u = st; u < numUnits; u += 64) {
+                int blk = u >> 4;
+                int j = (u >> 3) & 1;
+                int lq = u & 7;
+                const device uchar* bp = row + blk * 210;
+                ushort2 ua = *(const device packed_ushort2*)(bp + j * 64 + lq * 4);
+                ushort2 ub = *(const device packed_ushort2*)(bp + j * 64 + 32 + lq * 4);
+                ushort2 uh = *(const device packed_ushort2*)(bp + 128 + j * 32 + lq * 4);
+                int4 la = int4(ua.x & 0xFF, ua.x >> 8, ua.y & 0xFF, ua.y >> 8);
+                int4 lb = int4(ub.x & 0xFF, ub.x >> 8, ub.y & 0xFF, ub.y >> 8);
+                int4 hb = int4(uh.x & 0xFF, uh.x >> 8, uh.y & 0xFF, uh.y >> 8);
+                int base = blk * 256 + j * 128;
+                int4 q0 = int4(la.x & 0xF, la.y & 0xF, la.z & 0xF, la.w & 0xF) |
+                          (int4(hb.x & 3, hb.y & 3, hb.z & 3, hb.w & 3) << 4);
+                int4 q1 = int4(lb.x & 0xF, lb.y & 0xF, lb.z & 0xF, lb.w & 0xF) |
+                          (int4((hb.x >> 2) & 3, (hb.y >> 2) & 3, (hb.z >> 2) & 3, (hb.w >> 2) & 3) << 4);
+                int4 q2 = int4((la.x >> 4) & 0xF, (la.y >> 4) & 0xF, (la.z >> 4) & 0xF, (la.w >> 4) & 0xF) |
+                          (int4((hb.x >> 4) & 3, (hb.y >> 4) & 3, (hb.z >> 4) & 3, (hb.w >> 4) & 3) << 4);
+                int4 q3 = int4((lb.x >> 4) & 0xF, (lb.y >> 4) & 0xF, (lb.z >> 4) & 0xF, (lb.w >> 4) & 0xF) |
+                          (int4((hb.x >> 6) & 3, (hb.y >> 6) & 3, (hb.z >> 6) & 3, (hb.w >> 6) & 3) << 4);
+                int g0 = blk * 16 + j * 8 + (lq >> 2);
+                float2 s0 = sf[g0],     s1 = sf[g0 + 2];
+                float2 s2 = sf[g0 + 4], s3 = sf[g0 + 6];
+                float4 x0 = *(const device float4*)(x + base + lq * 4);
+                float4 x1 = *(const device float4*)(x + base + 32 + lq * 4);
+                float4 x2 = *(const device float4*)(x + base + 64 + lq * 4);
+                float4 x3 = *(const device float4*)(x + base + 96 + lq * 4);
+                acc += dot(x0, s0.x * float4(q0) + s0.y) + dot(x1, s1.x * float4(q1) + s1.y)
+                     + dot(x2, s2.x * float4(q2) + s2.y) + dot(x3, s3.x * float4(q3) + s3.y);
+            }
+            return acc;
+        }
+        case 2: {  // Q8_0
+            float acc = 0.0f;
+            int bpr = in_dim >> 5;
+            for (int b = st; b < bpr; b += 64) {
+                const device uchar* bp = row + b * 34;
+                float d = float(*(const device half*)bp);
+                float s = 0.0f;
+                for (int k = 0; k < 8; k++) {
+                    char4 q = *(const device packed_char4*)(bp + 2 + k * 4);
+                    s += dot(float4(q.x, q.y, q.z, q.w),
+                             *(const device float4*)(x + b * 32 + k * 4));
+                }
+                acc += d * s;
+            }
+            return acc;
+        }
+        case 3: {  // Q2_0C
+            float acc = 0.0f;
+            int nsub = in_dim >> 6;
+            for (int si = st; si < nsub; si += 64) {
+                int blk = si >> 3, sj = si & 7;
+                const device uchar* bp = row + blk * 130;
+                float d = float(*(const device half*)bp);
+                int xb = blk * 512 + sj * 64;
+                float ss = 0.0f;
+                for (int k = 0; k < 4; k++) {
+                    uchar4 u = *(const device packed_uchar4*)(bp + 2 + sj * 16 + k * 4);
+                    for (int bi = 0; bi < 4; bi++) {
+                        int ub = u[bi];
+                        float4 wv = float4(
+                            float(((ub      ) & 3) * 2 - 3), float(((ub >> 2) & 3) * 2 - 3),
+                            float(((ub >> 4) & 3) * 2 - 3),  float(((ub >> 6) & 3) * 2 - 3));
+                        ss += dot(wv, *(const device float4*)(x + xb + k * 16 + bi * 4));
+                    }
+                }
+                acc += d * ss;
+            }
+            return acc;
+        }
+        default: {  // STQ1_0
+            float acc = 0.0f;
+            int nsub = in_dim >> 6;
+            for (int si = st; si < nsub; si += 64) {
+                int blk = si >> 2, c = si & 3;
+                const device uchar* bp = row + blk * 42;
+                float d = float(*(const device half*)(bp + 40));
+                uchar4 qa = *(const device packed_uchar4*)(bp + c * 8);
+                uchar4 qb = *(const device packed_uchar4*)(bp + c * 8 + 4);
+                uchar2 sg = *(const device packed_uchar2*)(bp + 32 + c * 2);
+                int xb = blk * 256 + c * 64;
+                float ss = 0.0f;
+                for (int i4 = 0; i4 < 4; i4++) {
+                    float w[4][4];
+                    for (int gg = 0; gg < 4; gg++) stq_group(i4 * 4 + gg, qa, qb, sg, w[gg]);
+                    float4 x0 = *(const device float4*)(x + xb + i4 * 4);
+                    float4 x1 = *(const device float4*)(x + xb + i4 * 4 + 16);
+                    float4 x2 = *(const device float4*)(x + xb + i4 * 4 + 32);
+                    float4 x3 = *(const device float4*)(x + xb + i4 * 4 + 48);
+                    for (int gg = 0; gg < 4; gg++)
+                        ss += w[gg][0] * x0[gg] + w[gg][1] * x1[gg]
+                            + w[gg][2] * x2[gg] + w[gg][3] * x3[gg];
+                }
+                acc += d * ss;
+            }
+            return acc;
+        }
+    }
+}
+
+kernel void gemv_multi(
+    device const float* x [[buffer(0)]],
+    device const uchar* w0 [[buffer(1)]],
+    device const uchar* w1 [[buffer(2)]],
+    device const uchar* w2 [[buffer(3)]],
+    device uchar* y0 [[buffer(4)]],
+    device uchar* y1 [[buffer(5)]],
+    device uchar* y2 [[buffer(6)]],
+    device const float* accIn [[buffer(7)]],
+    constant int& in_dim [[buffer(8)]],
+    constant int4& ncols [[buffer(9)]],
+    constant int4& types [[buffer(10)]],
+    constant int& flags [[buffer(11)]],
+    uint g [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    int sub = (int)(tid >> 6), st = (int)(tid & 63u);
+    int c = (int)g * 4 + sub;
+    bool pair = (flags & 2) != 0;
+    const device uchar* rowA = w0;
+    const device uchar* rowB = w1;
+    device uchar* yp = y0;
+    int tA = types.x, tB = types.y;
+    int lc = c;
+    bool valid = true;
+    int bf = 0;
+    if (pair) {
+        valid = lc < ncols.x && ncols.x > 0;
+        if (!valid) lc = max(ncols.x - 1, 0);
+    } else {
+        int s, l;
+        if (c < ncols.x) { s = 0; l = c; }
+        else if (c < ncols.x + ncols.y) { s = 1; l = c - ncols.x; }
+        else { s = 2; l = c - ncols.x - ncols.y; }
+        int sn = s == 0 ? ncols.x : (s == 1 ? ncols.y : ncols.z);
+        valid = l >= 0 && l < sn;
+        if (!valid) l = max(sn - 1, 0);
+        tA = s == 0 ? types.x : (s == 1 ? types.y : types.z);
+        rowA = s == 0 ? w0 : (s == 1 ? w1 : w2);
+        yp = s == 0 ? y0 : (s == 1 ? y1 : y2);
+        bf = (flags >> (2 + s)) & 1;
+        lc = l;
+    }
+    const device uchar* rw = rowA + (ulong)lc * mv_rowbytes(tA, in_dim);
+    threadgroup float2 sf[4 * 384];
+    threadgroup float2* sfA = sf + sub * 384;
+    threadgroup float2* sfB = sfA + mv_ng(tA, in_dim);
+    mv_stage(tA, rw, st, in_dim, sfA);
+    const device uchar* rwB = rowB;
+    if (pair) {
+        rwB = rowB + (ulong)lc * mv_rowbytes(tB, in_dim);
+        mv_stage(tB, rwB, st, in_dim, sfB);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float accA = mv_dot(tA, rw, x, st, in_dim, sfA);
+    float accB = pair ? mv_dot(tB, rwB, x, st, in_dim, sfB) : 0.0f;
+    threadgroup float r1[256], r2[256];
+    r1[tid] = accA;
+    r2[tid] = accB;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s2 = 32; s2 > 0; s2 >>= 1) {
+        if (st < s2) {
+            r1[tid] += r1[tid + s2];
+            if (pair) r2[tid] += r2[tid + s2];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (st != 0 || !valid) return;
+    if (pair) {
+        float gv = r1[tid], uv = r2[tid];
+        ((device float*)y0)[lc] = gv / (1.0f + exp(-gv)) * uv;
+    } else if ((flags & 1) != 0) {
+        ((device float*)yp)[lc] = accIn[lc] + r1[tid];
+    } else if (bf != 0) {
+        ((device ushort*)yp)[lc] = f32_to_bf16(r1[tid]);
+    } else {
+        ((device float*)yp)[lc] = r1[tid];
+    }
+}
+
+// Fused NeoX-rope + per-head rmsnorm for q and k, one threadgroup per head
+// row. q rows transform in place (fp32); k rows transform then land
+// DIRECTLY in the bf16 KV row for `pos` — the separate kv_append hop
+// disappears. headDim <= 256 (threadgroup staging).
+kernel void rope_rms(
+    device float* q [[buffer(0)]],
+    device const float* k [[buffer(1)]],
+    device ushort* kDst [[buffer(2)]],
+    device const float* qNW [[buffer(3)]],
+    device const float* kNW [[buffer(4)]],
+    constant int& heads [[buffer(5)]],
+    constant int& headDim [[buffer(6)]],
+    constant int& ropeDim [[buffer(7)]],
+    constant int& pos [[buffer(8)]],
+    constant float& base [[buffer(9)]],
+    constant float& eps [[buffer(10)]],
+    uint g [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]])
+{
+    bool isQ = (int)g < heads;
+    int r = isQ ? (int)g : (int)g - heads;
+    threadgroup float rowv[256];
+    threadgroup float red[256];
+    if (isQ) {
+        for (int i = (int)tid; i < headDim; i += 256) rowv[i] = q[(int)g * headDim + i];
+    } else {
+        for (int i = (int)tid; i < headDim; i += 256) rowv[i] = k[r * headDim + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int hd = ropeDim >> 1;
+    if ((int)tid < hd) {
+        float freq = 1.0f / pow(base, float(tid) / float(hd));
+        float a = float(pos) * freq;
+        float c = cos(a), s = sin(a);
+        float x0 = rowv[tid], x1 = rowv[tid + hd];
+        rowv[tid] = x0 * c - x1 * s;
+        rowv[tid + hd] = x0 * s + x1 * c;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float acc2 = 0.0f;
+    for (int i = (int)tid; i < headDim; i += 256) acc2 += rowv[i] * rowv[i];
+    red[tid] = acc2;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 128; s > 0; s >>= 1) {
+        if ((int)tid < s) red[tid] += red[tid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float scale = 1.0f / sqrt(red[0] / float(headDim) + eps);
+    const device float* nw = isQ ? qNW : kNW;
+    for (int i = (int)tid; i < headDim; i += 256) {
+        float v = rowv[i] * scale * nw[i];
+        if (isQ) q[(int)g * headDim + i] = v;
+        else kDst[r * headDim + i] = f32_to_bf16(v);
+    }
 }
 
 ";

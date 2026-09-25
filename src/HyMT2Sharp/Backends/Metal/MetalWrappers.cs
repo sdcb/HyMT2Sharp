@@ -97,6 +97,15 @@ public struct CmdCtx : IDisposable
         unsafe { ObjC.SendV1P2N(Enc, ObjC.Sel("setBytes:length:atIndex:"), (IntPtr)(&v), 4, index); }
     }
 
+    public void SetInt4(nuint index, int x, int y, int z, int w)
+    {
+        unsafe
+        {
+            int* v = stackalloc int[] { x, y, z, w };
+            ObjC.SendV1P2N(Enc, ObjC.Sel("setBytes:length:atIndex:"), (IntPtr)v, 16, index);
+        }
+    }
+
     public void SetFloat(nuint index, float v)
     {
         unsafe { ObjC.SendV1P2N(Enc, ObjC.Sel("setBytes:length:atIndex:"), (IntPtr)(&v), 4, index); }
