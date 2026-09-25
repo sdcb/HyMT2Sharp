@@ -55,18 +55,18 @@ HyMT2Sharp 分发顺序 **AVX-VNNI → AVX2 → AdvSimd/SDOT → `Vector<float>`
 
 ### Metal GPU 后端（纯 net10.0 + libobjc P/Invoke，`--backend metal`，同日补测）
 
-同一 VM 的 Apple M4 paravirtual GPU（Metal only，无 bfloat/simdgroup 特性，走 portable 档 kernel）。decode 为 M2 融合图（embed_gather 去 host 化，~165 dispatch/token），prefill 为量化 GEMM（TILE_T=8）+ 融合 causal attention；KV 为 bf16 + 64-token 块表分页（device 侧 KvBlockStore）。支持全部 5 种量化（Q2_0C/STQ1_0 的 embd 为 Q6_K，output.weight 与其绑定）。
+同一 VM 的 Apple M4 paravirtual GPU（Metal only，无 bfloat/simdgroup 特性，走 portable 档 kernel）。decode 为 M2 融合图（embed_gather 去 host 化，~165 dispatch/token），prefill 为两段式 fp32 GEMM（量化权重一次性反量化进 `_wfp32` 缓存 + xT 转置 + 64tok×64col/256线程 `sgemm4x4`）+ 融合 causal attention；KV 为 bf16 + 64-token 块表分页（device 侧 KvBlockStore）。支持全部 5 种量化（Q2_0C/STQ1_0 的 embd 为 Q6_K，output.weight 与其绑定）。
 
 | 量化   | Metal prefill 512 | SDOT prefill | Metal decode 128 | SDOT decode | Metal/SDOT decode |
 | ------ | ----------------: | -----------: | ---------------: | ----------: | ----------------: |
-| STQ1_0 |              89.9 |     140.00   |            59.76 |      38.54  |           1.55×   |
-| Q2_0C  |             115.1 |     137.89   |            59.37 |      46.46  |           1.28×   |
-| Q4_K_M |             203.6 |     147.70   |            56.25 |      40.83  |           1.38×   |
-| Q6_K   |             211.3 |     194.86   |            53.63 |      35.87  |           1.50×   |
-| Q8_0   |             164.1 |     207.81   |            43.50 |      34.41  |           1.26×   |
+| STQ1_0 |             646.4 |     140.00   |            58.59 |      38.54  |           1.52×   |
+| Q2_0C  |             650.0 |     137.89   |            59.59 |      46.46  |           1.28×   |
+| Q4_K_M |             649.6 |     147.70   |            56.30 |      40.83  |           1.38×   |
+| Q6_K   |             650.2 |     194.86   |            51.15 |      35.87  |           1.43×   |
+| Q8_0   |             646.2 |     207.81   |            49.96 |      34.41  |           1.45×   |
 
 - **decode 全面反超 SDOT**（1.26–1.55×），但各量化收敛在 44–60 tok/s 而非随位宽下降等比变快——瓶颈已移到与量化无关的部分：vocab=120818 的 logits gemv（embd/output 恒为 Q6_K，STQ/Q2 文件里它独占 ~44% 字节）加固定 dispatch 序列；低位量化的权重字节优势被淹没。
-- **prefill 只有 Q4/Q6 反超**：paravirt GPU 算力弱（paravirt GPU 无 tensor core 路径，纯 ALU），GEMM 吞吐与 SDOT CPU 接近，Q8/Q2/STQ 的反量化成本把 GPU 拖回 CPU 之下。
+- **prefill 改造后全量化 ~647–650 tok/s**（原 90–211）：权重反量化从 hot loop 挪进一次性 `_wfp32` 缓存（fp32 副本，代价 ~6GB 常驻显存/共享内存），hot loop 只剩一个量化无关的 fp32 `sgemm4x4`——各量化收敛到同一吞吐即 GEMM 已到该 GPU 的算力墙（实测 fp32 FMA 峰值 ~3.9 TFLOP/s，prefill 512 约耗 ~2.3 TFLOP/s ≈ 60% 峰值；对比 MLX 同机 767 tok/s）。原"逐量化 GEMM+TILE_T=8"形态下 X 被每 4 列重读一遍、in_dim=2048 的 K-quant GEMM 只有 8/64 线程有活，是此前 ~200 的主因。
 - **STQ kernel 曾撞 paravirt GPU watchdog**（~10s command buffer 上限）：初版逐 lane 标量 gather + 函数内 `const uchar CB[32]` 被编译器 spill 到私有显存，512-token prefill 25s 触发 timeout（`status=5,error=2`），之后所有 command buffer 被秒拒（`error=4`）表现为 decode "1368 tok/s" 假象。改法：CB 提为文件作用域 `constant`、内层按 4 组一批做 `float4` 向量化读 x——25s→5.7s，回到阈值内。**对低位量化 kernel 的教训：paravirt GPU 上私有地址空间的动态索引小表是性能杀手。**
 - 复现：`./Sdcb.HyMT2Sharp.Benchmark --model <gguf> --bench-prefill 512 --bench-decode 128 --backend metal`；`HYMT_METAL_TIMING=1` 可看每 token 的 encode/GPU 分解。
 

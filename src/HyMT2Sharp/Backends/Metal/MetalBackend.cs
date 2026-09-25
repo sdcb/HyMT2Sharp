@@ -20,7 +20,10 @@ public sealed unsafe class MetalBackend : IComputeBackend
     private readonly Dictionary<string, IntPtr> _w = new(StringComparer.Ordinal);
     private readonly Dictionary<string, GgmlTensorType> _wtype = new(StringComparer.Ordinal);
     private IntPtr _psoGemv, _psoGemvQ6, _psoGemvQ8, _psoGemvQ2, _psoGemvStq;
-    private IntPtr _psoGemm, _psoGemmQ6, _psoGemmQ8, _psoGemmQ2, _psoGemmStq;
+    private IntPtr _psoSgemm, _psoXt, _psoDeqQ4, _psoDeqQ6, _psoDeqQ8, _psoDeqQ2, _psoDeqStq;
+    // Persistently dequantized fp32 weight copies for prefill GEMM (M6):
+    // allocated on first use so decode-only runs pay nothing.
+    private readonly Dictionary<string, IntPtr> _wfp32 = new(StringComparer.Ordinal);
     private IntPtr _psoEmbedQ4, _psoEmbedQ6, _psoEmbedQ8, _psoRms, _psoRope, _psoKvAppend, _psoAttn, _psoSilu, _psoAdd;
     private IntPtr _psoEmbedRowsQ4, _psoEmbedRowsQ6, _psoEmbedRowsQ8, _psoRopeMulti, _psoKvAppendMulti;
     private IntPtr _psoAttnScores, _psoAttnCombine, _psoKvCopy;
@@ -91,11 +94,13 @@ public sealed unsafe class MetalBackend : IComputeBackend
         _psoAttn = NewPso(lib2, "attn_decode");
         _psoSilu = NewPso(lib2, "silu_mul");
         _psoAdd = NewPso(lib2, "add_inplace");
-        _psoGemm = NewPso(lib2, "q4k_gemm");
-        _psoGemmQ6 = NewPso(lib2, "q6k_gemm");
-        _psoGemmQ8 = NewPso(lib2, "q8_0_gemm");
-        _psoGemmQ2 = NewPso(lib2, "q2c_gemm");
-        _psoGemmStq = NewPso(lib2, "stq_gemm");
+        _psoSgemm = NewPso(lib2, "sgemm4x4");
+        _psoXt = NewPso(lib2, "xtranspose");
+        _psoDeqQ4 = NewPso(lib2, "q4k_deq");
+        _psoDeqQ6 = NewPso(lib2, "q6k_deq");
+        _psoDeqQ8 = NewPso(lib2, "q8_0_deq");
+        _psoDeqQ2 = NewPso(lib2, "q2c_deq");
+        _psoDeqStq = NewPso(lib2, "stq_deq");
         _psoEmbedRowsQ4 = NewPso(lib2, "q4k_embed_rows");
         _psoEmbedRowsQ6 = NewPso(lib2, "q6k_embed_rows");
         _psoEmbedRowsQ8 = NewPso(lib2, "q8_0_embed_rows");
@@ -489,6 +494,12 @@ public sealed unsafe class MetalBackend : IComputeBackend
         IntPtr down = _dev.NewBuffer((nuint)(T * hidden * 4));
         IntPtr normed = _dev.NewBuffer((nuint)(T * hidden * 4));
         IntPtr scores = _dev.NewBuffer((nuint)heads * (nuint)T * (nuint)kvLen * 4);
+        // Transposed copies of the four per-layer GEMM inputs (xT[k][t]).
+        int Tpad = (T + 63) & ~63;
+        IntPtr xT1 = _dev.NewBuffer((nuint)(hidden * Tpad * 4));   // n1 (q/k/v)
+        IntPtr xT2 = _dev.NewBuffer((nuint)(hidden * Tpad * 4));   // n2 (gate/up)
+        IntPtr xT3 = _dev.NewBuffer((nuint)(qDim * Tpad * 4));     // ao (attn_output)
+        IntPtr xT4 = _dev.NewBuffer((nuint)(ffn * Tpad * 4));      // silu(gate) (down)
 
         var cc = CmdCtx.Begin(_dev.Queue);
         ExecCopies(cc);
@@ -497,13 +508,23 @@ public sealed unsafe class MetalBackend : IComputeBackend
         cc.SetBuffer(_embd, 0, 0); cc.SetBuffer(toks, 0, 1); cc.SetBuffer(h, 0, 2);
         cc.SetInt(3, hidden);
         cc.Dispatch((nuint)T, 1, 1, 256, 1, 1);
+        if (Environment.GetEnvironmentVariable("HYMT_METAL_EARLYD") == "1")
+        {
+            cc.EndEnc(); cc.Commit(); cc.Wait();
+            DumpF(h, T * hidden, "h_early");
+            cc = CmdCtx.Begin(_dev.Queue);
+        }
 
-        for (int l = 0; l < c.NumLayers; l++)
+        int maxLayers = c.NumLayers;
+        if (int.TryParse(Environment.GetEnvironmentVariable("HYMT_METAL_LAYERS"), out int ml))
+            maxLayers = Math.Min(ml, c.NumLayers);
+        for (int l = 0; l < maxLayers; l++)
         {
             Rms(cc, h, W($"blk.{l}.attn_norm.weight"), n1, T, hidden);
-            Gemm(cc, $"blk.{l}.attn_q.weight", n1, q, hidden, qDim, T);
-            Gemm(cc, $"blk.{l}.attn_k.weight", n1, kb, hidden, kDim, T);
-            Gemm(cc, $"blk.{l}.attn_v.weight", n1, vb, hidden, kDim, T);
+            Xt(cc, n1, xT1, hidden, T, Tpad);
+            Gemm(cc, $"blk.{l}.attn_q.weight", xT1, q, hidden, qDim, T, Tpad);
+            Gemm(cc, $"blk.{l}.attn_k.weight", xT1, kb, hidden, kDim, T, Tpad);
+            Gemm(cc, $"blk.{l}.attn_v.weight", xT1, vb, hidden, kDim, T, Tpad);
             RopeMulti(cc, q, heads, dim, start, T);
             RopeMulti(cc, kb, kvHeads, dim, start, T);
             Rms(cc, q, W($"blk.{l}.attn_q_norm.weight"), q, T * heads, dim);
@@ -544,17 +565,20 @@ public sealed unsafe class MetalBackend : IComputeBackend
                 cc.SetBuffer(_kvTab, 0, 10); cc.SetInt(11, BlkShift);
                 cc.Dispatch((nuint)T, (nuint)heads, 1, 128, 1, 1);
             }
-            Gemm(cc, $"blk.{l}.attn_output.weight", ao, attnOut, qDim, hidden, T);
+            Xt(cc, ao, xT3, qDim, T, Tpad);
+            Gemm(cc, $"blk.{l}.attn_output.weight", xT3, attnOut, qDim, hidden, T, Tpad);
             Add(cc, h, attnOut, T * hidden);
 
             Rms(cc, h, W($"blk.{l}.ffn_norm.weight"), n2, T, hidden);
-            Gemm(cc, $"blk.{l}.ffn_gate.weight", n2, gate, hidden, ffn, T);
-            Gemm(cc, $"blk.{l}.ffn_up.weight", n2, up, hidden, ffn, T);
+            Xt(cc, n2, xT2, hidden, T, Tpad);
+            Gemm(cc, $"blk.{l}.ffn_gate.weight", xT2, gate, hidden, ffn, T, Tpad);
+            Gemm(cc, $"blk.{l}.ffn_up.weight", xT2, up, hidden, ffn, T, Tpad);
             cc.SetPso(_psoSilu);
             cc.SetBuffer(gate, 0, 0); cc.SetBuffer(up, 0, 1);
             cc.SetInt(2, T * ffn);
             cc.Dispatch((nuint)((T * ffn + 255) / 256), 1, 1, 256, 1, 1);
-            Gemm(cc, $"blk.{l}.ffn_down.weight", gate, down, ffn, hidden, T);
+            Xt(cc, gate, xT4, ffn, T, Tpad);
+            Gemm(cc, $"blk.{l}.ffn_down.weight", xT4, down, ffn, hidden, T, Tpad);
             Add(cc, h, down, T * hidden);
         }
 
@@ -564,9 +588,18 @@ public sealed unsafe class MetalBackend : IComputeBackend
         cc.EndEnc();
         cc.Commit();
         cc.Wait();
+        if (Environment.GetEnvironmentVariable("HYMT_METAL_DUMP") == "1")
+        {
+            DumpF(n1, T * hidden, "n1"); DumpF(q, T * qDim, "q");
+            DumpF(kb, T * kDim, "kb"); DumpF(vb, T * kDim, "vb"); DumpF(ao, T * qDim, "ao");
+            DumpF(gate, T * ffn, "gate"); DumpF(down, T * hidden, "down");
+            DumpF(normed, T * hidden, "normed"); DumpF(xT1, hidden * Tpad, "xT1");
+            DumpF(h, T * hidden, "h");
+        }
         // GPU is done with the scratch; newBuffer* returned +1 objects.
         foreach (IntPtr b in new[]
-            { toks, h, n1, n2, q, kb, vb, ao, attnOut, gate, up, down, normed, scores })
+            { toks, h, n1, n2, q, kb, vb, ao, attnOut, gate, up, down, normed, scores,
+              xT1, xT2, xT3, xT4 })
             ObjC.Release(b);
         cc.Drain();
 
@@ -633,17 +666,45 @@ public sealed unsafe class MetalBackend : IComputeBackend
         c.Dispatch((nuint)((outDim + 3) / 4), 1, 1, 256, 1, 1);
     }
 
-    // [T x inDim] · W^T -> [T x outDim]; TILE_T=8 token rows per threadgroup tile.
-    private void Gemm(CmdCtx c, string name, IntPtr x, IntPtr y, int inDim, int outDim, int T)
+    // x -> xT[k][t] (stride Tpad), 32x32 tiled transpose.
+    private void Xt(CmdCtx c, IntPtr x, IntPtr xT, int dim, int T, int Tpad)
     {
+        c.SetPso(_psoXt);
+        c.SetBuffer(x, 0, 0); c.SetBuffer(xT, 0, 1);
+        c.SetInt(2, dim); c.SetInt(3, T); c.SetInt(4, Tpad);
+        c.Dispatch((nuint)((dim + 31) / 32), (nuint)(Tpad / 32), 1, 256, 1, 1);
+    }
+
+    // Lazily dequantize a weight tensor into a persistent fp32 buffer
+    // ([out][in] rows) and return it; later calls reuse the cached copy.
+    private IntPtr WFp32(CmdCtx c, string name, int inDim, int outDim)
+    {
+        if (_wfp32.TryGetValue(name, out IntPtr buf)) return buf;
+        buf = _dev.NewBuffer((nuint)inDim * (nuint)outDim * 4);
+        _wfp32[name] = buf;
         IntPtr w = W(name);
-        // Same sf[] staging bound as gemv — only the K-quant kernels use it.
-        if (inDim > 6144 && _wtype[name] is GgmlTensorType.Q4_K or GgmlTensorType.Q6_K)
-            throw new NotSupportedException($"gemm {name}: in_dim {inDim} exceeds fast4 K-quant staging limit 6144");
-        c.SetPso(PsoFor(name, inDim, (_psoGemm, _psoGemmQ6, _psoGemmQ8, _psoGemmQ2, _psoGemmStq)));
-        c.SetBuffer(w, 0, 0); c.SetBuffer(x, 0, 1); c.SetBuffer(y, 0, 2);
-        c.SetInt(3, inDim); c.SetInt(4, outDim); c.SetInt(5, T);
-        c.Dispatch((nuint)((outDim + 3) / 4), (nuint)((T + 7) / 8), 1, 256, 1, 1);  // TILE_T=8
+        c.SetPso(PsoFor(name, inDim, (_psoDeqQ4, _psoDeqQ6, _psoDeqQ8, _psoDeqQ2, _psoDeqStq)));
+        c.SetBuffer(w, 0, 0); c.SetBuffer(buf, 0, 1);
+        c.SetInt(2, inDim); c.SetInt(3, outDim);
+        int cover = _wtype[name] switch   // elements each dequant thread writes
+        {
+            GgmlTensorType.Q6_K => 16,
+            GgmlTensorType.Q8_0 => 32,
+            _ => 64,
+        };
+        int units = (inDim + cover - 1) / cover;
+        c.Dispatch((nuint)((units + 31) / 32), (nuint)outDim, 1, 32, 1, 1);
+        return buf;
+    }
+
+    // [T x inDim] · W^T -> [T x outDim] via sgemm4x4 on fp32 weights + xT.
+    private void Gemm(CmdCtx c, string name, IntPtr xT, IntPtr y, int inDim, int outDim, int T, int Tpad)
+    {
+        IntPtr w32 = WFp32(c, name, inDim, outDim);
+        c.SetPso(_psoSgemm);
+        c.SetBuffer(w32, 0, 0); c.SetBuffer(xT, 0, 1); c.SetBuffer(y, 0, 2);
+        c.SetInt(3, inDim); c.SetInt(4, outDim); c.SetInt(5, T); c.SetInt(6, Tpad);
+        c.Dispatch((nuint)((outDim + 63) / 64), (nuint)(Tpad / 64), 1, 256, 1, 1);
     }
 
     private void Rms(CmdCtx c, IntPtr x, IntPtr w, IntPtr y, int rows, int dim)
@@ -672,5 +733,17 @@ public sealed unsafe class MetalBackend : IComputeBackend
         c.Dispatch((nuint)((n + 255) / 256), 1, 1, 256, 1, 1);
     }
 
-    public void Dispose() { /* TODO(M2): release device/queue/buffers on the real backend lifecycle */ }
+    private static void DumpF(IntPtr buf, int n, string name)
+    {
+        float[] a = new float[n];
+        Marshal.Copy((IntPtr)Contents(buf), a, 0, n);
+        File.WriteAllBytes($"/tmp/metal_{name}.bin",
+            a.SelectMany(BitConverter.GetBytes).ToArray());
+    }
+
+    public void Dispose()
+    {
+        foreach (IntPtr b in _wfp32.Values) ObjC.Release(b);
+        /* TODO(M2): release device/queue/buffers on the real backend lifecycle */
+    }
 }
