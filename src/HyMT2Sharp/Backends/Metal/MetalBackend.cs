@@ -834,13 +834,12 @@ public sealed unsafe class MetalBackend : IComputeBackend
     // dequant overwrites it; re-dequant cost is <1% of the GEMM work.
     private IntPtr WFp32(CmdCtx c, string name, int inDim, int outDim)
     {
-        long need = (long)inDim * outDim;
-        if (_wScratch == IntPtr.Zero || need > _wScratchElems)
-        {
-            if (_wScratch != IntPtr.Zero) ObjC.Release(_wScratch);
-            _wScratchElems = Math.Max(_wScratchElems, need);
+        // _wScratchElems already covers the model's largest tensor, so the
+        // scratch is allocated once and never resized — resizing here would
+        // free storage that dispatches encoded earlier in this command
+        // buffer may still be reading.
+        if (_wScratch == IntPtr.Zero)
             _wScratch = _dev.NewBuffer((nuint)_wScratchElems * 4);
-        }
         IntPtr buf = _wScratch;
         IntPtr w = W(name);
         c.SetPso(PsoFor(name, inDim, (_psoDeqQ4, _psoDeqQ6, _psoDeqQ8, _psoDeqQ2, _psoDeqStq)));

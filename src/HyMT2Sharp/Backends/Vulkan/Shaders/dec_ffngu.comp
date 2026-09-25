@@ -1,0 +1,189 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// fused: xs = rmsnorm(h)*wn (per-WG, in shared); each WG computes 16 gate rows
+// AND 16 up rows, then writes out[row] = silu(g)*u. One dispatch replaces
+// rms + gate-gemv + up-gemv + silu.
+// dtype flags: 0 = Q4_K (144B/blk), 1 = Q6_K (210B/blk). Weights via u16 view.
+// Scales pre-decoded into sf[16*64] vec4: .xy = gate slot, .zw = up slot,
+// same packing as dec_prekv (q4k: vec2(dsc,dmn); q6k: vec2(d*s[2i],d*s[2i+1])).
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer XV { vec4 xv[]; };
+layout(set = 0, binding = 1) readonly buffer WG { uint16_t wg[]; };
+layout(set = 0, binding = 2) readonly buffer WU { uint16_t wu[]; };
+layout(set = 0, binding = 3) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint in_dim; uint out_dim; uint tg; uint tu;
+} pc;
+
+shared vec4 sf[16 * 64];
+shared float red[256];
+shared float gu[512];
+
+#define R32(arr, off) (uint(arr[(off) >> 1]) | (uint(arr[((off) >> 1) + 1u]) << 16))
+#define R16(arr, off) (uint(arr[(off) >> 1]))
+#define SB(arr, off)  ((R16(arr, (off) & ~1u) >> (((off) & 1u) * 8u)) & 0xFFu)
+#define S8(arr, off)  (int((int(R16(arr, (off) & ~1u)) >> int((off & 1u) * 8u)) << 24) >> 24)
+
+#define X4(i) xv[i]
+#define SX(i) (xv[i].x + xv[i].y + xv[i].z + xv[i].w)
+
+#define FILL(arr, rlRow, bpr, t, slot, out2) { \
+    if ((t) == 0u) { \
+        uint _blk = (slot) >> 3, _g = (slot) & 7u; \
+        uint _bp = (rlRow) * (bpr) * 144u + _blk * 144u; \
+        uint _v0 = SB(arr, _bp + 4u + _g); \
+        uint _v1 = SB(arr, _bp + 8u + _g); \
+        uint _v2 = SB(arr, _bp + _g); \
+        uint _sc, _mn; \
+        if (_g < 4u) { _sc = _v0 & 63u; _mn = _v1 & 63u; } \
+        else { _sc = (_v1 & 15u) | ((_v2 >> 6 & 3u) << 4); _mn = ((_v1 >> 4) & 15u) | (((_v0 >> 6) & 3u) << 4); } \
+        vec2 _dm = unpackHalf2x16(R32(arr, _bp)); \
+        out2 = vec2(_dm.x * float(_sc), _dm.y * float(_mn)); \
+    } else { \
+        uint _i0 = (slot) * 2u; \
+        uint _b0 = _i0 >> 4, _s0 = _i0 & 15u; \
+        uint _bb = (rlRow) * (bpr) * 210u + _b0 * 210u; \
+        float _d = unpackHalf2x16(R16(arr, _bb + 208u) << 16).y; \
+        out2 = vec2(_d * float(S8(arr, _bb + 192u + _s0)), \
+                    _d * float(S8(arr, _bb + 193u + _s0))); \
+    } \
+}
+
+#define GEMV_Q4K(arr, rl, rlRow, bpr, itid, comp, accOut) { \
+    uint il = (itid) >> 2; \
+    uint ir = (itid) & 3u; \
+    uint v_im = il >> 1; \
+    uint v_in = il & 1u; \
+    uint l0 = ((2u * ir + v_in) << 2); \
+    uint qw  = (v_im << 5) + l0; \
+    uint xbase = (v_im << 4) + (l0 >> 2); \
+    uint gA = 2u * v_im; \
+    float _acc = 0.0f; \
+    uint _rb = (rlRow) * (bpr) * 144u; \
+    uint _sfb = (rl) * 64u; \
+    for (uint blk = 0u; blk < (bpr); blk++) { \
+        uint bp = _rb + blk * 144u; \
+        vec4 smA = vec4(sf[_sfb + (blk << 3) + gA].comp, sf[_sfb + (blk << 3) + gA + 1u].comp); \
+        vec4 smB = vec4(sf[_sfb + (blk << 3) + gA + 4u].comp, sf[_sfb + (blk << 3) + gA + 5u].comp); \
+        uint qs0  = R32(arr, bp + 16u + qw); \
+        uint qs64 = R32(arr, bp + 16u + qw + 64u); \
+        vec4 q0l = vec4(float(qs0 & 15u), float((qs0 >> 8u) & 15u), \
+                        float((qs0 >> 16u) & 15u), float((qs0 >> 24u) & 15u)); \
+        vec4 q0h = vec4(float((qs0 >> 4u) & 15u), float((qs0 >> 12u) & 15u), \
+                        float((qs0 >> 20u) & 15u), float(qs0 >> 28u)); \
+        vec4 q64l = vec4(float(qs64 & 15u), float((qs64 >> 8u) & 15u), \
+                         float((qs64 >> 16u) & 15u), float((qs64 >> 24u) & 15u)); \
+        vec4 q64h = vec4(float((qs64 >> 4u) & 15u), float((qs64 >> 12u) & 15u), \
+                         float((qs64 >> 20u) & 15u), float(qs64 >> 28u)); \
+        uint kv = (blk << 6) + xbase; \
+        _acc += smA.x * dot(X4(kv), q0l) - smA.y * SX(kv); \
+        _acc += smA.z * dot(X4(kv + 8u), q0h) - smA.w * SX(kv + 8u); \
+        _acc += smB.x * dot(X4(kv + 32u), q64l) - smB.y * SX(kv + 32u); \
+        _acc += smB.z * dot(X4(kv + 40u), q64h) - smB.w * SX(kv + 40u); \
+    } \
+    accOut = _acc; \
+}
+
+#define GEMV_Q6K(arr, rl, rlRow, bpr, itid, comp, accOut) { \
+    uint v_im = (itid) >> 3; \
+    uint v_in = (itid) & 7u; \
+    uint l0 = v_in << 2; \
+    uint is = v_in >> 2; \
+    uint qlb = (v_im << 6) + l0; \
+    uint qhb = (v_im << 5) + l0; \
+    uint soff = (v_im << 3) + is; \
+    uint xoff = (v_im << 5) + (l0 >> 2); \
+    float _acc = 0.0f; \
+    uint _rb = (rlRow) * (bpr) * 210u; \
+    uint _sp = (soff & 1u); \
+    uint _sb = (rl) * 64u + (soff >> 1); \
+    for (uint blk = 0u; blk < (bpr); blk++) { \
+        uint bb = _rb + blk * 210u; \
+        uint ql0  = R32(arr, bb + qlb); \
+        uint ql32 = R32(arr, bb + qlb + 32u); \
+        uint qh   = R32(arr, bb + 128u + qhb); \
+        vec4 A = sf[_sb + (blk << 3)]; \
+        vec4 B = sf[_sb + (blk << 3) + 1u]; \
+        vec4 C = sf[_sb + (blk << 3) + 2u]; \
+        vec4 D = sf[_sb + (blk << 3) + 3u]; \
+        float s0 = _sp == 0u ? A.comp.x : A.comp.y; \
+        float s1 = _sp == 0u ? B.comp.x : B.comp.y; \
+        float s2 = _sp == 0u ? C.comp.x : C.comp.y; \
+        float s3 = _sp == 0u ? D.comp.x : D.comp.y; \
+        uint q0u = (ql0 & 0x0F0F0F0Fu)        | ((qh & 0x03030303u) << 4); \
+        uint q1u = (ql32 & 0x0F0F0F0Fu)       | ((qh & 0x0C0C0C0Cu) << 2); \
+        uint q2u = ((ql0 >> 4) & 0x0F0F0F0Fu) | (qh & 0x30303030u); \
+        uint q3u = ((ql32 >> 4) & 0x0F0F0F0Fu) | ((qh >> 2) & 0x30303030u); \
+        vec4 q0 = vec4(float(q0u & 0xFFu), float((q0u >> 8u) & 0xFFu), float((q0u >> 16u) & 0xFFu), float(q0u >> 24u)) - 32.0f; \
+        vec4 q1 = vec4(float(q1u & 0xFFu), float((q1u >> 8u) & 0xFFu), float((q1u >> 16u) & 0xFFu), float(q1u >> 24u)) - 32.0f; \
+        vec4 q2 = vec4(float(q2u & 0xFFu), float((q2u >> 8u) & 0xFFu), float((q2u >> 16u) & 0xFFu), float(q2u >> 24u)) - 32.0f; \
+        vec4 q3 = vec4(float(q3u & 0xFFu), float((q3u >> 8u) & 0xFFu), float((q3u >> 16u) & 0xFFu), float(q3u >> 24u)) - 32.0f; \
+        uint kv = (blk << 6) + xoff; \
+        _acc += s0 * dot(X4(kv),      q0); \
+        _acc += s1 * dot(X4(kv + 8u),  q1); \
+        _acc += s2 * dot(X4(kv + 16u), q2); \
+        _acc += s3 * dot(X4(kv + 24u), q3); \
+    } \
+    accOut = _acc; \
+}
+
+// tree-reduce red[] and gu[] within each 16-lane team
+#define REDUCE16() { \
+    barrier(); \
+    if (itid < 8u) { red[tid] += red[tid + 8u]; gu[tid] += gu[tid + 8u]; } \
+    barrier(); \
+    if (itid < 4u) { red[tid] += red[tid + 4u]; gu[tid] += gu[tid + 4u]; } \
+    barrier(); \
+    if (itid < 2u) { red[tid] += red[tid + 2u]; gu[tid] += gu[tid + 2u]; } \
+    barrier(); \
+    if (itid < 1u) { red[tid] += red[tid + 1u]; gu[tid] += gu[tid + 1u]; } \
+    barrier(); \
+}
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint bpr = pc.in_dim >> 8;
+
+    // pre-decode gate+up scales: vec4 slot = (gate.xy, up.zw)
+    for (uint e = tid; e < 16u * 64u; e += 256u) {
+        uint rl = e >> 6, slot = e & 63u;
+        uint row = gl_WorkGroupID.x * 16u + rl;
+        vec4 v4 = vec4(0.0f);
+        if (row < pc.out_dim) {
+            vec2 a2, b2;
+            FILL(wg, row, bpr, pc.tg, slot, a2)
+            FILL(wu, row, bpr, pc.tu, slot, b2)
+            v4 = vec4(a2, b2);
+        }
+        sf[rl * 64u + slot] = v4;
+    }
+    barrier();
+
+    uint rowLane = tid >> 4;
+    uint itid = tid & 15u;
+    uint row = gl_WorkGroupID.x * 16u + rowLane;
+    bool valid = row < pc.out_dim;
+    uint r = valid ? row : 0u;
+
+    float accG = 0.0f, accU = 0.0f;
+    if (pc.tg == 0u) GEMV_Q4K(wg, rowLane, r, bpr, itid, xy, accG)
+    else            GEMV_Q6K(wg, rowLane, r, bpr, itid, xy, accG)
+    if (pc.tu == 0u) GEMV_Q4K(wu, rowLane, r, bpr, itid, zw, accU)
+    else            GEMV_Q6K(wu, rowLane, r, bpr, itid, zw, accU)
+
+    red[tid] = accG;
+    gu[tid] = accU;
+    REDUCE16();
+    if (itid == 0u && valid) {
+        float g = red[tid];
+        float u = gu[tid];
+        o[row] = g / (1.0f + exp(-g)) * u;
+    }
+}

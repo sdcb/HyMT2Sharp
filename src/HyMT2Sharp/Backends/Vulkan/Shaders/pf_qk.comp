@@ -1,0 +1,68 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// S[h][m-tile 128][p 0..m0+128) = Q16 (fp16, head segment) * K[0..m0+128)^T
+// coopmat 8x16x16; 256 threads = 16 sg16 in 4x4 grid, sg strip 32x32.
+// S scratch fp32 [h][m][p]; out-of-range cols are masked in the softmax pass.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer Q16 { float16_t q16[]; };
+layout(set = 0, binding = 1) readonly buffer KK { f16vec4 kk4[]; };
+layout(set = 0, binding = 2) buffer S { float s[]; };
+
+layout(push_constant) uniform PC {
+    uint q16Row; uint kvPitch; uint sRow; uint sHead; uint headDim; uint group; uint pos;
+} pc;
+
+shared float16_t qs[128 * 128];
+
+void main()
+{
+    uint h = gl_WorkGroupID.x;
+    uint m0 = gl_WorkGroupID.y * 128u;
+    uint tid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint sgx = sg & 3u, sgy = sg >> 2;
+
+    // stage Q tile for head h: q16[m][h*headDim + d] -> qs[m-tile][d]
+    uint qbase = h * pc.headDim;
+    for (uint i = tid; i < 128u * 128u; i += 256u)
+        qs[i] = q16[(m0 + (i >> 7)) * pc.q16Row + qbase + (i & 127u)];
+    barrier();
+
+    uint kvh = h / pc.group;
+    uint kvb = kvh * (pc.headDim >> 2);          // vec4 offset of kv-head segment
+    uint kvp = pc.kvPitch >> 2;                  // vec4 pitch between K rows
+    uint sBase = h * pc.sHead;
+
+    coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc[4][2];
+    uint pEnd = pc.pos + m0 + 128u;
+    for (uint p0 = 0u; p0 < pEnd; p0 += 128u) {
+        for (uint i = 0u; i < 4u; i++)
+            for (uint j = 0u; j < 2u; j++)
+                acc[i][j] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0f);
+        for (uint kb = 0u; kb < pc.headDim; kb += 16u) {
+            coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> ma[4];
+            for (uint i = 0u; i < 4u; i++)
+                coopMatLoad(ma[i], qs, (sgy * 32u + i * 8u) * 128u + kb, 128u, gl_CooperativeMatrixLayoutRowMajor);
+            coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[2];
+            for (uint j = 0u; j < 2u; j++)
+                coopMatLoad(mb[j], kk4,
+                    kvb + (p0 + sgx * 32u + j * 16u) * kvp + (kb >> 2),
+                    kvp, gl_CooperativeMatrixLayoutColumnMajor);
+            for (uint i = 0u; i < 4u; i++)
+                for (uint j = 0u; j < 2u; j++)
+                    acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]);
+        }
+        for (uint i = 0u; i < 4u; i++)
+            for (uint j = 0u; j < 2u; j++)
+                coopMatStore(acc[i][j], s,
+                    sBase + (m0 + sgy * 32u + i * 8u) * pc.sRow + (p0 + sgx * 32u + j * 16u),
+                    pc.sRow, gl_CooperativeMatrixLayoutRowMajor);
+    }
+}

@@ -1,0 +1,57 @@
+#version 450
+
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Per (head, m): rope + rmsnorm q row -> fp16 q16[m][h*headDim .. +headDim].
+// Grid: (heads, seq). One WG of 128 threads per query row.
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) readonly buffer QKV { float qkv[]; };
+layout(set = 0, binding = 1) readonly buffer QN { float qnw[]; };
+layout(set = 0, binding = 2) readonly buffer P { int tokenId; int pos; int kvLen; int seq; } prm;
+layout(set = 0, binding = 3) writeonly buffer Q16 { float16_t q16[]; };
+
+layout(push_constant) uniform PC {
+    uint headDim; uint ropeDim; uint qkvRow; uint q16Row;
+    float base; float eps;
+} pc;
+
+shared float sq[128];
+shared float red[8];
+
+void main()
+{
+    uint h = gl_WorkGroupID.x, m = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x;
+    uint pos = uint(prm.pos) + m;
+    uint qb = h * pc.headDim;
+    uint hd2 = pc.ropeDim >> 1;
+    uint rowQ = m * pc.qkvRow + qb;
+
+    if (tid < hd2) {
+        float freq = 1.0f / pow(pc.base, float(tid) / float(hd2));
+        float a = float(pos) * freq;
+        float c = cos(a), s = sin(a);
+        float x0 = qkv[rowQ + tid], x1 = qkv[rowQ + tid + hd2];
+        sq[tid]       = x0 * c - x1 * s;
+        sq[tid + hd2] = x0 * s + x1 * c;
+    }
+    for (uint i = hd2 * 2u + tid; i < pc.headDim; i += 128u)
+        sq[i] = qkv[rowQ + i];
+    barrier();
+
+    float a2 = sq[tid] * sq[tid];
+    float t = subgroupAdd(a2);
+    if (subgroupElect()) red[gl_SubgroupID] = t;
+    barrier();
+    if (tid == 0u) {
+        float s = 0.0f;
+        for (uint i = 0u; i < gl_NumSubgroups; i++) s += red[i];
+        red[0] = s;
+    }
+    barrier();
+    float rstd = 1.0f / sqrt(red[0] / float(pc.headDim) + pc.eps);
+    q16[m * pc.q16Row + qb + tid] = float16_t(sq[tid] * rstd * qnw[tid]);
+}

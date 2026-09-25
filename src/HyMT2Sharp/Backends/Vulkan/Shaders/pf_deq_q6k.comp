@@ -1,0 +1,30 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q6_K block (210B) -> 256 fp16 elements. One WG per block, thread = one element.
+// 210B blocks are only 2-byte aligned -> all reads via byte-granular u32 view.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W16 { uint w16[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float16_t o[]; };
+
+layout(push_constant) uniform PC { uint outOff; uint gridX; uint nblk; } p;
+
+uint rd16(uint off) { return (w16[off >> 2] >> ((off & 2u) << 3)) & 0xFFFFu; }
+uint SB(uint off)   { return (w16[off >> 2] >> ((off & 3u) << 3)) & 0xFFu; }
+int  S8(uint off)   { return (int(SB(off)) << 24) >> 24; }
+void main()
+{
+    uint e = gl_LocalInvocationID.x;
+    uint blk = gl_WorkGroupID.y * p.gridX + gl_WorkGroupID.x;
+    if (blk >= p.nblk) return;
+    uint bb = blk * 210u;
+
+    uint v_im = e >> 7, ee = e & 127u, j = e >> 4;
+    float d = unpackHalf2x16(uint(rd16(bb + 208u)) << 16).y;
+    uint qlo = (SB(bb + v_im * 64u + (ee & 63u)) >> (((ee >> 6) & 1u) * 4u)) & 15u;
+    uint qhi = (SB(bb + 128u + v_im * 32u + (ee & 31u)) >> ((ee >> 5) * 2u)) & 3u;
+    float val = d * float(S8(bb + 192u + j)) * float(int(qlo | (qhi << 4u)) - 32);
+
+    o[p.outOff + blk * 256u + e] = float16_t(val);
+}
