@@ -1,0 +1,37 @@
+#version 450
+// embed gather: y[i] = dequant_q4k(token_embd[tokenId], i), one thread per elem.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) readonly buffer P { int tokenId; int pos; int kvLen; } prm;
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC { uint in_dim; } pc;
+
+uint rd8(uint byteOff) { return (w[byteOff >> 2] >> ((byteOff & 3u) << 3)) & 0xFFu; }
+float fp16(uint byteOff) { uint h = (w[byteOff >> 2] >> ((byteOff & 3u) << 3)) & 0xFFFFu; return unpackHalf2x16(h).x; }
+
+void get_scale_min_k4(uint packed, uint index, out uint sc, out uint mn) {
+    if (index < 4u) { sc = rd8(packed + index) & 63u; mn = rd8(packed + index + 4u) & 63u; }
+    else {
+        sc = (rd8(packed + index + 4u) & 15u) | ((rd8(packed + index - 4u) >> 6) << 4);
+        mn = (rd8(packed + index + 4u) >> 4) | ((rd8(packed + index) >> 6) << 4);
+    }
+}
+
+float dequant_q4k(uint blk, uint i) {
+    uint g = i >> 5, w32 = i & 31u, pi = g >> 1;
+    uint sc, mn;
+    get_scale_min_k4(blk + 4u, g, sc, mn);
+    uint q = rd8(blk + 16u + pi * 32u + w32);
+    uint nib = ((g & 1u) != 0u) ? (q >> 4) & 15u : q & 15u;
+    return fp16(blk) * float(sc) * float(nib) - fp16(blk + 2u) * float(mn);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.in_dim) return;
+    uint rowBase = uint(prm.tokenId) * (pc.in_dim >> 8) * 144u;
+    y[i] = dequant_q4k(rowBase + (i >> 8) * 144u, i & 255u);
+}

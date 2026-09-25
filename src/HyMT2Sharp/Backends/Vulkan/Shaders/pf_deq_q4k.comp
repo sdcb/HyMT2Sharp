@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q4_K block -> 256 fp16 elements. One WG per block, thread = one element.
+// Out is a flat fp16 view of the (row-major) weight tensor.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W { uint w[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float16_t o[]; };
+
+layout(push_constant) uniform PC { uint outOff; uint gridX; uint nblk; } p;
+
+uint SB(uint blk, uint i) {
+    uint o = blk * 144u + i;
+    return (w[o >> 2] >> ((o & 3u) << 3)) & 0xFFu;
+}
+
+void main()
+{
+    uint e = gl_LocalInvocationID.x;
+    uint blk = gl_WorkGroupID.y * p.gridX + gl_WorkGroupID.x;
+    if (blk >= p.nblk) return;
+    uint j = e >> 5;
+    vec2 ddm = unpackHalf2x16(w[blk * 36u]);
+
+    float s, m;
+    if (j < 4u) {
+        s = float(SB(blk, 4u + j) & 63u);
+        m = float(SB(blk, 4u + j + 4u) & 63u);
+    } else {
+        s = float((SB(blk, 4u + j + 4u) & 15u) | ((SB(blk, 4u + j - 4u) >> 6u) << 4u));
+        m = float((SB(blk, 4u + j + 4u) >> 4u) | ((SB(blk, 4u + j) >> 6u) << 4u));
+    }
+
+    uint qb = 16u + (e >> 7) * 64u + ((e >> 6) & 1u) * 32u + (e & 31u);
+    uint q = (SB(blk, qb) >> (((e >> 5) & 1u) * 4u)) & 15u;
+
+    o[p.outOff + blk * 256u + e] = float16_t(ddm.x * s * float(q) - ddm.y * m);
+}

@@ -16,13 +16,8 @@ Console.WriteLine($"threads={(threads <= 0 ? "auto" : threads.ToString())}  avx2
 
 IComputeBackend? backend = null;
 string? backendName = Args.Get(args, "--backend");
-if (backendName is not null and not "cpu")
-{
-    if (backendName == "metal" && System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(System.Runtime.InteropServices.OSPlatform.OSX))
-        backend = new Sdcb.HyMT2Sharp.Backends.Metal.MetalBackend();
-    else
-        Console.WriteLine($"backend {backendName} unavailable here — using cpu");
-}
+try { backend = Sdcb.HyMT2Sharp.Backends.BackendFactory.Create(backendName); }
+catch (Exception e) { Console.WriteLine($"backend {backendName} unavailable ({e.Message}) — using cpu"); }
 if (backend is not null)
     Console.WriteLine($"backend={backend.Name}");
 

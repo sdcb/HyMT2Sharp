@@ -1,0 +1,177 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+// fused per-head decode attention: one WG per q head, 128 threads.
+// Each WG: rope its q head + (redundantly) rope+norm its kv head into shared,
+// append normed k + raw v into fp16 caches at pos, then softmax attention.
+// Cross-WG duplicate writes are all identical values -> benign.
+layout(local_size_x = 1024) in;
+
+layout(set = 0, binding = 0) buffer Q  { float q[]; };
+layout(set = 0, binding = 1) readonly buffer K  { float k[]; };
+layout(set = 0, binding = 2) readonly buffer V  { float v[]; };
+layout(set = 0, binding = 3) writeonly buffer KD { uint16_t kDst[]; };
+layout(set = 0, binding = 4) writeonly buffer VD { uint16_t vDst[]; };
+layout(set = 0, binding = 5) readonly buffer KK { uvec4 Kk4[]; };
+layout(set = 0, binding = 6) readonly buffer VV { uint Vv32[]; };
+layout(set = 0, binding = 7) readonly buffer QN { float qnw[]; };
+layout(set = 0, binding = 8) readonly buffer KN { float knw[]; };
+layout(set = 0, binding = 9) readonly buffer P { int tokenId; int pos; int kvLen; int seq; } prm;
+layout(set = 0, binding = 10) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform PC {
+    uint heads; uint kvHeads; uint headDim; uint ropeDim; uint kvStride;
+    float scale; float base; float eps;
+} pc;
+
+
+shared float sc[4096];
+shared float red[256];
+shared float sk[128];   // rope+normed k head (current pos)
+shared float sv[128];   // raw v head (current pos)
+shared float sq[128];   // rope+normed q head
+shared float vp[1024];   // V-accum partials [half][d]
+
+float h2f(uint16_t h) { return unpackHalf2x16(uint(h)).x; }
+uint16_t f2h(float f) { return uint16_t(packHalf2x16(vec2(f, 0.0f)) & 0xFFFFu); }
+
+#define WGSUM(accv, outv) { \
+    float _t = subgroupAdd(accv); \
+    if (subgroupElect()) red[gl_SubgroupID] = _t; \
+    barrier(); \
+    if (tid == 0u) { float _s = 0.0f; for (uint _i = 0u; _i < gl_NumSubgroups; _i++) _s += red[_i]; red[0] = _s; } \
+    barrier(); \
+    outv = red[0]; \
+}
+
+#define WGMAX(accv, outv) { \
+    float _t = subgroupMax(accv); \
+    if (subgroupElect()) red[gl_SubgroupID] = _t; \
+    barrier(); \
+    if (tid == 0u) { float _s = -3.4e38f; for (uint _i = 0u; _i < gl_NumSubgroups; _i++) _s = max(_s, red[_i]); red[0] = _s; } \
+    barrier(); \
+    outv = red[0]; \
+}
+
+void main()
+{
+    uint g = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    uint pos = uint(prm.pos);
+    uint kvLen = pos + 1u;
+    uint group = pc.heads / pc.kvHeads;
+    uint kvh = g / group;
+    uint qb = g * pc.headDim;
+    uint kb = kvh * pc.headDim;
+    uint hd2 = pc.ropeDim >> 1;
+
+    // stage 1: rope q head in-place; rope k head into sk; load v into sv
+    for (uint i = tid; i < hd2; i += 1024u) {
+        float freq = 1.0f / pow(pc.base, float(i) / float(hd2));
+        float a = float(pos) * freq;
+        float c = cos(a), s = sin(a);
+        {   float x0 = q[qb + i], x1 = q[qb + i + hd2];
+            q[qb + i]      = x0 * c - x1 * s;
+            q[qb + i + hd2] = x0 * s + x1 * c; }
+        {   float x0 = k[kb + i], x1 = k[kb + i + hd2];
+            sk[i]      = x0 * c - x1 * s;
+            sk[i + hd2] = x0 * s + x1 * c; }
+    }
+    // tail dims beyond ropeDim pass through unchanged
+    for (uint i = hd2 * 2u + tid; i < pc.headDim; i += 1024u)
+        sk[i] = k[kb + i];
+    for (uint i = tid; i < pc.headDim; i += 1024u)
+        sv[i] = v[kb + i];
+    barrier();
+
+    // stage 2: rmsnorm sk (knw), q (qnw) -> sq
+    {
+        float a1 = 0.0f, a2 = 0.0f;
+        for (uint i = tid; i < pc.headDim; i += 1024u) {
+            a1 += sk[i] * sk[i];
+            float xq = q[qb + i];
+            sq[i] = xq;
+            a2 += xq * xq;
+        }
+        float totK;
+        WGSUM(a1, totK)
+        float rstdK = 1.0f / sqrt(totK / float(pc.headDim) + pc.eps);
+        float totQ;
+        WGSUM(a2, totQ)
+        float rstdQ = 1.0f / sqrt(totQ / float(pc.headDim) + pc.eps);
+        for (uint i = tid; i < pc.headDim; i += 1024u) {
+            sk[i] *= rstdK * knw[i];
+            sq[i] *= rstdQ * qnw[i];
+        }
+        barrier();
+    }
+
+    // stage 3: append current pos into fp16 caches
+    for (uint i = tid; i < pc.headDim; i += 1024u) {
+        uint off = pos * pc.kvStride + kb + i;
+        kDst[off] = f2h(sk[i]);
+        vDst[off] = f2h(sv[i]);
+    }
+    // no barrier needed: attention reads only t<pos from cache
+
+    // stage 4: scores (K read as uvec4 = 8 fp16)
+    for (uint t = tid; t < pos; t += 1024u) {
+        uint kk = (kb + t * pc.kvStride) >> 3;
+        float acc = 0.0f;
+        for (uint d8 = 0u; d8 < pc.headDim / 8u; d8++) {
+            uvec4 pk = Kk4[kk + d8];
+            acc += dot(vec4(unpackHalf2x16(pk.x).x, unpackHalf2x16(pk.x).y,
+                            unpackHalf2x16(pk.y).x, unpackHalf2x16(pk.y).y),
+                       vec4(sq[d8*8u], sq[d8*8u+1u], sq[d8*8u+2u], sq[d8*8u+3u]));
+            acc += dot(vec4(unpackHalf2x16(pk.z).x, unpackHalf2x16(pk.z).y,
+                            unpackHalf2x16(pk.w).x, unpackHalf2x16(pk.w).y),
+                       vec4(sq[d8*8u+4u], sq[d8*8u+5u], sq[d8*8u+6u], sq[d8*8u+7u]));
+        }
+        sc[t] = acc * pc.scale;
+    }
+    if (tid == 0u) {
+        float acc = 0.0f;
+        for (uint d = 0u; d < pc.headDim; d++)
+            acc += sq[d] * sk[d];
+        sc[pos] = acc * pc.scale;
+    }
+    barrier();
+
+    float mxl = -3.4e38f;
+    for (uint t = tid; t < kvLen; t += 1024u) mxl = max(mxl, sc[t]);
+    float mx;
+    WGMAX(mxl, mx)
+
+    float sm = 0.0f;
+    for (uint t = tid; t < kvLen; t += 1024u) {
+        float e = exp(sc[t] - mx);
+        sc[t] = e;
+        sm += e;
+    }
+    float smt;
+    WGSUM(sm, smt)
+    sm = smt;
+
+    // stage 6: weighted V — (d, t-half) split across all 256 threads
+    uint vb = kvh * pc.headDim;
+    uint d = tid & 127u;
+    uint tq = pos >> 3;                // eighth index 0..7
+    uint thf = tid >> 7;               // 0..7
+    uint t0 = thf * tq;
+    uint t1 = (thf == 7u) ? pos : min(t0 + tq, pos);
+    float va = 0.0f;
+    uint vb32 = (vb >> 1) + (d >> 1);
+    uint dp = d & 1u;
+    for (uint t = t0; t < t1; t++) {
+        uint pk = Vv32[vb32 + t * (pc.kvStride >> 1)];
+        va += sc[t] * unpackHalf2x16(dp == 0u ? (pk << 16) : pk).y;
+    }
+    vp[tid] = va;
+    barrier();
+    if (tid < pc.headDim) {
+        float acc = 0.0f;
+        for (uint h = 0u; h < 8u; h++) acc += vp[tid + h * 128u];
+        o[qb + tid] = (acc + sc[pos] * sv[tid]) / sm;
+    }
+}

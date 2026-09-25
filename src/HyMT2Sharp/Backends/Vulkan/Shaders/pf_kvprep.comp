@@ -1,0 +1,71 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Per (kvh, m): rope+rmsnorm the k row out of qkv into the fp16 K cache at
+// pos=start+m, and copy the v row into the fp16 V cache.
+// Grid: (kvHeads, seq).
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer QKV { float qkv[]; };
+layout(set = 0, binding = 1) writeonly buffer KD { uint16_t kd[]; };
+layout(set = 0, binding = 2) writeonly buffer VD { uint16_t vd[]; };
+layout(set = 0, binding = 3) readonly buffer KN { float knw[]; };
+layout(set = 0, binding = 4) readonly buffer P { int tokenId; int pos; int kvLen; int seq; } prm;
+
+layout(push_constant) uniform PC {
+    uint headDim; uint ropeDim; uint kvStride; uint qkvRow;
+    uint kOff; uint vOff; float base; float eps;
+} pc;
+
+shared float red[256];
+shared float sk[128];
+
+uint16_t f2h(float f) { return uint16_t(packHalf2x16(vec2(f, 0.0f)) & 0xFFFFu); }
+
+void main()
+{
+    uint kvh = gl_WorkGroupID.x;
+    uint m = gl_WorkGroupID.y;
+    uint tid = gl_LocalInvocationID.x;
+    uint pos = uint(prm.pos) + m;
+    uint hd2 = pc.ropeDim >> 1;
+
+    uint rowK = m * pc.qkvRow + pc.kOff + kvh * pc.headDim;
+    uint rowV = m * pc.qkvRow + pc.vOff + kvh * pc.headDim;
+
+    // rope k row -> sk
+    for (uint i = tid; i < hd2; i += 256u) {
+        float freq = 1.0f / pow(pc.base, float(i) / float(hd2));
+        float a = float(pos) * freq;
+        float c = cos(a), s = sin(a);
+        float x0 = qkv[rowK + i], x1 = qkv[rowK + i + hd2];
+        sk[i]        = x0 * c - x1 * s;
+        sk[i + hd2]  = x0 * s + x1 * c;
+    }
+    for (uint i = hd2 * 2u + tid; i < pc.headDim; i += 256u)
+        sk[i] = qkv[rowK + i];
+    barrier();
+
+    // rmsnorm sk (per-head shared knw)
+    float acc = 0.0f;
+    for (uint i = tid; i < pc.headDim; i += 256u) acc += sk[i] * sk[i];
+    float t = subgroupAdd(acc);
+    if (subgroupElect()) red[gl_SubgroupID] = t;
+    barrier();
+    if (tid == 0u) {
+        float s = 0.0f;
+        for (uint i = 0u; i < gl_NumSubgroups; i++) s += red[i];
+        red[0] = s;
+    }
+    barrier();
+    float rstd = 1.0f / sqrt(red[0] / float(pc.headDim) + pc.eps);
+
+    uint dst = pos * pc.kvStride + kvh * pc.headDim;
+    for (uint i = tid; i < pc.headDim; i += 256u) {
+        kd[dst + i] = f2h(sk[i] * rstd * knw[i]);
+        vd[dst + i] = f2h(qkv[rowV + i]);
+    }
+}

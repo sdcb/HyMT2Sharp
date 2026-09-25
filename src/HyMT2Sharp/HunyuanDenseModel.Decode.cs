@@ -6,6 +6,22 @@ namespace Sdcb.HyMT2Sharp.Model;
 
 public sealed unsafe partial class HunyuanDenseModel
 {
+    private static readonly bool _dbgDump = Environment.GetEnvironmentVariable("HYMT_DEBUG_DUMP") == "1";
+    private static void Dbg(string name, float* p, int n)
+    {
+        if (!_dbgDump) return;
+        var sb = new System.Text.StringBuilder(name + ":");
+        for (int i = 0; i < n; i++) sb.Append(' ').Append(p[i].ToString("R"));
+        System.IO.File.AppendAllText("cpu_dump.txt", sb.Append('\n').ToString());
+    }
+    private static void DbgBin(string name, float* p, int n)
+    {
+        if (!_dbgDump) return;
+        using var fs = System.IO.File.Create($"cpu_{name}.bin");
+        using var bw = new System.IO.BinaryWriter(fs);
+        for (int i = 0; i < n; i++) bw.Write(p[i]);
+    }
+
     /// <summary>
     /// Decode (1 token) only. GEMV, no pair GEMM, no SiLU→q8, no quantize Barriers.
     /// Pointwise ops stay serial so prefill scheduling experiments cannot tax tg128.
@@ -18,21 +34,31 @@ public sealed unsafe partial class HunyuanDenseModel
         float* n1 = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         float* attn = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         RmsSerial($"blk.{layer}.attn_norm.weight", hidden, n1, seq, hiddenSize);
+        bool dl = _dbgDump && layer == 0;
+        if (dl) { Dbg("h", hidden, 8); Dbg("n1", n1, 8); DbgBin("n1", n1, hiddenSize); }
         DecodeAttention(n1, attn, layer, start);
+        if (dl) Dbg("attnOut", attn, 8);
         Ops.AddInPlace(hidden, attn, hiddenSize, pool: null);
+        if (dl) Dbg("h", hidden, 8);
 
         float* n2 = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         RmsSerial($"blk.{layer}.ffn_norm.weight", hidden, n2, seq, hiddenSize);
+        if (dl) Dbg("n2", n2, 8);
         float* gate = (float*)Bump((nuint)((long)seq * Config.FfnSize * sizeof(float)));
         float* up = (float*)Bump((nuint)((long)seq * Config.FfnSize * sizeof(float)));
         float* down = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         DecodeGateUp(n2, gate, up, layer);
+        if (dl) { Dbg("gate", gate, 8); Dbg("up", up, 8); }
         long tSilu = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
         Ops.SiLUMul(gate, up, Config.FfnSize, pool: null);
         if (ProfileEnabled)
             TicksSilu += Stopwatch.GetTimestamp() - tSilu;
+        if (dl) { Dbg("gate", gate, 8); DbgBin("gate", gate, Config.FfnSize); }
         DecodeLinear(gate, $"blk.{layer}.ffn_down.weight", down, Config.FfnSize, hiddenSize);
+        if (dl) Dbg("down", down, 8);
         Ops.AddInPlace(hidden, down, hiddenSize, pool: null);
+        if (dl) { Dbg("h", hidden, 8); DbgBin("h", hidden, hiddenSize); }
+        if (_dbgDump) DbgBin($"hL{layer}", hidden, hiddenSize);
     }
 
     private void DecodeAttention(float* input, float* output, int layer, int start)
@@ -47,6 +73,8 @@ public sealed unsafe partial class HunyuanDenseModel
         float* k = (float*)Bump((nuint)((long)seq * kDim * sizeof(float)));
         float* v = (float*)Bump((nuint)((long)seq * kDim * sizeof(float)));
         DecodeQkv(input, q, k, v, layer);
+        bool dl = _dbgDump && layer == 0;
+        if (dl) { Dbg("q0", q, 8); Dbg("k0", k, 8); Dbg("v", v, 64); }
 
         long tRope = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
         Ops.NeoXRoPE(q, seq, heads, dim, Config.RopeDim, start, Config.RopeBase, pool: null);
@@ -55,6 +83,7 @@ public sealed unsafe partial class HunyuanDenseModel
             TicksRope += Stopwatch.GetTimestamp() - tRope;
         RmsSerial($"blk.{layer}.attn_q_norm.weight", q, q, heads, dim);
         RmsSerial($"blk.{layer}.attn_k_norm.weight", k, k, kvHeads, dim);
+        if (dl) { Dbg("q", q, 64); Dbg("k", k, 8); DbgBin("q", q, qDim); DbgBin("v", v, kDim); DbgBin("k", k, kDim); DbgBin("ao_src", q, 1); }
         Ops.ConvertToBf16(k, _cacheK[layer] + start * kDim, seq * kDim, pool: null);
         Ops.ConvertToBf16(v, _cacheV[layer] + start * kDim, seq * kDim, pool: null);
 
@@ -66,6 +95,7 @@ public sealed unsafe partial class HunyuanDenseModel
         Ops.AttentionDecode(q, _cacheK[layer], _cacheV[layer], sc, ao, heads, kvHeads, dim, kvLen, kDim, scale, start, _pool);
         if (ProfileEnabled)
             TicksAttnScore += Stopwatch.GetTimestamp() - t0;
+        if (dl) { Dbg("ao", ao, 16); DbgBin("ao", ao, qDim); }
 
         DecodeLinear(ao, $"blk.{layer}.attn_output.weight", output, qDim, Config.HiddenSize);
     }

@@ -20,8 +20,11 @@ public sealed class ChatCompletionService : IDisposable
         _defaultMaxTokens = defaultMaxTokens > 0 ? defaultMaxTokens : 256;
         CreatedUnix = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
 
-        Console.WriteLine($"loading {ModelPath}");
-        _model = new HunyuanDenseModel(ModelPath, threads, cacheConfig);
+        IComputeBackend? backend = null;
+        try { backend = Backends.BackendFactory.Create(); }
+        catch (Exception e) { Console.WriteLine($"backend init failed ({e.Message}) — using cpu"); }
+        Console.WriteLine($"loading {ModelPath}  backend={backend?.Name ?? "cpu"}");
+        _model = new HunyuanDenseModel(ModelPath, threads, cacheConfig, backend);
         Console.WriteLine($"ready  threads={_model.ThreadCount}{(threads <= 0 ? $" ({_model.ThreadAutoHint})" : "")}  kv-cache={_model.CacheConfig.PolicyName}  arch={_model.Config.Architecture} layers={_model.Config.NumLayers} hidden={_model.Config.HiddenSize} heads={_model.Config.NumHeads}/{_model.Config.NumKvHeads} vocab={_model.Config.VocabSize}");
     }
 

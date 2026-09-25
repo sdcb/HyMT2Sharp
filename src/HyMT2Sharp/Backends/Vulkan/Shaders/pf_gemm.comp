@@ -1,0 +1,82 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+// C[M,N] = X[M,K](fp32) * W[N,K](fp16)^T (+ R[M,N] when flags&1).
+// WG tile 128x128, 256 threads, thread computes an 8x8 sub-tile.
+// Shared layout is transposed (xs[kt*TM+m]) so compute reads are conflict-free.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer W { float16_t w[]; };
+layout(set = 0, binding = 2) readonly buffer R { float r[]; };
+layout(set = 0, binding = 3) buffer C { float c[]; };
+
+layout(push_constant) uniform PC { uint mDim; uint nDim; uint kDim; uint flags; } p;
+
+const uint TM = 128u, TN = 128u, TK = 16u;
+shared float xs[TM * TK];
+shared float ws[TN * TK];
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint m0 = gl_WorkGroupID.x * TM;
+    uint n0 = gl_WorkGroupID.y * TN;
+    uint tx = tid & 15u, ty = tid >> 4;      // 16x16 threads, each 8x8
+
+    float acc[8][8];
+    for (uint i = 0u; i < 8u; i++) for (uint j = 0u; j < 8u; j++) acc[i][j] = 0.0f;
+
+    for (uint kb = 0u; kb < p.kDim; kb += TK) {
+        // global -> shared: 128x16 floats = 512 vec4 each side, 2 vec4 per thread.
+        // vec4 index v: row = v/4, koff = (v%4)*4 ; written transposed into shared.
+        for (uint l = 0u; l < 2u; l++) {
+            uint v = tid * 2u + l;
+            uint m = v >> 2, k = (v & 3u) * 4u;
+            uint gm = m0 + m;
+            vec4 a = (gm < p.mDim)
+                ? vec4(x[gm * p.kDim + kb + k],      x[gm * p.kDim + kb + k + 1u],
+                       x[gm * p.kDim + kb + k + 2u], x[gm * p.kDim + kb + k + 3u])
+                : vec4(0.0f);
+            xs[(k + 0u) * TM + m] = a.x;
+            xs[(k + 1u) * TM + m] = a.y;
+            xs[(k + 2u) * TM + m] = a.z;
+            xs[(k + 3u) * TM + m] = a.w;
+        }
+        for (uint l = 0u; l < 2u; l++) {
+            uint v = tid * 2u + l;
+            uint n = v >> 2, k = (v & 3u) * 4u;
+            uint gn = n0 + n;
+            vec4 b = (gn < p.nDim)
+                ? vec4(float(w[gn * p.kDim + kb + k]),      float(w[gn * p.kDim + kb + k + 1u]),
+                       float(w[gn * p.kDim + kb + k + 2u]), float(w[gn * p.kDim + kb + k + 3u]))
+                : vec4(0.0f);
+            ws[(k + 0u) * TN + n] = b.x;
+            ws[(k + 1u) * TN + n] = b.y;
+            ws[(k + 2u) * TN + n] = b.z;
+            ws[(k + 3u) * TN + n] = b.w;
+        }
+        barrier();
+        for (uint kt = 0u; kt < TK; kt++) {
+            float xv[8]; float wv[8];
+            for (uint i = 0u; i < 8u; i++) xv[i] = xs[kt * TM + ty * 8u + i];
+            for (uint j = 0u; j < 8u; j++) wv[j] = ws[kt * TN + tx * 8u + j];
+            for (uint i = 0u; i < 8u; i++)
+                for (uint j = 0u; j < 8u; j++)
+                    acc[i][j] += xv[i] * wv[j];
+        }
+        barrier();
+    }
+
+    bool hasR = (p.flags & 1u) != 0u;
+    for (uint i = 0u; i < 8u; i++) {
+        uint gm = m0 + ty * 8u + i;
+        if (gm >= p.mDim) continue;
+        for (uint j = 0u; j < 8u; j++) {
+            uint gn = n0 + tx * 8u + j;
+            if (gn >= p.nDim) continue;
+            uint idx = gm * p.nDim + gn;
+            c[idx] = hasR ? (r[idx] + acc[i][j]) : acc[i][j];
+        }
+    }
+}

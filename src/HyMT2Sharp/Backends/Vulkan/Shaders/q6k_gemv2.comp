@@ -1,0 +1,93 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q6_K GEMV v2: llama.cpp mul_mat_vec mapping. 16 rows/WG, 16 lanes/row.
+// Block = 210B: ql[128] @0, qh[64] @128, scales int8[16] @192, d fp16 @208.
+// Blocks are only 2-byte aligned → all weight reads via u16 view.
+// Lane: v_im=itid/8 (128-elem half), v_in=itid%8, l0=4*v_in, is=v_in/4.
+// Covers quads at elems y0={128*v_im+l0} + {0,32,64,96}.
+
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W16 { uint16_t w16[]; };
+layout(set = 0, binding = 1) readonly buffer XV { vec4 xv[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC { uint in_dim; uint out_dim; } p;
+
+shared float red[256];
+
+uint16_t rd16(uint byteOff) { return w16[byteOff >> 1]; }
+
+int rd8s(uint byteOff) {
+    uint16_t v = rd16(byteOff & ~1u);
+    int b = int(uint(v) >> ((byteOff & 1u) * 8u)) & 0xFF;
+    return (b << 24) >> 24;  // sign extend
+}
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint bpr = p.in_dim >> 8;
+
+    uint rowLane = tid >> 4;
+    uint itid = tid & 15u;
+    uint row = gl_WorkGroupID.x * 16u + rowLane;
+    bool valid = row < p.out_dim;
+    uint rowBytes = (valid ? row : 0u) * bpr * 210u;
+
+    uint v_im = itid >> 3;            // 0..1
+    uint v_in = itid & 7u;            // 0..7
+    uint l0 = v_in << 2;              // 0..28
+    uint is = v_in >> 2;              // 0..1
+    uint qlb = (v_im << 6) + l0;      // ql byte offset in block
+    uint qhb = (v_im << 5) + l0;      // qh byte offset
+    uint soff = (v_im << 3) + is;     // scale base index
+    uint xoff = (v_im << 5) + (l0 >> 2); // x vec4 offset (elems/4)
+
+    float acc = 0.0f;
+    for (uint blk = 0; blk < bpr; blk++) {
+        uint bb = rowBytes + blk * 210u;
+
+        uint ql0  = uint(rd16(bb + qlb))       | (uint(rd16(bb + qlb + 2u)) << 16);
+        uint ql32 = uint(rd16(bb + qlb + 32u)) | (uint(rd16(bb + qlb + 34u)) << 16);
+        uint qh   = uint(rd16(bb + 128u + qhb)) | (uint(rd16(bb + 128u + qhb + 2u)) << 16);
+        uint dh   = uint(rd16(bb + 208u));
+        float d   = unpackHalf2x16(dh << 16).y;
+
+        float s0 = d * float(rd8s(bb + 192u + soff));
+        float s1 = d * float(rd8s(bb + 192u + soff + 2u));
+        float s2 = d * float(rd8s(bb + 192u + soff + 4u));
+        float s3 = d * float(rd8s(bb + 192u + soff + 6u));
+
+        uint q0u = (ql0 & 0x0F0F0F0Fu)        | ((qh & 0x03030303u) << 4);
+        uint q1u = (ql32 & 0x0F0F0F0Fu)       | ((qh & 0x0C0C0C0Cu) << 2);
+        uint q2u = ((ql0 >> 4) & 0x0F0F0F0Fu) | (qh & 0x30303030u);
+        uint q3u = ((ql32 >> 4) & 0x0F0F0F0Fu) | ((qh >> 2) & 0x30303030u);
+
+        vec4 q0 = vec4(float(q0u & 0xFFu), float((q0u >> 8u) & 0xFFu), float((q0u >> 16u) & 0xFFu), float(q0u >> 24u)) - 32.0f;
+        vec4 q1 = vec4(float(q1u & 0xFFu), float((q1u >> 8u) & 0xFFu), float((q1u >> 16u) & 0xFFu), float(q1u >> 24u)) - 32.0f;
+        vec4 q2 = vec4(float(q2u & 0xFFu), float((q2u >> 8u) & 0xFFu), float((q2u >> 16u) & 0xFFu), float(q2u >> 24u)) - 32.0f;
+        vec4 q3 = vec4(float(q3u & 0xFFu), float((q3u >> 8u) & 0xFFu), float((q3u >> 16u) & 0xFFu), float(q3u >> 24u)) - 32.0f;
+
+        uint kv = (blk << 6) + xoff;
+        acc += s0 * dot(xv[kv],      q0);
+        acc += s1 * dot(xv[kv + 8u],  q1);
+        acc += s2 * dot(xv[kv + 16u], q2);
+        acc += s3 * dot(xv[kv + 24u], q3);
+    }
+
+    red[tid] = acc;
+    barrier();
+    if (itid < 8u) red[tid] += red[tid + 8u];
+    barrier();
+    if (itid < 4u) red[tid] += red[tid + 4u];
+    barrier();
+    if (itid < 2u) red[tid] += red[tid + 2u];
+    barrier();
+    if (itid < 1u) red[tid] += red[tid + 1u];
+    barrier();
+    if (itid == 0u && valid) y[row] = red[tid];
+}

@@ -1,0 +1,38 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_16bit_storage : require
+// embed gather for Q6_K token_embd: y[i] = dequant_q6k(row tokenId, i).
+// 210B blocks are only 2B aligned -> u16 buffer view.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W16 { uint16_t w16[]; };
+layout(set = 0, binding = 1) readonly buffer P { int tokenId; int pos; int kvLen; } prm;
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC { uint in_dim; } pc;
+
+uint rd8(uint byteOff) { return (uint(w16[byteOff >> 1]) >> ((byteOff & 1u) << 3)) & 0xFFu; }
+int rd8s(uint byteOff) { int b = int(rd8(byteOff)); return (b << 24) >> 24; }
+float fp16(uint byteOff) { return unpackHalf2x16(uint(w16[byteOff >> 1])).x; }
+
+float dequant_q6k(uint blk, uint i) {
+    uint j = i >> 7, w = i & 127u;
+    uint l = w & 31u, sub = w >> 5;
+    uint ql = blk + j * 64u;
+    uint qh = blk + 128u + j * 32u;
+    uint sc = blk + 192u + j * 8u;
+    uint q6;
+    if (sub == 0u)      q6 = (rd8(ql + l) & 15u)      | ((rd8(qh + l) & 3u) << 4);
+    else if (sub == 1u) q6 = (rd8(ql + l + 32u) & 15u) | (((rd8(qh + l) >> 2) & 3u) << 4);
+    else if (sub == 2u) q6 = (rd8(ql + l) >> 4)       | (((rd8(qh + l) >> 4) & 3u) << 4);
+    else                q6 = (rd8(ql + l + 32u) >> 4) | (((rd8(qh + l) >> 6) & 3u) << 4);
+    return fp16(blk + 208u) * float(rd8s(sc + (l >> 4) + sub * 2u)) * (float(q6) - 32.0f);
+}
+
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.in_dim) return;
+    uint rowBase = uint(prm.tokenId) * (pc.in_dim >> 8) * 210u;
+    y[i] = dequant_q6k(rowBase + (i >> 8) * 210u, i & 255u);
+}

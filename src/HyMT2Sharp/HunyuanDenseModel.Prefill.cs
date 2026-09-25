@@ -13,12 +13,15 @@ public sealed unsafe partial class HunyuanDenseModel
     /// </summary>
     private void PrefillBlock(float* hidden, int layer, int seq, int start)
     {
+        bool dl = _dbgDump && layer == 0;
         int hiddenSize = Config.HiddenSize;
         float* n1 = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         float* attn = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         Rms($"blk.{layer}.attn_norm.weight", hidden, n1, seq, hiddenSize);
+        if (dl) DbgBin("pfxs", n1, seq * hiddenSize);
         PrefillAttention(n1, attn, layer, seq, start);
         Ops.AddInPlace(hidden, attn, seq * hiddenSize, _pool);
+        if (dl) DbgBin("pfx_attn", hidden, seq * hiddenSize);
 
         float* n2 = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         Rms($"blk.{layer}.ffn_norm.weight", hidden, n2, seq, hiddenSize);
@@ -26,8 +29,10 @@ public sealed unsafe partial class HunyuanDenseModel
         float* up = (float*)Bump((nuint)((long)seq * Config.FfnSize * sizeof(float)));
         float* down = (float*)Bump((nuint)((long)seq * hiddenSize * sizeof(float)));
         PrefillGateUp(n2, gate, up, layer, seq);
+        if (dl) { DbgBin("pfg", gate, seq * Config.FfnSize); DbgBin("pfu", up, seq * Config.FfnSize); }
         PrefillDown(gate, up, down, layer, seq);
         Ops.AddInPlace(hidden, down, seq * hiddenSize, _pool);
+        if (dl) DbgBin("pfx_end", hidden, seq * hiddenSize);
     }
 
     private void PrefillAttention(float* input, float* output, int layer, int seq, int start)
@@ -37,10 +42,12 @@ public sealed unsafe partial class HunyuanDenseModel
         int dim = Config.HeadDim;
         int qDim = heads * dim;
         int kDim = kvHeads * dim;
+        bool dl = _dbgDump && layer == 0;
         float* q = (float*)Bump((nuint)((long)seq * qDim * sizeof(float)));
         float* k = (float*)Bump((nuint)((long)seq * kDim * sizeof(float)));
         float* v = (float*)Bump((nuint)((long)seq * kDim * sizeof(float)));
         PrefillQkv(input, q, k, v, layer, seq);
+        if (dl) { DbgBin("pfq", q, seq * qDim); DbgBin("pfk", k, seq * kDim); DbgBin("pfv", v, seq * kDim); }
 
         long tRope = ProfileEnabled ? Stopwatch.GetTimestamp() : 0;
         Ops.NeoXRoPE(q, seq, heads, dim, Config.RopeDim, start, Config.RopeBase, _pool);
@@ -49,6 +56,7 @@ public sealed unsafe partial class HunyuanDenseModel
             TicksRope += Stopwatch.GetTimestamp() - tRope;
         Rms($"blk.{layer}.attn_q_norm.weight", q, q, seq * heads, dim);
         Rms($"blk.{layer}.attn_k_norm.weight", k, k, seq * kvHeads, dim);
+        if (dl) { DbgBin("pfq_post", q, seq * qDim); DbgBin("pfk_post", k, seq * kDim); }
         Ops.ConvertToBf16(k, _cacheK[layer] + start * kDim, seq * kDim, _pool);
         Ops.ConvertToBf16(v, _cacheV[layer] + start * kDim, seq * kDim, _pool);
 
@@ -75,6 +83,7 @@ public sealed unsafe partial class HunyuanDenseModel
         Ops.AttentionCombine(_cacheV[layer], sc, ao, heads, kvHeads, dim, seq, kvLen, qDim, kvStride, start, _pool);
         if (ProfileEnabled)
             TicksAttnCombine += Stopwatch.GetTimestamp() - t0;
+        if (dl) DbgBin("pfao", ao, seq * qDim);
 
         Linear(ao, $"blk.{layer}.attn_output.weight", output, qDim, Config.HiddenSize, seq);
     }
@@ -161,6 +170,7 @@ public sealed unsafe partial class HunyuanDenseModel
             return;
         }
 
+        if (_dbgDump && layer == 0) DbgBin("wq_cpu", _weights[$"blk.{layer}.attn_q.weight"].F32, 512);
         Linear(input, $"blk.{layer}.attn_q.weight", q, hidden, qDim, seq);
         Linear(input, $"blk.{layer}.attn_k.weight", k, hidden, kDim, seq);
         Linear(input, $"blk.{layer}.attn_v.weight", v, hidden, kDim, seq);

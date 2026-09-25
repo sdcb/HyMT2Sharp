@@ -1,0 +1,76 @@
+#version 450
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// O[m-tile 128][d 128] = P[h][m-tile][p 0..m0+128) (fp16) * V[p][d] -> ao fp16.
+// coopmat 8x16x16; 256 threads = 16 sg16 in 4x4 grid, sg strip 32x32.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer P16 { float16_t p16[]; };
+layout(set = 0, binding = 1) readonly buffer VV { float16_t vv[]; };
+layout(set = 0, binding = 2) writeonly buffer AO { float16_t ao[]; };
+
+layout(push_constant) uniform PC {
+    uint sRow; uint sHead; uint kvPitch; uint aoRow; uint headDim; uint group; uint mDim; uint pos;
+} pc;
+
+shared float stage[16 * 8 * 16];
+
+void main()
+{
+    uint h = gl_WorkGroupID.x;
+    uint m0 = gl_WorkGroupID.y * 128u;
+    uint tid = gl_LocalInvocationID.x;
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint sgx = sg & 3u, sgy = sg >> 2;
+
+    uint kvh = h / pc.group;
+    uint kvb = kvh * pc.headDim;                    // element offset of kv-head segment
+    uint pBase = h * pc.sHead;
+
+    coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator> acc[4][2];
+    for (uint i = 0u; i < 4u; i++)
+        for (uint j = 0u; j < 2u; j++)
+            acc[i][j] = coopmat<float, gl_ScopeSubgroup, 8, 16, gl_MatrixUseAccumulator>(0.0f);
+
+    uint pEnd = pc.pos + m0 + 128u;
+    for (uint kk = 0u; kk < pEnd; kk += 16u) {
+        coopmat<float16_t, gl_ScopeSubgroup, 8, 16, gl_MatrixUseA> ma[4];
+        for (uint i = 0u; i < 4u; i++)
+            coopMatLoad(ma[i], p16,
+                pBase + (m0 + sgy * 32u + i * 8u) * pc.sRow + kk,
+                pc.sRow, gl_CooperativeMatrixLayoutRowMajor);
+        coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> mb[2];
+        for (uint j = 0u; j < 2u; j++)
+            coopMatLoad(mb[j], vv,
+                kvb + kk * pc.kvPitch + (sgx * 32u + j * 16u),
+                pc.kvPitch, gl_CooperativeMatrixLayoutRowMajor);
+        for (uint i = 0u; i < 4u; i++)
+            for (uint j = 0u; j < 2u; j++)
+                acc[i][j] = coopMatMulAdd(ma[i], mb[j], acc[i][j]);
+    }
+
+    for (uint i = 0u; i < 4u; i++) {
+        for (uint j = 0u; j < 2u; j++) {
+            coopMatStore(acc[i][j], stage, sg * 128u, 8u, gl_CooperativeMatrixLayoutColumnMajor);
+            barrier();
+            uint rm = sgy * 32u + i * 8u;
+            uint cn = sgx * 32u + j * 16u;
+            for (uint l = 0u; l < 8u; l++) {
+                uint e = lane * 8u + l;
+                uint mm = e >> 4, nn = e & 15u;
+                uint gmr = m0 + rm + mm;
+                if (gmr < pc.mDim) {
+                    uint idx = gmr * pc.aoRow + h * pc.headDim + cn + nn;
+                    ao[idx] = float16_t(stage[sg * 128u + nn * 8u + mm]);
+                }
+            }
+            barrier();
+        }
+    }
+}

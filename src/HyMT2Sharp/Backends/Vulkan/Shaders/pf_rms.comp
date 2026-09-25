@@ -1,0 +1,41 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// xs[dstRow,:] = rmsnorm(x[srcRow,:]) * wn. One WG per row; srcRow =
+// rowOff+wgid, dstRow = dstOff+wgid (dstOff lets a single-row norm land at 0).
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer WN { float wn[]; };
+layout(set = 0, binding = 2) writeonly buffer XS { float xs[]; };
+
+layout(push_constant) uniform PC { uint dim; uint rowOff; uint dstOff; float eps; } p;
+
+shared float red[256];
+
+void main()
+{
+    uint tid = gl_LocalInvocationID.x;
+    uint row = p.rowOff + gl_WorkGroupID.x;
+    uint dst = p.dstOff + gl_WorkGroupID.x;
+
+    float acc = 0.0f;
+    for (uint i = tid; i < p.dim; i += 256u) {
+        float v = x[row * p.dim + i];
+        acc += v * v;
+    }
+    float t = subgroupAdd(acc);
+    if (subgroupElect()) red[gl_SubgroupID] = t;
+    barrier();
+    if (tid == 0u) {
+        float s = 0.0f;
+        for (uint i = 0u; i < gl_NumSubgroups; i++) s += red[i];
+        red[0] = s;
+    }
+    barrier();
+    float rstd = 1.0f / sqrt(red[0] / float(p.dim) + p.eps);
+
+    for (uint i = tid; i < p.dim; i += 256u)
+        xs[dst * p.dim + i] = x[row * p.dim + i] * rstd * wn[i];
+}

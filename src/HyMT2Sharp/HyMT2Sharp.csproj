@@ -1,5 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <Description>Hy-MT2 hunyuan-dense inference: GGUF, tokenize, KV cache, CPU (SIMD) and Metal backends.</Description>
+    <Description>Hy-MT2 hunyuan-dense inference: GGUF, tokenize, KV cache, CPU (SIMD), Metal and Vulkan backends.</Description>
   </PropertyGroup>
+  <ItemGroup>
+    <!-- SPIR-V binaries are committed next to the .comp sources; regenerate with
+         src/HyMT2Sharp/Backends/Vulkan/tools/build-shaders.bat (glslc, dev-time only). -->
+    <EmbeddedResource Include="Backends\Vulkan\Shaders\*.spv" />
+    <None Remove="Backends\Vulkan\Shaders\*.comp" />
+    <None Remove="Backends\Vulkan\Shaders\*.spv" />
+  </ItemGroup>
 </Project>

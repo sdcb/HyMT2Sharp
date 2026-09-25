@@ -1,0 +1,27 @@
+#version 450
+// rmsnorm: one WG per row, 256 threads. y[r] = x[r]*w / sqrt(mean(x[r]^2)+eps)
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer X { float x[]; };
+layout(set = 0, binding = 1) readonly buffer W { float w[]; };
+layout(set = 0, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC { uint dim; float eps; } pc;
+
+shared float red[256];
+
+void main()
+{
+    uint g = gl_WorkGroupID.x, tid = gl_LocalInvocationID.x;
+    uint base = g * pc.dim;
+    float acc = 0.0f;
+    for (uint i = tid; i < pc.dim; i += 256u) acc += x[base + i] * x[base + i];
+    red[tid] = acc;
+    barrier();
+    for (uint s = 128u; s > 0u; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float scale = 1.0f / sqrt(red[0] / float(pc.dim) + pc.eps);
+    for (uint i = tid; i < pc.dim; i += 256u) y[base + i] = x[base + i] * scale * w[i];
+}
