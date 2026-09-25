@@ -81,7 +81,11 @@ internal unsafe sealed class VkDevice : IDisposable
         Vk.VkPhysicalDevice16BitStorageFeatures s16query = new() { SType = VkConst.StPhysicalDevice16BitStorageFeatures };
         Vk.VkPhysicalDeviceFeatures2 f2 = new() { SType = VkConst.StPhysicalDeviceFeatures2, PNext = &s16query };
         Vk.vkGetPhysicalDeviceFeatures2(d.PhysDevice, &f2);
-        d.Storage16Bit = s16query.StorageBuffer16BitAccess != 0 && f2.Features.ShaderInt16 != 0;
+        Vk.VkPhysicalDeviceFeatures coreF;
+        Vk.vkGetPhysicalDeviceFeatures(d.PhysDevice, &coreF);
+        d.Storage16Bit = s16query.StorageBuffer16BitAccess != 0 && coreF.ShaderInt16 != 0;
+        if (Environment.GetEnvironmentVariable("HYMT_VK_DEBUG") == "1")
+            Console.Error.WriteLine($"vk-dbg device={d.DeviceName} api={props.ApiVersion:x8} s16={s16query.StorageBuffer16BitAccess} int16(core)={coreF.ShaderInt16} int16(f2)={f2.Features.ShaderInt16} f36core={coreF.F[36]}");
 
         // Extension probe: VK_KHR_push_descriptor (llama.cpp-style inline descriptor writes,
         // skips per-dispatch descriptor-set binds).
