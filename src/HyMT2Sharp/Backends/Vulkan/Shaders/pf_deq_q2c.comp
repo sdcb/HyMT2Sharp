@@ -1,0 +1,28 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+// Q2_0C (130B blk: fp16 d + 2-bit qs[128] per 512 weights) -> fp16.
+// One WG per 256-elem superblock; a block spans two superblocks (h = blk&1 half).
+// Thread e covers elem e of the superblock: qs byte (e>>2), code (e&3),
+// value = ((byte >> ((e&3)*2)) & 3) * 2 - 3 times d.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W16 { uint w16[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float16_t o[]; };
+
+layout(push_constant) uniform PC { uint outOff; uint gridX; uint nblk; } p;
+
+uint rd16(uint off) { return (w16[off >> 2] >> ((off & 2u) << 3)) & 0xFFFFu; }
+uint rd8(uint off)  { return (rd16(off & ~1u) >> ((off & 1u) << 3)) & 0xFFu; }
+
+void main()
+{
+    uint e = gl_LocalInvocationID.x;
+    uint blk = gl_WorkGroupID.y * p.gridX + gl_WorkGroupID.x;
+    if (blk >= p.nblk) return;
+    uint bb = (blk >> 1) * 130u;
+    float d = unpackHalf2x16(rd16(bb)).x;
+    uint ub = rd8(bb + 2u + (blk & 1u) * 64u + (e >> 2));
+    float w = float(((ub >> ((e & 3u) * 2u)) & 3u) * 2u) - 3.0f;
+    o[p.outOff + blk * 256u + e] = float16_t(d * w);
+}

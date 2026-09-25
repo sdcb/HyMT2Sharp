@@ -1,0 +1,41 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+
+// STQ1_0 (42B blk: Qs[32] + Sign[8] + fp16 d @40, per 256 weights) -> fp16.
+// One WG per 256-elem superblock (= one STQ block), thread = one element.
+// Elem e: chunk c = e>>6, pos = e&63 -> group g = c*16 + (pos&15), lane t = pos>>4.
+// slot nibble (g&1)*4 of Qs[g>>1], sign bit (g&7) of Sign[g>>3];
+// qpack = CB[(sign<<4)|slot]; value = ((qpack >> (t*2)) & 3) - 1 times d.
+layout(local_size_x = 256) in;
+
+layout(set = 0, binding = 0) readonly buffer W16 { uint w16[]; };
+layout(set = 0, binding = 1) writeonly buffer O { float16_t o[]; };
+
+layout(push_constant) uniform PC { uint outOff; uint gridX; uint nblk; } p;
+
+const uint STQ_CB[32] = uint[](
+    0xA9u, 0x89u, 0x29u, 0x09u, 0xA6u, 0x86u, 0x26u, 0x06u,
+    0x9Au, 0x92u, 0x1Au, 0x12u, 0x6Au, 0x62u, 0x4Au, 0x42u,
+    0x01u, 0x21u, 0x81u, 0xA1u, 0x04u, 0x24u, 0x84u, 0xA4u,
+    0x10u, 0x18u, 0x90u, 0x98u, 0x40u, 0x48u, 0x60u, 0x68u);
+
+uint rd16(uint off) { return (w16[off >> 2] >> ((off & 2u) << 3)) & 0xFFFFu; }
+uint rd8(uint off)  { return (rd16(off & ~1u) >> ((off & 1u) << 3)) & 0xFFu; }
+
+void main()
+{
+    uint e = gl_LocalInvocationID.x;
+    uint blk = gl_WorkGroupID.y * p.gridX + gl_WorkGroupID.x;
+    if (blk >= p.nblk) return;
+    uint bb = blk * 42u;
+    float d = unpackHalf2x16(rd16(bb + 40u)).x;
+
+    uint c = e >> 6, pos = e & 63u;
+    uint g = c * 16u + (pos & 15u);
+    uint t = pos >> 4;
+    uint slot = (rd8(bb + (g >> 1)) >> ((g & 1u) * 4u)) & 0xFu;
+    uint sign = (rd8(bb + 32u + (g >> 3)) >> (g & 7u)) & 1u;
+    uint qp = STQ_CB[(sign << 4) | slot];
+    float w = float(int((qp >> (t * 2u)) & 3u) - 1);
+    o[p.outOff + blk * 256u + e] = float16_t(d * w);
+}
