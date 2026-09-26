@@ -71,7 +71,10 @@ public sealed unsafe class MetalBackend : IComputeBackend
 
     public string Name => "metal";
 
-    public bool SupportsPrefill => true;
+    // HYMT_METAL_NOPREFILL=1 keeps prefill on the CPU engine and pushes its
+    // bf16 KV up via UploadKv — GEMV decode still runs on device. Escape for
+    // hosts whose unified memory can't hold the fp32 dequant weight cache.
+    public bool SupportsPrefill => Environment.GetEnvironmentVariable("HYMT_METAL_NOPREFILL") != "1";
 
     public MetalBackend()
     {

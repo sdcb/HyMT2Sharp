@@ -1,0 +1,72 @@
+name: metal-smoke
+
+on:
+  push:
+    branches: [devin/**]
+  workflow_dispatch:
+
+jobs:
+  metal:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hardware info
+        run: |
+          sysctl -n machdep.cpu.brand_string || true
+          sysctl -n hw.memsize || true
+          system_profiler SPDisplaysDataType | head -25 || true
+          xcode-select -p || true
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      - name: Build (Release)
+        run: dotnet build HyMT2Sharp.slnx -c Release --nologo
+
+      - name: Unit tests
+        run: dotnet test tests/HyMT2Sharp.Tests -c Release --no-build --nologo
+
+      - name: Download smallest GGUF (1.25Bit ~441MB)
+        run: |
+          curl -fL --retry 3 -o Hy-MT2-1.8B-1.25Bit.gguf \
+            https://huggingface.co/tencent/Hy-MT2-1.8B-1.25Bit-GGUF/resolve/main/Hy-MT2-1.8B-1.25Bit.gguf
+          ls -lh Hy-MT2-1.8B-1.25Bit.gguf
+
+      - name: Bench Metal full (prefill+decode on GPU)
+        continue-on-error: true
+        run: |
+          ./src/HyMT2Sharp.Benchmark/bin/Release/net10.0/Sdcb.HyMT2Sharp.Benchmark \
+            --model Hy-MT2-1.8B-1.25Bit.gguf --backend metal \
+            --bench-prefill 512 --bench-decode 128 --threads 0
+
+      - name: Bench Metal hybrid (CPU prefill + GPU decode)
+        continue-on-error: true
+        env:
+          HYMT_METAL_NOPREFILL: '1'
+        run: |
+          ./src/HyMT2Sharp.Benchmark/bin/Release/net10.0/Sdcb.HyMT2Sharp.Benchmark \
+            --model Hy-MT2-1.8B-1.25Bit.gguf --backend metal \
+            --bench-prefill 512 --bench-decode 128 --threads 0
+
+      - name: Bench CPU backend (comparison)
+        run: |
+          ./src/HyMT2Sharp.Benchmark/bin/Release/net10.0/Sdcb.HyMT2Sharp.Benchmark \
+            --model Hy-MT2-1.8B-1.25Bit.gguf --backend cpu \
+            --bench-prefill 512 --bench-decode 128 --threads 0
+
+      - name: CLI smoke (Metal hybrid)
+        continue-on-error: true
+        env:
+          HYMT_METAL_NOPREFILL: '1'
+        run: |
+          ./src/HyMT2Sharp.Cli/bin/Release/net10.0/Sdcb.HyMT2Sharp.Cli \
+            --model Hy-MT2-1.8B-1.25Bit.gguf --backend metal \
+            --prompt "Translate to French: good morning" --max-tokens 32
