@@ -258,7 +258,7 @@ public sealed unsafe class VulkanBackend : IComputeBackend
                     $"Vulkan backend supports F32/Q4_K/Q6_K/Q8_0/Q2_0C/STQ1_0 only; {name} is {info.Type} — use --backend cpu"),
             };
             VkBuffer b = _dev.NewStorageBuffer(bytes, hostVisible: _dev.CoherentDeviceLocal);
-            _dev.Upload(b, gguf.DataBase + (long)info.Offset, bytes);
+            _dev.Upload(b, bytes, (void* dst, ulong n) => gguf.CopyTensor(info, dst, n));
             _w[name] = b;
             _wtype[name] = info.Type;
             _welems[name] = (long)info.NumElements;

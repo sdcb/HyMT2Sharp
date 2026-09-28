@@ -6,6 +6,8 @@ using System.Runtime.InteropServices;
 
 namespace Sdcb.HyMT2Sharp.Backends.Vulkan;
 
+internal unsafe delegate void VkUploadWrite(void* dst, ulong bytes);
+
 internal unsafe sealed class VkDevice : IDisposable
 {
     public IntPtr Instance, PhysDevice, Device, Queue;
@@ -476,18 +478,26 @@ internal unsafe sealed class VkDevice : IDisposable
 
     /// <summary>Upload raw bytes into a buffer (host memcpy when mappable, else staging + copy cmd).</summary>
     public void Upload(VkBuffer buf, void* src, ulong bytes)
+        => Upload(buf, bytes, (void* dst, ulong n) => Buffer.MemoryCopy(src, dst, n, n));
+
+    /// <summary>
+    /// Upload bytes written by <paramref name="write"/> straight into mapped
+    /// host memory (or a staging buffer). The callback must fill
+    /// <paramref name="bytes"/> at the pointer it is given.
+    /// </summary>
+    public void Upload(VkBuffer buf, ulong bytes, VkUploadWrite write)
     {
         if ((buf.Flags & VkConst.MemHostVisible) != 0)
         {
             void* p = buf.Map();
-            Buffer.MemoryCopy(src, p, bytes, bytes);
+            write(p, bytes);
             buf.Flush(0, bytes);
             buf.Unmap();
             return;
         }
         VkBuffer staging = NewStorageBuffer(bytes, hostVisible: true);
         void* sp = staging.Map();
-        Buffer.MemoryCopy(src, sp, bytes, bytes);
+        write(sp, bytes);
         staging.Flush(0, bytes);
         staging.Unmap();
         IntPtr cmd = NewCommandBuffer();

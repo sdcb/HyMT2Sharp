@@ -7,7 +7,7 @@ namespace Sdcb.HyMT2Sharp.Model;
 
 public sealed unsafe partial class HunyuanDenseModel : IDisposable
 {
-    private readonly GgufFile _gguf;
+    private GgufFile? _gguf;
     private readonly CpuThreadPool _pool;
     private readonly ScratchArena _gemmScratch = new();
     private readonly Dictionary<string, Weight> _weights = new(StringComparer.Ordinal);
@@ -78,51 +78,87 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     }
 
     public HunyuanDenseModel(string ggufPath, int threads = 0, KvCacheConfig? cacheConfig = null, IComputeBackend? backend = null)
+        : this(new GgufFile(ggufPath), threads, cacheConfig, backend, releaseGgufAfterLoad: false)
     {
-        CacheConfig = cacheConfig ?? KvCacheConfig.Memory;
-        _gguf = new GgufFile(ggufPath);
-        Config = ModelConfig.FromGguf(_gguf);
-        _backend = backend;
-        if (Config.VocabSize == 0)
+    }
+
+    /// <summary>
+    /// Load from a readable, seekable GGUF stream. Weight bytes are read again
+    /// when a compute backend is attached. The stream is closed after load
+    /// unless <paramref name="leaveOpen"/> is set — nothing retains it.
+    /// </summary>
+    public HunyuanDenseModel(Stream ggufStream, int threads = 0, KvCacheConfig? cacheConfig = null, IComputeBackend? backend = null, bool leaveOpen = false)
+        : this(new GgufFile(ggufStream, leaveOpen), threads, cacheConfig, backend, releaseGgufAfterLoad: true)
+    {
+    }
+
+    private HunyuanDenseModel(GgufFile gguf, int threads, KvCacheConfig? cacheConfig, IComputeBackend? backend, bool releaseGgufAfterLoad)
+    {
+        _gguf = gguf;
+        CpuThreadPool? pool = null;
+        bool ok = false;
+        try
         {
-            // Filled after weights load from token_embd rows.
-        }
-        if (!string.Equals(Config.Architecture, "hunyuan-dense", StringComparison.Ordinal))
-            throw new NotSupportedException($"Expected hunyuan-dense, got {Config.Architecture}");
-        Tokenizer = new BpeTokenizer(_gguf);
-        _pool = new CpuThreadPool(threads);
-        LoadWeights();
-        if (Config.VocabSize == 0 && _weights.TryGetValue("token_embd.weight", out Weight emb) && emb.NOut > 0)
-            Config.VocabSize = emb.NOut;
-        _backend?.LoadModel(_gguf, Config);
-        _cacheCap = Math.Min(Config.ContextLength, 4096);
-        _cacheK = new ushort*[Config.NumLayers];
-        _cacheV = new ushort*[Config.NumLayers];
-        _cacheKBuffers = new NativeBuffer[Config.NumLayers];
-        _cacheVBuffers = new NativeBuffer[Config.NumLayers];
-        int kvStride = Config.NumKvHeads * Config.HeadDim;
-        if (CacheConfig.KeepFlatCache && CacheConfig.Blocks is null)
-        {
-            for (int l = 0; l < Config.NumLayers; l++)
+            CacheConfig = cacheConfig ?? KvCacheConfig.Memory;
+            Config = ModelConfig.FromGguf(gguf);
+            _backend = backend;
+            if (Config.VocabSize == 0)
             {
-                NativeBuffer k = Rent((nuint)((long)_cacheCap * kvStride * sizeof(ushort)));
-                NativeBuffer v = Rent((nuint)((long)_cacheCap * kvStride * sizeof(ushort)));
-                _cacheKBuffers[l] = k;
-                _cacheVBuffers[l] = v;
-                _cacheK[l] = (ushort*)k.Pointer;
-                _cacheV[l] = (ushort*)v.Pointer;
+                // Filled after weights load from token_embd rows.
+            }
+            if (!string.Equals(Config.Architecture, "hunyuan-dense", StringComparison.Ordinal))
+                throw new NotSupportedException($"Expected hunyuan-dense, got {Config.Architecture}");
+            Tokenizer = new BpeTokenizer(gguf);
+            pool = new CpuThreadPool(threads);
+            _pool = pool;
+            LoadWeights();
+            if (Config.VocabSize == 0 && _weights.TryGetValue("token_embd.weight", out Weight emb) && emb.NOut > 0)
+                Config.VocabSize = emb.NOut;
+            _backend?.LoadModel(gguf, Config);
+            _cacheCap = Math.Min(Config.ContextLength, 4096);
+            _cacheK = new ushort*[Config.NumLayers];
+            _cacheV = new ushort*[Config.NumLayers];
+            _cacheKBuffers = new NativeBuffer[Config.NumLayers];
+            _cacheVBuffers = new NativeBuffer[Config.NumLayers];
+            int kvStride = Config.NumKvHeads * Config.HeadDim;
+            if (CacheConfig.KeepFlatCache && CacheConfig.Blocks is null)
+            {
+                for (int l = 0; l < Config.NumLayers; l++)
+                {
+                    NativeBuffer k = Rent((nuint)((long)_cacheCap * kvStride * sizeof(ushort)));
+                    NativeBuffer v = Rent((nuint)((long)_cacheCap * kvStride * sizeof(ushort)));
+                    _cacheKBuffers[l] = k;
+                    _cacheVBuffers[l] = v;
+                    _cacheK[l] = (ushort*)k.Pointer;
+                    _cacheV[l] = (ushort*)v.Pointer;
+                }
+            }
+            else
+            {
+                // Buffers grow lazily through EnsureCache — under KeepFlatCache
+                // they stay warm (restored blocks land there; prefixes live in
+                // _blockStore), without it they're returned at end of request
+                // so an idle service holds no KV memory.
+                _cacheCap = 0;
+            }
+            if (CacheConfig.Blocks is { } blocks)
+                _blockStore = new KvBlockStore(Config.NumLayers, kvStride, blocks.BlockTokens, blocks.CapBytes);
+            ok = true;
+        }
+        finally
+        {
+            if (!ok)
+                pool?.Dispose();
+            // Stream payloads are copied into NativeBuffers (and the backend)
+            // during load. Drop the stream afterwards so those pages can leave
+            // the working set. Path mode keeps the mapping until Dispose, same
+            // as before.
+            if (!ok || releaseGgufAfterLoad)
+            {
+                gguf.Dispose();
+                _gguf = null;
             }
         }
-        else
-        {
-            // Buffers grow lazily through EnsureCache — under KeepFlatCache
-            // they stay warm (restored blocks land there; prefixes live in
-            // _blockStore), without it they're returned at end of request
-            // so an idle service holds no KV memory.
-            _cacheCap = 0;
-        }
-        if (CacheConfig.Blocks is { } blocks)
-            _blockStore = new KvBlockStore(Config.NumLayers, kvStride, blocks.BlockTokens, blocks.CapBytes);
     }
 
     public KvCacheConfig CacheConfig { get; }
@@ -516,14 +552,14 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
 
     private void LoadWeights()
     {
-        foreach ((string name, GgufTensorInfo info) in _gguf.Tensors)
+        GgufFile gguf = _gguf ?? throw new ObjectDisposedException(nameof(GgufFile));
+        foreach ((string name, GgufTensorInfo info) in gguf.Tensors)
         {
-            byte* data = _gguf.DataBase + (long)info.Offset;
             if (info.Type == GgmlTensorType.F32)
             {
                 int n = checked((int)info.NumElements);
                 NativeBuffer buf = Rent((nuint)((long)n * sizeof(float)));
-                Buffer.MemoryCopy(data, buf.Pointer, buf.Bytes, buf.Bytes);
+                gguf.CopyTensor(info, buf.Pointer, buf.Bytes);
                 _weights[name] = new Weight { Type = GgmlTensorType.F32, F32 = (float*)buf.Pointer, Count = n };
                 continue;
             }
@@ -551,7 +587,7 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
                 _ => throw new NotSupportedException($"Unsupported quantized tensor type {info.Type} for {name}"),
             };
             NativeBuffer quant = Rent((nuint)((long)nOut * nb * blockBytes));
-            Buffer.MemoryCopy(data, quant.Pointer, quant.Bytes, quant.Bytes);
+            gguf.CopyTensor(info, quant.Pointer, quant.Bytes);
             Weight w = new()
             {
                 Type = info.Type,
@@ -764,7 +800,8 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         _gemmScratch.Dispose();
         _pool.Dispose();
         _backend?.Dispose();
-        _gguf.Dispose();
+        _gguf?.Dispose();
+        _gguf = null;
     }
 
     private struct Weight

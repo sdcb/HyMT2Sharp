@@ -25,6 +25,8 @@ public sealed class MtlDevice
         return ObjC.Send1P1N(H, ObjC.Sel("newBufferWithLength:options:"), IntPtr.Zero + (nint)bytes, 0);
     }
 
+    public static unsafe void* Contents(IntPtr buf) => (void*)ObjC.Send0(buf, ObjC.Sel("contents"));
+
     public unsafe IntPtr NewBufferBytes(void* src, nuint bytes)
     {
         // newBufferWithBytes:length:options:  StorageModeShared=0
