@@ -14,6 +14,10 @@ artifacts/
 *.snupkg
 project.lock.json
 project.fragment.lock.json
+# Isolated restore for the local weight-package demo. Do not let these
+# 1.0.0 nupkgs land in the global cache — a later licensed upload keeps
+# the same version and would otherwise stick forever.
+samples/EmbeddedWeightsDemo/packages/
 
 # LINQPad NuGet pack output
 build/nupkgs/

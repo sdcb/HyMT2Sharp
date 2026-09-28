@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Keep the unpublished 1.0.0 weight packages out of the global cache. -->
+    <RestorePackagesPath>$(MSBuildThisFileDirectory)packages</RestorePackagesPath>
+    <RestoreAdditionalProjectSources>C:\Users\sdfly\source\repos\Sdcb.GgufWeights.Abstractions\nupkgs</RestoreAdditionalProjectSources>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\HyMT2Sharp\HyMT2Sharp.csproj" />
+    <PackageReference Include="Sdcb.GgufWeights.Hy-MT2-1.8B-1.25Bit" Version="1.0.0" />
+    <PackageReference Include="Sdcb.GgufWeights.Hy-MT2-1.8B-Q4_K_M" Version="1.0.0" />
+  </ItemGroup>
+</Project>
