@@ -15,11 +15,15 @@ public sealed class GgufTypeTests
             WriteMinimal(legacy, "Hy-MT2 1.25Bit Stride16", 41, 42);
             WriteMinimal(standard, "plain Q2 model", 41, 42);
             using (GgufFile a = new(legacy))
-            using (GgufFile b = new(standard))
-            {
                 Assert.Equal(GgmlTensorType.STQ1_0, a.Tensors["x"].Type);
+            using (FileStream fs = File.OpenRead(legacy))
+            using (GgufFile aStream = new(fs))
+                Assert.Equal(GgmlTensorType.STQ1_0, aStream.Tensors["x"].Type);
+            using (GgufFile b = new(standard))
                 Assert.Equal(GgmlTensorType.Q2_0, b.Tensors["x"].Type);
-            }
+            using (FileStream fs = File.OpenRead(standard))
+            using (GgufFile bStream = new(fs))
+                Assert.Equal(GgmlTensorType.Q2_0, bStream.Tensors["x"].Type);
         }
         finally
         {
