@@ -1,3 +1,5 @@
+// Local-only check. Not part of HyMT2Sharp.slnx.
+// Weights come from the sibling repo build/nupkgs (nuget.config). GGUF files are this machine's copies under D:\_\model.
 using System.Diagnostics;
 using System.Globalization;
 using System.Security.Cryptography;

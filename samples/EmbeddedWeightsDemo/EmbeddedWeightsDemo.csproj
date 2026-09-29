@@ -1,9 +1,10 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <!-- Keep the unpublished 1.0.0 weight packages out of the global cache. -->
+    <!-- Local verification tool, not in HyMT2Sharp.slnx.
+         GGUF paths are this machine's files (see Program.cs). Package source is nuget.config.
+         Keep the unpublished 1.0.0 weight packages out of the global cache. -->
     <RestorePackagesPath>$(MSBuildThisFileDirectory)packages</RestorePackagesPath>
-    <RestoreAdditionalProjectSources>C:\Users\sdfly\source\repos\Sdcb.GgufWeights.Abstractions\nupkgs</RestoreAdditionalProjectSources>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\HyMT2Sharp\HyMT2Sharp.csproj" />

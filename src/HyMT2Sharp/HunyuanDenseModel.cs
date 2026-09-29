@@ -96,12 +96,14 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
     {
         _gguf = gguf;
         CpuThreadPool? pool = null;
+        IComputeBackend? ownedBackend = null;
         bool ok = false;
         try
         {
             CacheConfig = cacheConfig ?? KvCacheConfig.Memory;
             Config = ModelConfig.FromGguf(gguf);
-            _backend = backend;
+            ownedBackend = backend;
+            _backend = ownedBackend;
             if (Config.VocabSize == 0)
             {
                 // Filled after weights load from token_embd rows.
@@ -148,16 +150,33 @@ public sealed unsafe partial class HunyuanDenseModel : IDisposable
         finally
         {
             if (!ok)
-                pool?.Dispose();
-            // Stream payloads are copied into NativeBuffers (and the backend)
-            // during load. Drop the stream afterwards so those pages can leave
-            // the working set. Path mode keeps the mapping until Dispose, same
-            // as before.
-            if (!ok || releaseGgufAfterLoad)
+                ReleaseFailedLoad(pool, ownedBackend);
+            else if (releaseGgufAfterLoad)
             {
+                // Stream payloads are copied into NativeBuffers (and the backend)
+                // during load. Drop the stream afterwards so those pages can leave
+                // the working set. Path mode keeps the mapping until Dispose.
                 gguf.Dispose();
                 _gguf = null;
             }
+        }
+    }
+
+    private void ReleaseFailedLoad(CpuThreadPool? pool, IComputeBackend? backend)
+    {
+        try
+        {
+            foreach (NativeBuffer buf in _buffers)
+                buf.Dispose();
+            _buffers.Clear();
+            _gemmScratch.Dispose();
+            pool?.Dispose();
+            backend?.Dispose();
+        }
+        finally
+        {
+            _gguf?.Dispose();
+            _gguf = null;
         }
     }
 

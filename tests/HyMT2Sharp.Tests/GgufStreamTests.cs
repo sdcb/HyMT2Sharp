@@ -38,14 +38,34 @@ public sealed class GgufStreamTests
     }
 
     [Fact]
+    public void SpanShortReadMatchesPath()
+    {
+        byte[] bytes = BuildSynthetic(q8Rows: 160_000, blobChars: 0);
+        string path = Path.GetTempFileName();
+        try
+        {
+            File.WriteAllBytes(path, bytes);
+            using GgufFile fromPath = new(path);
+            SpanShortReadStream spans = new(bytes, maxRead: 13, boundary: 100);
+            using GgufFile fromSpan = new(spans, leaveOpen: true);
+            AssertSameMetadata(fromPath, fromSpan);
+            AssertSameTensors(fromPath, fromSpan);
+            Assert.True(spans.SpanReads > 0);
+            Assert.True(spans.MaxSpan <= CopyChunkLimit);
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    private const string RealModelPath = @"D:\_\model\Hy-MT2-1.8B-1.25Bit.gguf";
+
+    [FactIfFileExists(RealModelPath)]
     public void RealModel_PathMatchesStream()
     {
-        const string path = @"D:\_\model\Hy-MT2-1.8B-1.25Bit.gguf";
-        if (!File.Exists(path))
-            return;
-
-        using GgufFile fromPath = new(path);
-        using FileStream fs = new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.RandomAccess);
+        using GgufFile fromPath = new(RealModelPath);
+        using FileStream fs = new(RealModelPath, FileMode.Open, FileAccess.Read, FileShare.Read, 1 << 20, FileOptions.RandomAccess);
         using GgufFile fromStream = new(fs, leaveOpen: true);
 
         Assert.Equal(fromPath.DataOffset, fromStream.DataOffset);
@@ -87,6 +107,26 @@ public sealed class GgufStreamTests
         }
 
         Assert.Equal((ulong)fromPath.DataLength, maxEnd);
+    }
+
+    [Fact]
+    public void HeaderLargerThanLimitIsRejected()
+    {
+        using MemoryStream raw = new();
+        using (BinaryWriter w = new(raw, Encoding.UTF8, leaveOpen: true))
+        {
+            w.Write(0x46554747u);
+            w.Write(3u);
+            w.Write(0ul);
+            w.Write(1ul);
+            WriteString(w, "k");
+            w.Write(8);
+            w.Write(300L << 20);
+        }
+
+        using ReportedLengthStream stream = new(raw.ToArray(), reportedLength: 400L << 20);
+        InvalidDataException ex = Assert.Throws<InvalidDataException>(() => new GgufFile(stream, leaveOpen: true));
+        Assert.Contains("header", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -335,7 +375,7 @@ public sealed class GgufStreamTests
         public override bool CanSeek => false;
     }
 
-    private sealed class ShortReadStream : Stream
+    private class ShortReadStream : Stream
     {
         private readonly byte[] _data;
         private readonly int _maxRead;
@@ -363,16 +403,23 @@ public sealed class GgufStreamTests
 
         public override int Read(byte[] buffer, int offset, int count)
         {
-            if (count > 0)
-                MaxRequested = Math.Max(MaxRequested, count);
-            if (_pos >= _data.Length || count <= 0)
+            int n = CopyShort(buffer.AsSpan(offset, count));
+            if (n > 0)
+                ReadCount++;
+            return n;
+        }
+
+        protected int CopyShort(Span<byte> destination)
+        {
+            if (destination.Length > 0)
+                MaxRequested = Math.Max(MaxRequested, destination.Length);
+            if (_pos >= _data.Length || destination.Length == 0)
                 return 0;
-            int room = (int)Math.Min(count, _data.Length - _pos);
+            int room = (int)Math.Min(destination.Length, _data.Length - _pos);
             int toEdge = _boundary - (int)(_pos % _boundary);
             int n = Math.Min(room, Math.Min(_maxRead, toEdge));
-            Buffer.BlockCopy(_data, (int)_pos, buffer, offset, n);
+            _data.AsSpan((int)_pos, n).CopyTo(destination);
             _pos += n;
-            ReadCount++;
             return n;
         }
 
@@ -394,5 +441,40 @@ public sealed class GgufStreamTests
         public override void Flush() { }
         public override void SetLength(long value) => throw new NotSupportedException();
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    }
+
+    private sealed class SpanShortReadStream : ShortReadStream
+    {
+        public SpanShortReadStream(byte[] data, int maxRead, int boundary) : base(data, maxRead, boundary) { }
+
+        public int SpanReads { get; private set; }
+        public int MaxSpan { get; private set; }
+
+        public override int Read(Span<byte> buffer)
+        {
+            if (buffer.Length > 0)
+                MaxSpan = Math.Max(MaxSpan, buffer.Length);
+            int n = CopyShort(buffer);
+            if (n > 0)
+                SpanReads++;
+            return n;
+        }
+    }
+
+    private sealed class ReportedLengthStream : MemoryStream
+    {
+        private readonly long _reportedLength;
+        public ReportedLengthStream(byte[] data, long reportedLength) : base(data, writable: false)
+            => _reportedLength = reportedLength;
+        public override long Length => _reportedLength;
+    }
+}
+
+public sealed class FactIfFileExistsAttribute : FactAttribute
+{
+    public FactIfFileExistsAttribute(string path)
+    {
+        if (!File.Exists(path))
+            Skip = $"GGUF model not present: {path}";
     }
 }

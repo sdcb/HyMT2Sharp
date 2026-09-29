@@ -490,25 +490,44 @@ internal unsafe sealed class VkDevice : IDisposable
         if ((buf.Flags & VkConst.MemHostVisible) != 0)
         {
             void* p = buf.Map();
-            write(p, bytes);
-            buf.Flush(0, bytes);
-            buf.Unmap();
+            try
+            {
+                write(p, bytes);
+                buf.Flush(0, bytes);
+            }
+            finally
+            {
+                buf.Unmap();
+            }
             return;
         }
         VkBuffer staging = NewStorageBuffer(bytes, hostVisible: true);
-        void* sp = staging.Map();
-        write(sp, bytes);
-        staging.Flush(0, bytes);
-        staging.Unmap();
-        IntPtr cmd = NewCommandBuffer();
-        IntPtr fence = NewFence();
-        var begin = new Vk.VkCommandBufferBeginInfo { SType = VkConst.StCommandBufferBeginInfo };
-        Vk.Check(Vk.vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
-        Vk.VkBufferCopy r = new() { Size = bytes };
-        Vk.vkCmdCopyBuffer(cmd, staging.Buffer, buf.Buffer, 1, &r);
-        Vk.Check(Vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-        Submit(cmd, fence);
-        WaitFence(fence);
+        try
+        {
+            void* sp = staging.Map();
+            try
+            {
+                write(sp, bytes);
+                staging.Flush(0, bytes);
+            }
+            finally
+            {
+                staging.Unmap();
+            }
+            IntPtr cmd = NewCommandBuffer();
+            IntPtr fence = NewFence();
+            var begin = new Vk.VkCommandBufferBeginInfo { SType = VkConst.StCommandBufferBeginInfo };
+            Vk.Check(Vk.vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
+            Vk.VkBufferCopy r = new() { Size = bytes };
+            Vk.vkCmdCopyBuffer(cmd, staging.Buffer, buf.Buffer, 1, &r);
+            Vk.Check(Vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+            Submit(cmd, fence);
+            WaitFence(fence);
+        }
+        finally
+        {
+            staging.Destroy();
+        }
     }
 
     public void BindBuffer(IntPtr set, uint binding, VkBuffer buf, ulong offset = 0)
@@ -584,6 +603,20 @@ internal unsafe sealed class VkBuffer
         return p;
     }
     public void Unmap() => Vk.vkUnmapMemory(Dev, Memory);
+
+    public void Destroy()
+    {
+        if (Buffer != IntPtr.Zero)
+        {
+            Vk.vkDestroyBuffer(Dev, Buffer, null);
+            Buffer = IntPtr.Zero;
+        }
+        if (Memory != IntPtr.Zero)
+        {
+            Vk.vkFreeMemory(Dev, Memory, null);
+            Memory = IntPtr.Zero;
+        }
+    }
 
     public void Flush(ulong offset, ulong size)
     {
