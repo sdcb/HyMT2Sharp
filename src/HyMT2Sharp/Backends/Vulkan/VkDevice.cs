@@ -6,6 +6,8 @@ using System.Runtime.InteropServices;
 
 namespace Sdcb.HyMT2Sharp.Backends.Vulkan;
 
+internal unsafe delegate void VkUploadWrite(void* dst, ulong bytes);
+
 internal unsafe sealed class VkDevice : IDisposable
 {
     public IntPtr Instance, PhysDevice, Device, Queue;
@@ -476,29 +478,56 @@ internal unsafe sealed class VkDevice : IDisposable
 
     /// <summary>Upload raw bytes into a buffer (host memcpy when mappable, else staging + copy cmd).</summary>
     public void Upload(VkBuffer buf, void* src, ulong bytes)
+        => Upload(buf, bytes, (void* dst, ulong n) => Buffer.MemoryCopy(src, dst, n, n));
+
+    /// <summary>
+    /// Upload bytes written by <paramref name="write"/> straight into mapped
+    /// host memory (or a staging buffer). The callback must fill
+    /// <paramref name="bytes"/> at the pointer it is given.
+    /// </summary>
+    public void Upload(VkBuffer buf, ulong bytes, VkUploadWrite write)
     {
         if ((buf.Flags & VkConst.MemHostVisible) != 0)
         {
             void* p = buf.Map();
-            Buffer.MemoryCopy(src, p, bytes, bytes);
-            buf.Flush(0, bytes);
-            buf.Unmap();
+            try
+            {
+                write(p, bytes);
+                buf.Flush(0, bytes);
+            }
+            finally
+            {
+                buf.Unmap();
+            }
             return;
         }
         VkBuffer staging = NewStorageBuffer(bytes, hostVisible: true);
-        void* sp = staging.Map();
-        Buffer.MemoryCopy(src, sp, bytes, bytes);
-        staging.Flush(0, bytes);
-        staging.Unmap();
-        IntPtr cmd = NewCommandBuffer();
-        IntPtr fence = NewFence();
-        var begin = new Vk.VkCommandBufferBeginInfo { SType = VkConst.StCommandBufferBeginInfo };
-        Vk.Check(Vk.vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
-        Vk.VkBufferCopy r = new() { Size = bytes };
-        Vk.vkCmdCopyBuffer(cmd, staging.Buffer, buf.Buffer, 1, &r);
-        Vk.Check(Vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
-        Submit(cmd, fence);
-        WaitFence(fence);
+        try
+        {
+            void* sp = staging.Map();
+            try
+            {
+                write(sp, bytes);
+                staging.Flush(0, bytes);
+            }
+            finally
+            {
+                staging.Unmap();
+            }
+            IntPtr cmd = NewCommandBuffer();
+            IntPtr fence = NewFence();
+            var begin = new Vk.VkCommandBufferBeginInfo { SType = VkConst.StCommandBufferBeginInfo };
+            Vk.Check(Vk.vkBeginCommandBuffer(cmd, &begin), "vkBeginCommandBuffer");
+            Vk.VkBufferCopy r = new() { Size = bytes };
+            Vk.vkCmdCopyBuffer(cmd, staging.Buffer, buf.Buffer, 1, &r);
+            Vk.Check(Vk.vkEndCommandBuffer(cmd), "vkEndCommandBuffer");
+            Submit(cmd, fence);
+            WaitFence(fence);
+        }
+        finally
+        {
+            staging.Destroy();
+        }
     }
 
     public void BindBuffer(IntPtr set, uint binding, VkBuffer buf, ulong offset = 0)
@@ -574,6 +603,20 @@ internal unsafe sealed class VkBuffer
         return p;
     }
     public void Unmap() => Vk.vkUnmapMemory(Dev, Memory);
+
+    public void Destroy()
+    {
+        if (Buffer != IntPtr.Zero)
+        {
+            Vk.vkDestroyBuffer(Dev, Buffer, null);
+            Buffer = IntPtr.Zero;
+        }
+        if (Memory != IntPtr.Zero)
+        {
+            Vk.vkFreeMemory(Dev, Memory, null);
+            Memory = IntPtr.Zero;
+        }
+    }
 
     public void Flush(ulong offset, ulong size)
     {

@@ -4,7 +4,7 @@ public readonly struct GgufTensorInfo
 {
     public GgmlTensorType Type { get; init; }
 
-    /// <summary>Byte offset from <see cref="GgufFile.DataBase"/> (the aligned tensor blob).</summary>
+    /// <summary>Byte offset from the aligned tensor data section (<see cref="GgufFile.DataOffset"/>).</summary>
     public ulong Offset { get; init; }
 
     /// <summary>GGUF dims, dim 0 is the innermost (row) length.</summary>

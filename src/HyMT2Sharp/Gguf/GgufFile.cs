@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.IO.MemoryMappedFiles;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -5,23 +6,40 @@ using System.Text;
 namespace Sdcb.HyMT2Sharp.Gguf;
 
 /// <summary>
-/// Memory-maps a GGUF v2/v3 file. Metadata is parsed immediately; tensor
-/// payloads stay in the map and are addressed as <c>DataBase + Offset</c>,
-/// matching ggml's aligned data section.
+/// GGUF v2/v3 reader. A path is memory-mapped; a <see cref="Stream"/> is
+/// parsed from a growable header buffer and tensor bytes are copied on
+/// demand via <see cref="CopyTensor"/>. Both modes share <see cref="Cursor"/>.
 /// </summary>
 public sealed unsafe class GgufFile : IDisposable
 {
     private const uint Magic = 0x46554747; // "GGUF" LE
     private const uint DefaultAlignment = 32;
+    // Each stream read is at most 4MB. A stream that does not override
+    // Read(Span<byte>) rents an array the size of the span; the cap keeps
+    // that rent small. SegmentStream writes the span straight through.
+    private const int StreamCopyChunk = 4 * 1024 * 1024;
+    // Tokenizer tables are a few MB. A corrupt length must not grow the
+    // header buffer toward the size of the whole weight file.
+    private const int HeaderLimit = 256 * 1024 * 1024;
 
     private readonly MemoryMappedFile? _mmf;
     private readonly MemoryMappedViewAccessor? _view;
     private readonly Dictionary<string, object> _kv = new(StringComparer.Ordinal);
     private readonly Dictionary<string, GgufTensorInfo> _tensors = new(StringComparer.Ordinal);
+    private readonly Stream? _stream;
+    private readonly bool _leaveOpen;
     private byte* _fileBase;
-    private bool _released;
+    private byte* _dataBase;
+    private long _dataOffset;
+    private long _dataLength;
+    private bool _disposed;
 
-    public byte* DataBase { get; private set; }
+    /// <summary>Byte offset of the aligned tensor data section.</summary>
+    public long DataOffset => _dataOffset;
+
+    /// <summary>Length in bytes of the tensor data section.</summary>
+    public long DataLength => _dataLength;
+
     public IReadOnlyDictionary<string, GgufTensorInfo> Tensors => _tensors;
 
     public GgufFile(string path)
@@ -43,13 +61,76 @@ public sealed unsafe class GgufFile : IDisposable
             byte* ptr = null;
             _view.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
             _fileBase = ptr;
-            Parse(length);
+            Parse(_fileBase, length, length);
         }
-        catch
+        catch (Exception ex)
         {
             stream?.Dispose();
             Dispose();
+            if (ex is HeaderShortException)
+                throw new EndOfStreamException("Unexpected end of GGUF file");
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Read a GGUF v2/v3 stream. The stream must be readable and seekable.
+    /// The image is read from offset 0; <see cref="Stream.Position"/> is ignored.
+    /// The stream is closed on <see cref="Dispose"/> unless <paramref name="leaveOpen"/> is set.
+    /// <see cref="CopyTensor"/> seeks this stream and is not thread-safe.
+    /// </summary>
+    public GgufFile(Stream stream, bool leaveOpen = false)
+    {
+        ArgumentNullException.ThrowIfNull(stream);
+        if (!stream.CanRead || !stream.CanSeek)
+            throw new ArgumentException("GGUF stream must be readable and seekable.", nameof(stream));
+
+        _stream = stream;
+        _leaveOpen = leaveOpen;
+        try
+        {
+            long length = stream.Length;
+            if (length < 24)
+                throw new InvalidDataException($"GGUF file is too small: {length} bytes");
+            ReadHeader(stream, length);
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Copy <paramref name="bytes"/> of tensor payload at <paramref name="info"/>'s
+    /// data-section offset into <paramref name="dst"/>. Path mode copies from the
+    /// mapping. Stream mode seeks, then reads at most 4MB at a time directly into
+    /// <paramref name="dst"/>, looping when a read stops early (a stitched weight
+    /// stream stops at each segment). Stream mode is not thread-safe.
+    /// </summary>
+    public void CopyTensor(GgufTensorInfo info, void* dst, ulong bytes)
+    {
+        if (bytes > (ulong)_dataLength || info.Offset > (ulong)_dataLength - bytes)
+            throw new ArgumentOutOfRangeException(nameof(bytes), $"Tensor slice at offset {info.Offset} length {bytes} exceeds the GGUF data section ({_dataLength} bytes).");
+        if (bytes == 0)
+            return;
+        if (_stream is null)
+        {
+            Buffer.MemoryCopy(_dataBase + (long)info.Offset, dst, bytes, bytes);
+            return;
+        }
+
+        _stream.Seek(checked(_dataOffset + (long)info.Offset), SeekOrigin.Begin);
+        byte* p = (byte*)dst;
+        ulong left = bytes;
+        while (left != 0)
+        {
+            int want = left > StreamCopyChunk ? StreamCopyChunk : (int)left;
+            int n = _stream.Read(new Span<byte>(p, want));
+            if (n <= 0)
+                throw new EndOfStreamException("Unexpected end of GGUF stream while reading tensor data.");
+            p += n;
+            left -= (ulong)n;
         }
     }
 
@@ -92,24 +173,99 @@ public sealed unsafe class GgufFile : IDisposable
 
     public void Dispose()
     {
-        if (!_released && _fileBase != null)
+        if (_disposed)
+            return;
+        _disposed = true;
+        if (_fileBase != null)
         {
             _view?.SafeMemoryMappedViewHandle.ReleasePointer();
-            _released = true;
             _fileBase = null;
-            DataBase = null;
+            _dataBase = null;
         }
 
         _view?.Dispose();
         _mmf?.Dispose();
+        if (!_leaveOpen)
+            _stream?.Dispose();
         GC.SuppressFinalize(this);
     }
 
     private bool TryGet(string key, out object? value) => _kv.TryGetValue(key, out value);
 
-    private void Parse(long fileLength)
+    private void ReadHeader(Stream stream, long fileLength)
     {
-        Cursor cur = new(_fileBase, fileLength);
+        int target = (int)Math.Min(fileLength, 1 << 20);
+        byte[] buf = ArrayPool<byte>.Shared.Rent(target);
+        try
+        {
+            stream.Seek(0, SeekOrigin.Begin);
+            int filled = Fill(stream, buf, 0, target);
+            while (true)
+            {
+                try
+                {
+                    fixed (byte* p = buf)
+                        Parse(p, filled, fileLength);
+                    return;
+                }
+                catch (HeaderShortException ex)
+                {
+                    if (ex.Required > fileLength)
+                        throw new EndOfStreamException("Unexpected end of GGUF stream.");
+                    if (ex.Required > HeaderLimit)
+                        throw new InvalidDataException($"GGUF header needs {ex.Required} bytes, above the {HeaderLimit}-byte limit.");
+                    // Jump to the bytes this read needs, then overshoot by at
+                    // least 1MB so the following small fields (tokenizer
+                    // tokens) do not each reparse the header.
+                    long slack = Math.Max((long)filled * 2, filled + (1 << 20));
+                    long grown = Math.Min(fileLength, Math.Max(ex.Required, slack));
+                    if (grown > HeaderLimit)
+                        grown = HeaderLimit;
+                    int next = (int)grown;
+                    if (next <= filled)
+                        throw new EndOfStreamException("Unexpected end of GGUF stream.");
+                    if (buf.Length < next)
+                    {
+                        byte[] bigger = ArrayPool<byte>.Shared.Rent(next);
+                        Buffer.BlockCopy(buf, 0, bigger, 0, filled);
+                        byte[] old = buf;
+                        buf = bigger;
+                        ArrayPool<byte>.Shared.Return(old);
+                    }
+
+                    int got = Fill(stream, buf, filled, next - filled);
+                    if (filled + got < next)
+                        throw new EndOfStreamException("Unexpected end of GGUF stream.");
+                    filled += got;
+                    target = next;
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+    }
+
+    private static int Fill(Stream stream, byte[] buf, int offset, int count)
+    {
+        int got = 0;
+        while (got < count)
+        {
+            int n = stream.Read(buf, offset + got, count - got);
+            if (n == 0)
+                break;
+            got += n;
+        }
+
+        return got;
+    }
+
+    private void Parse(byte* fileBase, long available, long fileLength)
+    {
+        _kv.Clear();
+        _tensors.Clear();
+        Cursor cur = new(fileBase, available);
         uint magic = cur.ReadU32();
         if (magic != Magic)
             throw new InvalidDataException($"Not a GGUF file (magic 0x{magic:X8})");
@@ -165,7 +321,10 @@ public sealed unsafe class GgufFile : IDisposable
             pos = Align(pos, alignment);
         if (pos > fileLength)
             throw new InvalidDataException("GGUF data section starts past end of file");
-        DataBase = _fileBase + pos;
+        _dataOffset = pos;
+        _dataLength = fileLength - pos;
+        if (_fileBase != null)
+            _dataBase = _fileBase + pos;
     }
 
     private GgmlTensorType CanonicalTensorType(int rawType)
@@ -396,8 +555,18 @@ public sealed unsafe class GgufFile : IDisposable
 
         private readonly void Ensure(long bytes)
         {
-            if (_pos < 0 || bytes < 0 || _pos + bytes > _length)
+            if (_pos < 0 || bytes < 0)
                 throw new EndOfStreamException("Unexpected end of GGUF file");
+            long end = _pos + bytes;
+            if (end > _length)
+                throw new HeaderShortException(end);
         }
+    }
+
+    /// <summary>Header parse ran past the bytes buffered so far. <see cref="Required"/> is the file offset needed.</summary>
+    private sealed class HeaderShortException : Exception
+    {
+        public HeaderShortException(long required) => Required = required;
+        public long Required { get; }
     }
 }

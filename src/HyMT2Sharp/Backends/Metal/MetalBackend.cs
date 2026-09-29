@@ -80,7 +80,7 @@ public sealed unsafe class MetalBackend : IComputeBackend
 
     private IntPtr W(string name) => _w.TryGetValue(name, out IntPtr b) ? b : 0;
 
-    private static void* Contents(IntPtr buf) => (void*)ObjC.Send0(buf, ObjC.Sel("contents"));
+    private static void* Contents(IntPtr buf) => MtlDevice.Contents(buf);
 
     private IntPtr NewPso(IntPtr lib, string name) =>
         _dev.NewPso(_dev.NewFunction(lib, name));
@@ -143,8 +143,10 @@ public sealed unsafe class MetalBackend : IComputeBackend
                 _ => throw new NotSupportedException(
                     $"Metal backend supports F32/Q4_K/Q6_K/Q8_0/Q2_0C/STQ1_0 only; {name} is {info.Type} — use --backend cpu"),
             };
-            byte* data = gguf.DataBase + (long)info.Offset;
-            _w[name] = _dev.NewBufferBytes(data, (nuint)bytes);
+            IntPtr buf = _dev.NewBuffer((nuint)bytes);
+            gguf.CopyTensor(info, MtlDevice.Contents(buf), bytes);
+            MtlDevice.DidModifyRange(buf, 0, (nuint)bytes);
+            _w[name] = buf;
             _wtype[name] = info.Type;
             _wScratchElems = Math.Max(_wScratchElems, (long)info.NumElements);
         }
