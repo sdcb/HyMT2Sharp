@@ -306,11 +306,48 @@ internal unsafe sealed class VkDevice : IDisposable
         Vk.VkMemoryRequirements req;
         Vk.vkGetBufferMemoryRequirements(Device, b.Buffer, &req);
 
+        uint memType = PickMemoryType(req.MemoryTypeBits, req.Size, hostVisible, preferHost);
+        if (memType == uint.MaxValue)
+            throw new PlatformNotSupportedException($"Vulkan: no suitable memory type for {bytes}-byte buffer (hostVisible={hostVisible})");
+
+        Vk.VkMemoryAllocateInfo mai = new()
+        {
+            SType = VkConst.StMemoryAllocateInfo,
+            AllocationSize = req.Size, MemoryTypeIndex = memType,
+        };
+        VkResult res = Vk.vkAllocateMemory(Device, &mai, null, out b.Memory);
+        if (res != VkResult.Success && !(hostVisible && preferHost))
+        {
+            // UMA fallback: on an iGPU the DEVICE_LOCAL heap is only a slice of system RAM, so one
+            // large buffer (or many small ones) can exhaust it while the shared host-visible heap
+            // sits idle. Retry there — the GPU can address that memory directly on such devices.
+            foreach (uint alt in new[] { PickMemoryType(req.MemoryTypeBits, req.Size, true, true), PickMemoryType(req.MemoryTypeBits, req.Size, true, false) })
+            {
+                if (alt == uint.MaxValue || alt == memType) continue;
+                mai.MemoryTypeIndex = alt;
+                res = Vk.vkAllocateMemory(Device, &mai, null, out b.Memory);
+                if (res == VkResult.Success) { memType = alt; break; }
+            }
+        }
+        Vk.Check(res, "vkAllocateMemory");
+        Vk.Check(Vk.vkBindBufferMemory(Device, b.Buffer, b.Memory, 0), "vkBindBufferMemory");
+        b.Flags = MemProps.TypeAt((int)memType).PropertyFlags;
+        return b;
+    }
+
+    /// <summary>
+    /// Choose a memory type for <paramref name="size"/> bytes: honours the requested visibility, but
+    /// never returns a type whose heap is smaller than the allocation (UMA iGPUs expose a tiny
+    /// DEVICE_LOCAL|HOST_VISIBLE BAR window that would otherwise swallow every big buffer).
+    /// </summary>
+    private uint PickMemoryType(uint typeBits, ulong size, bool hostVisible, bool preferHost)
+    {
         uint memType = uint.MaxValue;
         for (int i = 0; i < (int)MemProps.MemoryTypeCount; i++)
         {
-            if ((req.MemoryTypeBits & (1u << i)) == 0) continue;
+            if ((typeBits & (1u << i)) == 0) continue;
             uint f = MemProps.TypeAt(i).PropertyFlags;
+            if (MemProps.HeapAt((int)MemProps.TypeAt(i).HeapIndex).Size < size) continue;
             bool ok;
             if (!hostVisible)
                 ok = (f & VkConst.MemDeviceLocal) != 0;
@@ -331,25 +368,15 @@ internal unsafe sealed class VkDevice : IDisposable
             // relax: some drivers expose host-visible non-local types without CACHED
             for (int i = 0; i < (int)MemProps.MemoryTypeCount && memType == uint.MaxValue; i++)
             {
-                if ((req.MemoryTypeBits & (1u << i)) == 0) continue;
+                if ((typeBits & (1u << i)) == 0) continue;
                 uint f = MemProps.TypeAt(i).PropertyFlags;
                 if ((f & (VkConst.MemHostVisible | VkConst.MemHostCoherent)) == (VkConst.MemHostVisible | VkConst.MemHostCoherent)
-                    && (f & VkConst.MemDeviceLocal) == 0)
+                    && (f & VkConst.MemDeviceLocal) == 0
+                    && MemProps.HeapAt((int)MemProps.TypeAt(i).HeapIndex).Size >= size)
                     memType = (uint)i;
             }
         }
-        if (memType == uint.MaxValue)
-            throw new PlatformNotSupportedException($"Vulkan: no suitable memory type for {bytes}-byte buffer (hostVisible={hostVisible})");
-
-        Vk.VkMemoryAllocateInfo mai = new()
-        {
-            SType = VkConst.StMemoryAllocateInfo,
-            AllocationSize = req.Size, MemoryTypeIndex = memType,
-        };
-        Vk.Check(Vk.vkAllocateMemory(Device, &mai, null, out b.Memory), "vkAllocateMemory");
-        Vk.Check(Vk.vkBindBufferMemory(Device, b.Buffer, b.Memory, 0), "vkBindBufferMemory");
-        b.Flags = MemProps.TypeAt((int)memType).PropertyFlags;
-        return b;
+        return memType;
     }
 
     public IntPtr NewShaderModule(byte[] spirv)
